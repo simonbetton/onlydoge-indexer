@@ -1,0 +1,90 @@
+import { HttpBlockchainRpcGateway } from '@onlydoge/platform';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+describe('http blockchain rpc gateway', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('sends basic auth headers for rpc endpoints with credentials', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      Response.json({
+        result: 123,
+        error: null,
+      }),
+    );
+
+    const gateway = new HttpBlockchainRpcGateway();
+
+    await expect(
+      gateway.assertHealthy('dogecoin', 'http://user:pass=@110.124.0.2:22555/'),
+    ).resolves.toBeUndefined();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://110.124.0.2:22555/',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          authorization: 'Basic dXNlcjpwYXNzPQ==',
+          'content-type': 'application/json',
+        }),
+      }),
+    );
+  });
+
+  it('times out hung dogecoin rpc health checks', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      (_input: RequestInfo | URL, init?: RequestInit) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(init.signal?.reason ?? new Error('aborted'));
+          });
+        });
+      },
+    );
+
+    const gateway = new HttpBlockchainRpcGateway(5);
+
+    await expect(
+      gateway.assertHealthy('dogecoin', 'http://user:pass=@110.124.0.2:22555/'),
+    ).rejects.toMatchObject({
+      message: 'could not connect to `http://user:pass=@110.124.0.2:22555/`',
+    });
+  });
+
+  it('throttles rpc calls using the configured rps', async () => {
+    vi.useFakeTimers();
+
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        result: 123,
+        error: null,
+      }),
+    } as Response);
+    const gateway = new HttpBlockchainRpcGateway();
+
+    const first = gateway.getBlockHeight({
+      architecture: 'dogecoin',
+      rpcEndpoint: 'http://user:pass=@110.124.0.2:22555/',
+      rps: 1,
+    });
+    const second = gateway.getBlockHeight({
+      architecture: 'dogecoin',
+      rpcEndpoint: 'http://user:pass=@110.124.0.2:22555/',
+      rps: 1,
+    });
+    const pending = Promise.all([first, second]);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+});

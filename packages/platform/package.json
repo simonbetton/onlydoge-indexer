@@ -1,0 +1,18 @@
+{
+  "name": "@onlydoge/platform",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@onlydoge/access-control": "workspace:*",
+    "@onlydoge/entity-labeling": "workspace:*",
+    "@onlydoge/indexing-pipeline": "workspace:*",
+    "@onlydoge/investigation-query": "workspace:*",
+    "@onlydoge/network-catalog": "workspace:*",
+    "@onlydoge/shared-kernel": "workspace:*",
+    "@libsql/client": "0.17.2",
+    "drizzle-orm": "0.45.1",
+    "mysql2": "3.20.0",
+    "pg": "8.20.0"
+  }
+}

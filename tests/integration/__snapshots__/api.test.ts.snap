@@ -1,0 +1,1679 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`api integration > serves heartbeat and openapi 1`] = `
+{
+  "components": {
+    "schemas": {},
+    "securitySchemes": {
+      "ApiTokenAuth": {
+        "description": "OnlyDoge API token.",
+        "in": "header",
+        "name": "x-api-token",
+        "type": "apiKey",
+      },
+    },
+  },
+  "info": {
+    "description": "Development documentation",
+    "title": "OnlyDoge API",
+    "version": "0.1.0",
+  },
+  "openapi": "3.0.3",
+  "paths": {
+    "/v1/addresses/": {
+      "delete": {
+        "operationId": "deleteV1Addresses",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "addresses": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "addresses",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "addresses": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "addresses",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "addresses": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "addresses",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "get": {
+        "operationId": "getV1Addresses",
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "post": {
+        "operationId": "postV1Addresses",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "addresses": {
+                    "items": {
+                      "properties": {
+                        "address": {
+                          "type": "string",
+                        },
+                        "data": {
+                          "patternProperties": {
+                            "^(.*)$": {},
+                          },
+                          "type": "object",
+                        },
+                        "description": {
+                          "type": "string",
+                        },
+                      },
+                      "required": [
+                        "address",
+                        "description",
+                      ],
+                      "type": "object",
+                    },
+                    "type": "array",
+                  },
+                  "entity": {
+                    "type": "string",
+                  },
+                  "network": {
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "entity",
+                  "network",
+                  "addresses",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "addresses": {
+                    "items": {
+                      "properties": {
+                        "address": {
+                          "type": "string",
+                        },
+                        "data": {
+                          "patternProperties": {
+                            "^(.*)$": {},
+                          },
+                          "type": "object",
+                        },
+                        "description": {
+                          "type": "string",
+                        },
+                      },
+                      "required": [
+                        "address",
+                        "description",
+                      ],
+                      "type": "object",
+                    },
+                    "type": "array",
+                  },
+                  "entity": {
+                    "type": "string",
+                  },
+                  "network": {
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "entity",
+                  "network",
+                  "addresses",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "addresses": {
+                    "items": {
+                      "properties": {
+                        "address": {
+                          "type": "string",
+                        },
+                        "data": {
+                          "patternProperties": {
+                            "^(.*)$": {},
+                          },
+                          "type": "object",
+                        },
+                        "description": {
+                          "type": "string",
+                        },
+                      },
+                      "required": [
+                        "address",
+                        "description",
+                      ],
+                      "type": "object",
+                    },
+                    "type": "array",
+                  },
+                  "entity": {
+                    "type": "string",
+                  },
+                  "network": {
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "entity",
+                  "network",
+                  "addresses",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/addresses/{id}": {
+      "get": {
+        "operationId": "getV1AddressesById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+            },
+          },
+        ],
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/entities/": {
+      "delete": {
+        "operationId": "deleteV1Entities",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "entities": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "entities",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "entities": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "entities",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "entities": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "entities",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "get": {
+        "operationId": "getV1Entities",
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "post": {
+        "operationId": "postV1Entities",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "data": {
+                    "patternProperties": {
+                      "^(.*)$": {},
+                    },
+                    "type": "object",
+                  },
+                  "description": {
+                    "type": "string",
+                  },
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "description",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "data": {
+                    "patternProperties": {
+                      "^(.*)$": {},
+                    },
+                    "type": "object",
+                  },
+                  "description": {
+                    "type": "string",
+                  },
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "description",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "data": {
+                    "patternProperties": {
+                      "^(.*)$": {},
+                    },
+                    "type": "object",
+                  },
+                  "description": {
+                    "type": "string",
+                  },
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "description",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/entities/{id}": {
+      "get": {
+        "operationId": "getV1EntitiesById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+            },
+          },
+        ],
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "put": {
+        "operationId": "putV1EntitiesById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+            },
+          },
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "data": {
+                    "patternProperties": {
+                      "^(.*)$": {},
+                    },
+                    "type": "object",
+                  },
+                  "description": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "data": {
+                    "patternProperties": {
+                      "^(.*)$": {},
+                    },
+                    "type": "object",
+                  },
+                  "description": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "data": {
+                    "patternProperties": {
+                      "^(.*)$": {},
+                    },
+                    "type": "object",
+                  },
+                  "description": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/heartbeat/": {
+      "get": {
+        "operationId": "getV1Heartbeat",
+      },
+    },
+    "/v1/info/": {
+      "get": {
+        "description": "Looks up a blockchain address or an entity id and returns known balances, linked sources, tags, and related entities. Example searches: \`?q=DTestAddress123\`, \`?q=ent_exampleentity\`.",
+        "operationId": "getV1Info",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "description": "Address or entity id to investigate, for example \`DTestAddress123\` or \`ent_exampleentity\`.",
+              "examples": [
+                "DTestAddress123",
+                "ent_exampleentity",
+              ],
+              "type": "string",
+            },
+          },
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "addressLookup": {
+                    "summary": "Address lookup with entity and risk context",
+                    "value": {
+                      "addresses": [
+                        "DTestAddress123",
+                      ],
+                      "assets": [
+                        {
+                          "balance": "2500000000",
+                          "network": "net_dogecoin",
+                        },
+                      ],
+                      "entities": [
+                        {
+                          "data": {},
+                          "description": "Tracked counterparty",
+                          "id": "ent_exampleentity",
+                          "name": "Example Entity",
+                          "tags": [
+                            "tag_sanctions",
+                          ],
+                        },
+                      ],
+                      "networks": [
+                        {
+                          "chainId": 0,
+                          "id": "net_dogecoin",
+                          "name": "Dogecoin Mainnet",
+                        },
+                      ],
+                      "risk": {
+                        "level": "high",
+                        "reasons": [
+                          "entity",
+                          "source",
+                        ],
+                      },
+                      "sources": [
+                        {
+                          "entity": "ent_sourceentity",
+                          "from": "DSourceWallet456",
+                          "hops": 2,
+                          "network": "net_dogecoin",
+                          "to": "DTestAddress123",
+                        },
+                      ],
+                      "tags": [
+                        {
+                          "id": "tag_sanctions",
+                          "name": "Sanctions",
+                          "riskLevel": "high",
+                        },
+                      ],
+                      "tokens": [],
+                    },
+                  },
+                },
+              },
+            },
+            "description": "Investigation result for the supplied address or entity.",
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "missingQuery": {
+                    "summary": "Missing q parameter",
+                    "value": {
+                      "error": "missing input params",
+                    },
+                  },
+                },
+              },
+            },
+            "description": "The query string is missing.",
+          },
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/keys/": {
+      "delete": {
+        "operationId": "deleteV1Keys",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "keys": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "keys",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "keys": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "keys",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "keys": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "keys",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "get": {
+        "operationId": "getV1Keys",
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "post": {
+        "description": "Creates the first API key without authentication. After the first key exists, this route also requires x-api-token.",
+        "operationId": "postV1Keys",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "type": "string",
+                  },
+                },
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "type": "string",
+                  },
+                },
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "type": "string",
+                  },
+                },
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+      },
+    },
+    "/v1/keys/{id}": {
+      "get": {
+        "operationId": "getV1KeysById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+            },
+          },
+        ],
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "put": {
+        "operationId": "putV1KeysById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+            },
+          },
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "isActive": {
+                    "type": "boolean",
+                  },
+                },
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "isActive": {
+                    "type": "boolean",
+                  },
+                },
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "isActive": {
+                    "type": "boolean",
+                  },
+                },
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/networks/": {
+      "delete": {
+        "operationId": "deleteV1Networks",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "networks": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "networks",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "networks": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "networks",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "networks": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "networks",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "get": {
+        "operationId": "getV1Networks",
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "post": {
+        "operationId": "postV1Networks",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "architecture": {
+                    "enum": [
+                      "dogecoin",
+                      "evm",
+                    ],
+                    "type": "string",
+                  },
+                  "blockTime": {
+                    "type": "number",
+                  },
+                  "chainId": {
+                    "type": "number",
+                  },
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "rpcEndpoint": {
+                    "type": "string",
+                  },
+                  "rps": {
+                    "type": "number",
+                  },
+                },
+                "required": [
+                  "name",
+                  "architecture",
+                  "blockTime",
+                  "rpcEndpoint",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "architecture": {
+                    "enum": [
+                      "dogecoin",
+                      "evm",
+                    ],
+                    "type": "string",
+                  },
+                  "blockTime": {
+                    "type": "number",
+                  },
+                  "chainId": {
+                    "type": "number",
+                  },
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "rpcEndpoint": {
+                    "type": "string",
+                  },
+                  "rps": {
+                    "type": "number",
+                  },
+                },
+                "required": [
+                  "name",
+                  "architecture",
+                  "blockTime",
+                  "rpcEndpoint",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "architecture": {
+                    "enum": [
+                      "dogecoin",
+                      "evm",
+                    ],
+                    "type": "string",
+                  },
+                  "blockTime": {
+                    "type": "number",
+                  },
+                  "chainId": {
+                    "type": "number",
+                  },
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "rpcEndpoint": {
+                    "type": "string",
+                  },
+                  "rps": {
+                    "type": "number",
+                  },
+                },
+                "required": [
+                  "name",
+                  "architecture",
+                  "blockTime",
+                  "rpcEndpoint",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/networks/{id}": {
+      "get": {
+        "operationId": "getV1NetworksById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+            },
+          },
+        ],
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "put": {
+        "operationId": "putV1NetworksById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+            },
+          },
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "architecture": {
+                    "enum": [
+                      "dogecoin",
+                      "evm",
+                    ],
+                    "type": "string",
+                  },
+                  "blockTime": {
+                    "type": "number",
+                  },
+                  "chainId": {
+                    "type": "number",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "rpcEndpoint": {
+                    "type": "string",
+                  },
+                  "rps": {
+                    "type": "number",
+                  },
+                },
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "architecture": {
+                    "enum": [
+                      "dogecoin",
+                      "evm",
+                    ],
+                    "type": "string",
+                  },
+                  "blockTime": {
+                    "type": "number",
+                  },
+                  "chainId": {
+                    "type": "number",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "rpcEndpoint": {
+                    "type": "string",
+                  },
+                  "rps": {
+                    "type": "number",
+                  },
+                },
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "architecture": {
+                    "enum": [
+                      "dogecoin",
+                      "evm",
+                    ],
+                    "type": "string",
+                  },
+                  "blockTime": {
+                    "type": "number",
+                  },
+                  "chainId": {
+                    "type": "number",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "rpcEndpoint": {
+                    "type": "string",
+                  },
+                  "rps": {
+                    "type": "number",
+                  },
+                },
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/stats/": {
+      "get": {
+        "operationId": "getV1Stats",
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/tags/": {
+      "delete": {
+        "operationId": "deleteV1Tags",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "tags": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "tags",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "tags": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "tags",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "tags": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "tags",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "get": {
+        "operationId": "getV1Tags",
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "post": {
+        "operationId": "postV1Tags",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "riskLevel": {
+                    "enum": [
+                      "low",
+                      "high",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "name",
+                  "riskLevel",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "riskLevel": {
+                    "enum": [
+                      "low",
+                      "high",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "name",
+                  "riskLevel",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "riskLevel": {
+                    "enum": [
+                      "low",
+                      "high",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "name",
+                  "riskLevel",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/tags/{id}": {
+      "get": {
+        "operationId": "getV1TagsById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+            },
+          },
+        ],
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "put": {
+        "operationId": "putV1TagsById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+            },
+          },
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "name": {
+                    "type": "string",
+                  },
+                  "riskLevel": {
+                    "enum": [
+                      "low",
+                      "high",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "name": {
+                    "type": "string",
+                  },
+                  "riskLevel": {
+                    "enum": [
+                      "low",
+                      "high",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "name": {
+                    "type": "string",
+                  },
+                  "riskLevel": {
+                    "enum": [
+                      "low",
+                      "high",
+                    ],
+                    "type": "string",
+                  },
+                },
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/tokens/": {
+      "delete": {
+        "operationId": "deleteV1Tokens",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "tokens": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "tokens",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "tokens": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "tokens",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "tokens": {
+                    "items": {
+                      "type": "string",
+                    },
+                    "type": "array",
+                  },
+                },
+                "required": [
+                  "tokens",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "get": {
+        "operationId": "getV1Tokens",
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+      "post": {
+        "operationId": "postV1Tokens",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "address": {
+                    "type": "string",
+                  },
+                  "decimals": {
+                    "type": "number",
+                  },
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "network": {
+                    "type": "string",
+                  },
+                  "symbol": {
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "network",
+                  "name",
+                  "symbol",
+                  "decimals",
+                ],
+                "type": "object",
+              },
+            },
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "properties": {
+                  "address": {
+                    "type": "string",
+                  },
+                  "decimals": {
+                    "type": "number",
+                  },
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "network": {
+                    "type": "string",
+                  },
+                  "symbol": {
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "network",
+                  "name",
+                  "symbol",
+                  "decimals",
+                ],
+                "type": "object",
+              },
+            },
+            "multipart/form-data": {
+              "schema": {
+                "properties": {
+                  "address": {
+                    "type": "string",
+                  },
+                  "decimals": {
+                    "type": "number",
+                  },
+                  "id": {
+                    "type": "string",
+                  },
+                  "name": {
+                    "type": "string",
+                  },
+                  "network": {
+                    "type": "string",
+                  },
+                  "symbol": {
+                    "type": "string",
+                  },
+                },
+                "required": [
+                  "network",
+                  "name",
+                  "symbol",
+                  "decimals",
+                ],
+                "type": "object",
+              },
+            },
+          },
+          "required": true,
+        },
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+    "/v1/tokens/{id}": {
+      "get": {
+        "operationId": "getV1TokensById",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string",
+            },
+          },
+        ],
+        "security": [
+          {
+            "ApiTokenAuth": [],
+          },
+        ],
+      },
+    },
+  },
+}
+`;

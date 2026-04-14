@@ -15,7 +15,7 @@ import {
   type SourceLinkRecord,
 } from '@onlydoge/indexing-pipeline';
 import type { InvestigationWarehousePort } from '@onlydoge/investigation-query';
-import type { PrimaryId } from '@onlydoge/shared-kernel';
+import { InfrastructureError, type PrimaryId } from '@onlydoge/shared-kernel';
 
 import type { WarehouseSettings } from './settings';
 
@@ -60,6 +60,10 @@ interface VersionedDirectLinkRow extends DirectLinkRecord {
 const maxClickHouseQueryValuesPerChunk = 256;
 const maxClickHouseQueryValueBytesPerChunk = 12_000;
 const utxoCurrentStateTable = 'utxo_outputs_current_v2';
+type ClickHouseClient = ReturnType<typeof createClient>;
+type ClickHouseCommandParameters = Parameters<ClickHouseClient['command']>[0];
+type ClickHouseInsertParameters = Parameters<ClickHouseClient['insert']>[0];
+type ClickHouseJsonQueryParameters = Parameters<ClickHouseClient['query']>[0];
 
 const emptyWarehouseState = (): WarehouseState => ({
   appliedBlocks: [],
@@ -515,9 +519,8 @@ export class ClickHouseWarehouseAdapter
 
     const rowChunks: BalanceRow[][] = await Promise.all(
       chunkQueryValues(addresses).map((chunk) =>
-        this.client
-          .query({
-            query: `
+        this.queryRows<BalanceRow>({
+          query: `
               SELECT
                 network_id AS "networkId",
                 asset_address AS "assetAddress",
@@ -529,10 +532,9 @@ export class ClickHouseWarehouseAdapter
               ORDER BY network_id ASC, asset_address ASC, address ASC, version DESC
               LIMIT 1 BY network_id, asset_address, address
             `,
-            query_params: { addresses: chunk },
-            format: 'JSONEachRow',
-          })
-          .then((result) => result.json<BalanceRow>()),
+          query_params: { addresses: chunk },
+          format: 'JSONEachRow',
+        }),
       ),
     );
     const rows = rowChunks.flat();
@@ -558,24 +560,20 @@ export class ClickHouseWarehouseAdapter
       }>
     > = await Promise.all(
       chunkQueryValues(addresses).map((chunk) =>
-        this.client
-          .query({
-            query: `
+        this.queryRows<{
+          fromAddress: string;
+          networkId: PrimaryId;
+          toAddress: string;
+          transferCount: number;
+        }>({
+          query: `
               SELECT network_id AS "networkId", source_address AS "fromAddress", to_address AS "toAddress", hop_count AS "transferCount"
               FROM source_links
               WHERE to_address IN ({addresses:Array(String)})
             `,
-            query_params: { addresses: chunk },
-            format: 'JSONEachRow',
-          })
-          .then((result) =>
-            result.json<{
-              fromAddress: string;
-              networkId: PrimaryId;
-              toAddress: string;
-              transferCount: number;
-            }>(),
-          ),
+          query_params: { addresses: chunk },
+          format: 'JSONEachRow',
+        }),
       ),
     );
     const rows = rowChunks.flat();
@@ -584,12 +582,11 @@ export class ClickHouseWarehouseAdapter
   }
 
   public async listAppliedBlocks(networkId: PrimaryId, offset = 0, limit?: number) {
-    const rows: Array<{
+    const rows = await this.queryRows<{
       blockHash: string;
       blockHeight: number;
-    }> = await this.client
-      .query({
-        query: `
+    }>({
+      query: `
           SELECT
             block_height AS "blockHeight",
             block_hash AS "blockHash"
@@ -599,25 +596,23 @@ export class ClickHouseWarehouseAdapter
           ${limit !== undefined ? 'LIMIT {limit:UInt64}' : ''}
           ${offset > 0 ? 'OFFSET {offset:UInt64}' : ''}
         `,
-        query_params: {
-          networkId,
-          ...(limit !== undefined ? { limit } : {}),
-          ...(offset > 0 ? { offset } : {}),
-        },
-        format: 'JSONEachRow',
-      })
-      .then((result) => result.json());
+      query_params: {
+        networkId,
+        ...(limit !== undefined ? { limit } : {}),
+        ...(offset > 0 ? { offset } : {}),
+      },
+      format: 'JSONEachRow',
+    });
 
     return rows;
   }
 
   public async getAppliedBlockByHash(networkId: PrimaryId, blockHash: string) {
-    const rows: Array<{
+    const rows = await this.queryRows<{
       blockHash: string;
       blockHeight: number;
-    }> = await this.client
-      .query({
-        query: `
+    }>({
+      query: `
           SELECT
             block_height AS "blockHeight",
             block_hash AS "blockHash"
@@ -625,23 +620,21 @@ export class ClickHouseWarehouseAdapter
           WHERE network_id = {networkId:UInt64} AND block_hash = {blockHash:String}
           LIMIT 1
         `,
-        query_params: { networkId, blockHash },
-        format: 'JSONEachRow',
-      })
-      .then((result) => result.json());
+      query_params: { networkId, blockHash },
+      format: 'JSONEachRow',
+    });
 
     return rows[0] ?? null;
   }
 
   public async getTransactionRef(networkId: PrimaryId, txid: string) {
-    const rows: Array<{
+    const rows = await this.queryRows<{
       blockHash: string;
       blockHeight: number;
       blockTime: number;
       txIndex: number;
-    }> = await this.client
-      .query({
-        query: `
+    }>({
+      query: `
           SELECT
             block_height AS "blockHeight",
             block_hash AS "blockHash",
@@ -652,19 +645,21 @@ export class ClickHouseWarehouseAdapter
           ORDER BY version DESC
           LIMIT 1
         `,
-        query_params: { networkId, txid },
-        format: 'JSONEachRow',
-      })
-      .then((result) => result.json());
+      query_params: { networkId, txid },
+      format: 'JSONEachRow',
+    });
 
     return rows[0] ?? null;
   }
 
   public async getAddressSummary(networkId: PrimaryId, address: string) {
     const [movementRows, balanceRows, utxoRows] = await Promise.all([
-      this.client
-        .query({
-          query: `
+      this.queryRows<{
+        receivedBase: string;
+        sentBase: string;
+        txCount: number;
+      }>({
+        query: `
             SELECT
               CAST(sumIf(toInt256(amount_base), direction = 'credit') AS String) AS "receivedBase",
               CAST(sumIf(toInt256(amount_base), direction = 'debit') AS String) AS "sentBase",
@@ -672,44 +667,38 @@ export class ClickHouseWarehouseAdapter
             FROM address_movements_v2
             WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
           `,
-          query_params: { networkId, address },
-          format: 'JSONEachRow',
-        })
-        .then((result) =>
-          result.json<{
-            receivedBase: string;
-            sentBase: string;
-            txCount: number;
-          }>(),
-        ),
-      this.client
-        .query({
-          query: `
+        query_params: { networkId, address },
+        format: 'JSONEachRow',
+      }),
+      this.queryRows<{ balance: string }>({
+        query: `
             SELECT balance
             FROM balances_v2
             WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
             ORDER BY version DESC
             LIMIT 1
           `,
-          query_params: { networkId, address },
-          format: 'JSONEachRow',
-        })
-        .then((result) => result.json<{ balance: string }>()),
-      this.client
-        .query({
-          query: `
+        query_params: { networkId, address },
+        format: 'JSONEachRow',
+      }),
+      this.queryRows<{ utxoCount: number }>({
+        query: `
             SELECT count() AS "utxoCount"
-            FROM utxo_outputs_current_v2 FINAL
-            WHERE
-              network_id = {networkId:UInt64}
-              AND address = {address:String}
-              AND is_spendable = 1
-              AND spent_by_txid IS NULL
+            FROM (
+              SELECT
+                output_key,
+                is_spendable,
+                spent_by_txid
+              FROM utxo_outputs_current_v2
+              WHERE network_id = {networkId:UInt64} AND address = {address:String}
+              ORDER BY output_key ASC, version DESC
+              LIMIT 1 BY output_key
+            )
+            WHERE is_spendable = 1 AND spent_by_txid IS NULL
           `,
-          query_params: { networkId, address },
-          format: 'JSONEachRow',
-        })
-        .then((result) => result.json<{ utxoCount: number }>()),
+        query_params: { networkId, address },
+        format: 'JSONEachRow',
+      }),
     ]);
 
     const movement = movementRows[0];
@@ -734,7 +723,7 @@ export class ClickHouseWarehouseAdapter
     offset = 0,
     limit?: number,
   ) {
-    const rows: Array<{
+    const rows = await this.queryRows<{
       blockHash: string;
       blockHeight: number;
       blockTime: number;
@@ -742,9 +731,8 @@ export class ClickHouseWarehouseAdapter
       sentBase: string;
       txIndex: number;
       txid: string;
-    }> = await this.client
-      .query({
-        query: `
+    }>({
+      query: `
           SELECT
             block_height AS "blockHeight",
             block_hash AS "blockHash",
@@ -760,61 +748,77 @@ export class ClickHouseWarehouseAdapter
           ${limit !== undefined ? 'LIMIT {limit:UInt64}' : ''}
           ${offset > 0 ? 'OFFSET {offset:UInt64}' : ''}
         `,
-        query_params: {
-          networkId,
-          address,
-          ...(limit !== undefined ? { limit } : {}),
-          ...(offset > 0 ? { offset } : {}),
-        },
-        format: 'JSONEachRow',
-      })
-      .then((result) => result.json());
+      query_params: {
+        networkId,
+        address,
+        ...(limit !== undefined ? { limit } : {}),
+        ...(offset > 0 ? { offset } : {}),
+      },
+      format: 'JSONEachRow',
+    });
 
     return rows;
   }
 
   public async listAddressUtxos(networkId: PrimaryId, address: string, offset = 0, limit?: number) {
-    const rows: ProjectionUtxoOutput[] = await this.client
-      .query({
-        query: `
+    const pageRows = await this.queryRows<{
+      blockHeight: number;
+      outputKey: string;
+      txIndex: number;
+      vout: number;
+    }>({
+      query: `
           SELECT
-            {networkId:UInt64} AS "networkId",
+            output_key AS "outputKey",
             block_height AS "blockHeight",
-            block_hash AS "blockHash",
-            block_time AS "blockTime",
-            txid,
             tx_index AS "txIndex",
             vout,
-            output_key AS "outputKey",
-            address,
-            script_type AS "scriptType",
-            value_base AS "valueBase",
-            is_coinbase = 1 AS "isCoinbase",
-            is_spendable = 1 AS "isSpendable",
-            spent_by_txid AS "spentByTxid",
-            spent_in_block AS "spentInBlock",
-            spent_input_index AS "spentInputIndex"
-          FROM utxo_outputs_current_v2 FINAL
-          WHERE
-            network_id = {networkId:UInt64}
-            AND address = {address:String}
-            AND is_spendable = 1
-            AND spent_by_txid IS NULL
+            is_spendable,
+            spent_by_txid
+          FROM (
+            SELECT
+              output_key,
+              block_height,
+              tx_index,
+              vout,
+              is_spendable,
+              spent_by_txid
+            FROM utxo_outputs_current_v2
+            WHERE network_id = {networkId:UInt64} AND address = {address:String}
+            ORDER BY output_key ASC, version DESC
+            LIMIT 1 BY output_key
+          )
+          WHERE is_spendable = 1 AND spent_by_txid IS NULL
           ORDER BY block_height DESC, tx_index DESC, vout ASC
           ${limit !== undefined ? 'LIMIT {limit:UInt64}' : ''}
           ${offset > 0 ? 'OFFSET {offset:UInt64}' : ''}
         `,
-        query_params: {
-          networkId,
-          address,
-          ...(limit !== undefined ? { limit } : {}),
-          ...(offset > 0 ? { offset } : {}),
-        },
-        format: 'JSONEachRow',
-      })
-      .then((result) => result.json());
+      query_params: {
+        networkId,
+        address,
+        ...(limit !== undefined ? { limit } : {}),
+        ...(offset > 0 ? { offset } : {}),
+      },
+      format: 'JSONEachRow',
+    });
 
-    return rows;
+    if (pageRows.length === 0) {
+      return [];
+    }
+
+    const outputsByKey = await this.getUtxoOutputs(
+      networkId,
+      pageRows.map((row) => row.outputKey),
+    );
+
+    return pageRows.flatMap((row) => {
+      const output = outputsByKey.get(row.outputKey);
+      if (!output || !output.isSpendable || output.spentByTxid !== null) {
+        return [];
+      }
+
+      return [output];
+    });
   }
 
   public async getUtxoOutput(
@@ -868,9 +872,8 @@ export class ClickHouseWarehouseAdapter
     blockHeight: number,
     blockHash: string,
   ): Promise<boolean> {
-    const rows: Array<Record<string, unknown>> = await this.client
-      .query({
-        query: `
+    const rows = await this.queryRows<Record<string, unknown>>({
+      query: `
           SELECT 1
           FROM applied_blocks_v2
           WHERE
@@ -879,10 +882,9 @@ export class ClickHouseWarehouseAdapter
             AND block_hash = {blockHash:String}
           LIMIT 1
         `,
-        query_params: { networkId, blockHeight, blockHash },
-        format: 'JSONEachRow',
-      })
-      .then((result) => result.json());
+      query_params: { networkId, blockHeight, blockHash },
+      format: 'JSONEachRow',
+    });
 
     return rows.length > 0;
   }
@@ -894,9 +896,8 @@ export class ClickHouseWarehouseAdapter
 
     const rowChunks: DirectLinkRecord[][] = await Promise.all(
       chunkQueryValues(fromAddresses).map((chunk) =>
-        this.client
-          .query({
-            query: `
+        this.queryRows<DirectLinkRecord>({
+          query: `
               SELECT
                 {networkId:UInt64} AS "networkId",
                 from_address AS "fromAddress",
@@ -911,10 +912,9 @@ export class ClickHouseWarehouseAdapter
               ORDER BY from_address ASC, to_address ASC, asset_address ASC, version DESC
               LIMIT 1 BY network_id, from_address, to_address, asset_address
             `,
-            query_params: { networkId, fromAddresses: chunk },
-            format: 'JSONEachRow',
-          })
-          .then((result) => result.json<DirectLinkRecord>()),
+          query_params: { networkId, fromAddresses: chunk },
+          format: 'JSONEachRow',
+        }),
       ),
     );
     const rows = rowChunks.flat();
@@ -932,17 +932,15 @@ export class ClickHouseWarehouseAdapter
 
     const rowChunks: Array<Array<{ sourceAddressId: PrimaryId }>> = await Promise.all(
       chunkQueryValues(addresses).map((chunk) =>
-        this.client
-          .query({
-            query: `
+        this.queryRows<{ sourceAddressId: PrimaryId }>({
+          query: `
               SELECT DISTINCT source_address_id AS "sourceAddressId"
               FROM source_links
               WHERE network_id = {networkId:UInt64} AND to_address IN ({addresses:Array(String)})
             `,
-            query_params: { networkId, addresses: chunk },
-            format: 'JSONEachRow',
-          })
-          .then((result) => result.json<{ sourceAddressId: PrimaryId }>()),
+          query_params: { networkId, addresses: chunk },
+          format: 'JSONEachRow',
+        }),
       ),
     );
     const rows = rowChunks.flat();
@@ -1177,7 +1175,7 @@ export class ClickHouseWarehouseAdapter
     sourceAddressId: PrimaryId,
     rows: SourceLinkRecord[],
   ): Promise<void> {
-    await this.client.command({
+    await this.executeCommand({
       query: `
         ALTER TABLE source_links
         DELETE WHERE network_id = {networkId:UInt64} AND source_address_id = {sourceAddressId:UInt64}
@@ -1216,9 +1214,12 @@ export class ClickHouseWarehouseAdapter
       >
     > = await Promise.all(
       chunkQueryValues(keys).map((chunk) =>
-        this.client
-          .query({
-            query: `
+        this.queryRows<
+          BalanceRow & {
+            version: number;
+          }
+        >({
+          query: `
               SELECT
                 network_id AS "networkId",
                 address,
@@ -1232,16 +1233,9 @@ export class ClickHouseWarehouseAdapter
               ORDER BY address ASC, asset_address ASC, version DESC
               LIMIT 1 BY network_id, address, asset_address
             `,
-            query_params: { networkId },
-            format: 'JSONEachRow',
-          })
-          .then((result) =>
-            result.json<
-              BalanceRow & {
-                version: number;
-              }
-            >(),
-          ),
+          query_params: { networkId },
+          format: 'JSONEachRow',
+        }),
       ),
     );
     const rows = rowChunks.flat();
@@ -1277,9 +1271,12 @@ export class ClickHouseWarehouseAdapter
       >
     > = await Promise.all(
       chunkQueryValues(keys).map((chunk) =>
-        this.client
-          .query({
-            query: `
+        this.queryRows<
+          DirectLinkRecord & {
+            version: number;
+          }
+        >({
+          query: `
               SELECT
                 network_id AS "networkId",
                 from_address AS "fromAddress",
@@ -1296,16 +1293,9 @@ export class ClickHouseWarehouseAdapter
               ORDER BY from_address ASC, to_address ASC, asset_address ASC, version DESC
               LIMIT 1 BY network_id, from_address, to_address, asset_address
             `,
-            query_params: { networkId },
-            format: 'JSONEachRow',
-          })
-          .then((result) =>
-            result.json<
-              DirectLinkRecord & {
-                version: number;
-              }
-            >(),
-          ),
+          query_params: { networkId },
+          format: 'JSONEachRow',
+        }),
       ),
     );
     const rows = rowChunks.flat();
@@ -1337,13 +1327,12 @@ export class ClickHouseWarehouseAdapter
       return new Set();
     }
 
-    const rows: Array<{
+    const rows = await this.queryRows<{
       blockHash: string;
       blockHeight: number;
       networkId: PrimaryId;
-    }> = await this.client
-      .query({
-        query: `
+    }>({
+      query: `
           SELECT
             network_id AS "networkId",
             block_height AS "blockHeight",
@@ -1351,10 +1340,9 @@ export class ClickHouseWarehouseAdapter
           FROM applied_blocks_v2
           WHERE network_id = {networkId:UInt64} AND block_height IN ({heights:Array(UInt64)})
         `,
-        query_params: { networkId, heights },
-        format: 'JSONEachRow',
-      })
-      .then((result) => result.json());
+      query_params: { networkId, heights },
+      format: 'JSONEachRow',
+    });
 
     return new Set(rows.map((row) => blockIdentity(row.networkId, row.blockHeight, row.blockHash)));
   }
@@ -1364,7 +1352,7 @@ export class ClickHouseWarehouseAdapter
       return;
     }
 
-    await this.client.insert({
+    await this.executeInsert({
       table,
       values,
       format: 'JSONEachRow',
@@ -1379,9 +1367,8 @@ export class ClickHouseWarehouseAdapter
   ): Promise<ProjectionUtxoOutput[]> {
     const rowChunks: ProjectionUtxoOutput[][] = await Promise.all(
       chunkQueryValues(outputKeys).map((chunk) =>
-        this.client
-          .query({
-            query: `
+        this.queryRows<ProjectionUtxoOutput>({
+          query: `
               SELECT
                 {networkId:UInt64} AS "networkId",
                 block_height AS "blockHeight",
@@ -1403,14 +1390,61 @@ export class ClickHouseWarehouseAdapter
               WHERE network_id = {networkId:UInt64} AND output_key IN ({outputKeys:Array(String)})
               ${useFinal ? '' : 'ORDER BY output_key ASC, version DESC LIMIT 1 BY output_key'}
             `,
-            query_params: { networkId, outputKeys: chunk },
-            format: 'JSONEachRow',
-          })
-          .then((result) => result.json<ProjectionUtxoOutput>()),
+          query_params: { networkId, outputKeys: chunk },
+          format: 'JSONEachRow',
+        }),
       ),
     );
 
     return rowChunks.flat();
+  }
+
+  private async queryRows<T>(parameters: ClickHouseJsonQueryParameters): Promise<T[]> {
+    try {
+      const result = await this.client.query(parameters);
+      return (await result.json<T>()) as T[];
+    } catch (error) {
+      throw this.toInfrastructureError(error);
+    }
+  }
+
+  private async executeCommand(parameters: ClickHouseCommandParameters): Promise<void> {
+    try {
+      await this.client.command(parameters);
+    } catch (error) {
+      throw this.toInfrastructureError(error);
+    }
+  }
+
+  private async executeInsert(parameters: ClickHouseInsertParameters): Promise<void> {
+    try {
+      await this.client.insert(parameters);
+    } catch (error) {
+      throw this.toInfrastructureError(error);
+    }
+  }
+
+  private toInfrastructureError(error: unknown): InfrastructureError {
+    if (error instanceof InfrastructureError) {
+      return error;
+    }
+
+    const message = describeWarehouseError(error);
+    if (isWarehouseUnavailableMessage(message)) {
+      return new InfrastructureError('warehouse unavailable', {
+        cause: error,
+      });
+    }
+
+    if (isWarehouseMemoryLimitMessage(message)) {
+      return new InfrastructureError('warehouse query exceeded memory limit', {
+        cause: error,
+      });
+    }
+
+    return new InfrastructureError('warehouse query failed', {
+      cause: error,
+    });
   }
 }
 
@@ -1473,6 +1507,33 @@ function chunkQueryValues<T>(values: T[]): T[][] {
   }
 
   return chunks;
+}
+
+function describeWarehouseError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === 'object' && error !== null && 'message' in error) {
+    const message = Reflect.get(error, 'message');
+    if (typeof message === 'string') {
+      return message;
+    }
+  }
+
+  return String(error);
+}
+
+function isWarehouseUnavailableMessage(message: string): boolean {
+  return ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'socket hang up', 'EAI_AGAIN'].some((needle) =>
+    message.includes(needle),
+  );
+}
+
+function isWarehouseMemoryLimitMessage(message: string): boolean {
+  return (
+    message.includes('MEMORY_LIMIT_EXCEEDED') || message.includes('User memory limit exceeded')
+  );
 }
 
 function formatBalanceTupleList(keys: string[]): string {

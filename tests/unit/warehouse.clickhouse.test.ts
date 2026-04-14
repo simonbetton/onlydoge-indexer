@@ -1,7 +1,48 @@
 import { ClickHouseWarehouseAdapter } from '@onlydoge/platform';
+import { InfrastructureError } from '@onlydoge/shared-kernel';
 import { describe, expect, it, vi } from 'vitest';
 
 describe('clickhouse warehouse adapter', () => {
+  it('surfaces warehouse connection failures as infrastructure errors', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async () => {
+      const error = new Error('connect ECONNREFUSED 10.124.0.6:8123');
+      Object.assign(error, { code: 'ECONNREFUSED' });
+      throw error;
+    });
+
+    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+
+    await expect(adapter.listAppliedBlocks(7)).rejects.toEqual(
+      new InfrastructureError('warehouse unavailable', {
+        cause: expect.any(Error),
+      }),
+    );
+  });
+
+  it('surfaces warehouse memory-limit failures as infrastructure errors', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async () => {
+      const error = new Error('MEMORY_LIMIT_EXCEEDED: User memory limit exceeded');
+      Object.assign(error, { code: '241' });
+      throw error;
+    });
+
+    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+
+    await expect(adapter.listAppliedBlocks(7)).rejects.toEqual(
+      new InfrastructureError('warehouse query exceeded memory limit', {
+        cause: expect.any(Error),
+      }),
+    );
+  });
+
   it('chunks oversized output-key queries instead of sending one huge request', async () => {
     const adapter = new ClickHouseWarehouseAdapter({
       driver: 'clickhouse',
@@ -207,6 +248,73 @@ describe('clickhouse warehouse adapter', () => {
     );
 
     expect(insertedTables).toContain('utxo_outputs_current_v2');
+  });
+
+  it('lists address UTXOs from a deduplicated key page before loading full rows', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async ({ query: statement }: { query: string }) => {
+      if (statement.includes('LIMIT 1 BY output_key') && !statement.includes('FINAL')) {
+        return {
+          json: async () => [
+            {
+              outputKey: 'prev-txid:1',
+              blockHeight: 123,
+              txIndex: 4,
+              vout: 1,
+            },
+          ],
+        };
+      }
+
+      if (statement.includes('FROM utxo_outputs_current_v2 FINAL')) {
+        return {
+          json: async () => [
+            {
+              networkId: 7,
+              blockHeight: 123,
+              blockHash: 'prev-hash',
+              blockTime: 456,
+              txid: 'prev-txid',
+              txIndex: 4,
+              vout: 1,
+              outputKey: 'prev-txid:1',
+              address: 'DInputAddress',
+              scriptType: 'pubkeyhash',
+              valueBase: '10',
+              isCoinbase: false,
+              isSpendable: true,
+              spentByTxid: null,
+              spentInBlock: null,
+              spentInputIndex: null,
+            },
+          ],
+        };
+      }
+
+      return { json: async () => [] };
+    });
+
+    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+
+    const rows = await adapter.listAddressUtxos(7, 'DInputAddress', 0, 50);
+    const statements = query.mock.calls.map(([parameters]) => parameters.query);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      outputKey: 'prev-txid:1',
+      address: 'DInputAddress',
+    });
+    expect(
+      statements.some(
+        (statement) =>
+          statement.includes('LIMIT 1 BY output_key') &&
+          statement.includes('FROM utxo_outputs_current_v2') &&
+          !statement.includes('FINAL'),
+      ),
+    ).toBe(true);
   });
 
   it('falls back to the versioned UTXO table when the current-state table misses rows', async () => {

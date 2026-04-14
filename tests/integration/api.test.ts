@@ -87,6 +87,9 @@ describe('api integration', () => {
     const deniedInfo = await request(ctx.app, '/v1/info?q=test');
     expect(deniedInfo.status).toBe(401);
 
+    const deniedExplorer = await request(ctx.app, '/v1/explorer/networks');
+    expect(deniedExplorer.status).toBe(401);
+
     const heartbeat = await request(ctx.app, '/v1/heartbeat');
     expect(heartbeat.status).toBe(204);
 
@@ -232,8 +235,17 @@ describe('api integration', () => {
     await ctx.cleanup();
   });
 
-  it('serves public explorer endpoints from indexed dogecoin data', async () => {
+  it('serves authenticated explorer endpoints from indexed dogecoin data', async () => {
     const ctx = await createTestApp();
+    const created = await request(ctx.app, '/v1/keys/', {
+      method: 'POST',
+      body: {},
+    });
+    const key = await readJsonObject(created);
+    const apiToken = requireStringField(key, 'key');
+    const headers = {
+      'x-api-token': apiToken,
+    };
     const network = await ctx.runtime.networkCatalog.createNetwork({
       name: 'Dogecoin Mainnet',
       architecture: 'dogecoin',
@@ -279,45 +291,65 @@ describe('api integration', () => {
 
     await ctx.runtime.indexingPipeline.runOnce();
 
-    const networks = await request(ctx.app, '/v1/explorer/networks');
+    const deniedNetworks = await request(ctx.app, '/v1/explorer/networks');
+    expect(deniedNetworks.status).toBe(401);
+
+    const networks = await request(ctx.app, '/v1/explorer/networks', {
+      headers,
+    });
     expect(networks.status).toBe(200);
     expect(networks.headers.get('cache-control')).toBe(
-      'public, max-age=30, stale-while-revalidate=120',
+      'private, max-age=30, stale-while-revalidate=120',
     );
+    expect(networks.headers.get('vary')).toBe('x-api-token');
     const networksBody = await readJsonObject(networks);
     const [networkSummary] = readObjectArrayField(networksBody, 'networks');
     expect(requireStringField(networkSummary ?? {}, 'id')).toBe(network.id);
 
-    const searchByHeight = await request(ctx.app, '/v1/explorer/search?q=2');
+    const searchByHeight = await request(ctx.app, '/v1/explorer/search?q=2', {
+      headers,
+    });
     expect(searchByHeight.status).toBe(200);
     expect(searchByHeight.headers.get('cache-control')).toBe(
-      'public, max-age=5, stale-while-revalidate=15',
+      'private, max-age=5, stale-while-revalidate=15',
     );
+    expect(searchByHeight.headers.get('vary')).toBe('x-api-token');
     const heightMatch = readObjectArrayField(await readJsonObject(searchByHeight), 'matches')[0];
     expect(requireStringField(heightMatch ?? {}, 'type')).toBe('block');
 
-    const searchByTx = await request(ctx.app, '/v1/explorer/search?q=doge-tx-2');
+    const searchByTx = await request(ctx.app, '/v1/explorer/search?q=doge-tx-2', {
+      headers,
+    });
     const txMatch = readObjectArrayField(await readJsonObject(searchByTx), 'matches')[0];
     expect(requireStringField(txMatch ?? {}, 'txid')).toBe('doge-tx-2');
 
     const searchByAddress = await request(
       ctx.app,
       `/v1/explorer/search?q=${dogecoinFixture.targetAddress}`,
+      {
+        headers,
+      },
     );
     const addressMatch = readObjectArrayField(await readJsonObject(searchByAddress), 'matches')[0];
     expect(requireStringField(addressMatch ?? {}, 'address')).toBe(dogecoinFixture.targetAddress);
 
-    const blocks = await request(ctx.app, '/v1/explorer/blocks');
+    const blocks = await request(ctx.app, '/v1/explorer/blocks', {
+      headers,
+    });
     const [block] = readObjectArrayField(await readJsonObject(blocks), 'blocks');
     expect(requireNumberField(block ?? {}, 'height')).toBe(2);
 
-    const blockDetail = await request(ctx.app, '/v1/explorer/blocks/2');
+    const blockDetail = await request(ctx.app, '/v1/explorer/blocks/2', {
+      headers,
+    });
     const blockDetailBody = await readJsonObject(blockDetail);
     expect(requireNumberField(readObjectField(blockDetailBody, 'block'), 'height')).toBe(2);
     const [blockTx] = readObjectArrayField(blockDetailBody, 'transactions');
     expect(requireStringField(blockTx ?? {}, 'txid')).toBe('doge-tx-2');
 
-    const transaction = await request(ctx.app, '/v1/explorer/transactions/doge-tx-2');
+    const transaction = await request(ctx.app, '/v1/explorer/transactions/doge-tx-2', {
+      headers,
+    });
     const transactionBody = await readJsonObject(transaction);
     expect(requireStringField(readObjectField(transactionBody, 'transaction'), 'txid')).toBe(
       'doge-tx-2',
@@ -334,11 +366,15 @@ describe('api integration', () => {
     const address = await request(
       ctx.app,
       `/v1/explorer/addresses/${dogecoinFixture.targetAddress}`,
+      {
+        headers,
+      },
     );
     expect(address.status).toBe(200);
     expect(address.headers.get('cache-control')).toBe(
-      'public, max-age=15, stale-while-revalidate=60',
+      'private, max-age=15, stale-while-revalidate=60',
     );
+    expect(address.headers.get('vary')).toBe('x-api-token');
     const addressBody = await readJsonObject(address);
     const addressSummary = readObjectField(addressBody, 'address');
     expect(requireStringField(addressSummary, 'balance')).toBe('2500000000');
@@ -349,6 +385,9 @@ describe('api integration', () => {
     const history = await request(
       ctx.app,
       `/v1/explorer/addresses/${dogecoinFixture.targetAddress}/transactions`,
+      {
+        headers,
+      },
     );
     const [historyItem] = readObjectArrayField(await readJsonObject(history), 'transactions');
     expect(requireStringField(readObjectField(historyItem ?? {}, 'transaction'), 'txid')).toBe(
@@ -358,6 +397,9 @@ describe('api integration', () => {
     const utxos = await request(
       ctx.app,
       `/v1/explorer/addresses/${dogecoinFixture.targetAddress}/utxos`,
+      {
+        headers,
+      },
     );
     const [utxo] = readObjectArrayField(await readJsonObject(utxos), 'utxos');
     expect(requireStringField(utxo ?? {}, 'outputKey')).toBe('doge-tx-2:0');

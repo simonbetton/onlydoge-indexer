@@ -2,13 +2,13 @@
 
 ## Current Goal
 
-Add a public Dogecoin block-explorer read surface without breaking the existing authenticated investigation API.
+Add a Dogecoin block-explorer read surface without breaking the existing authenticated investigation API.
 
 The explorer should:
 
 1. read only from indexed warehouse facts and stored raw block snapshots,
 2. stay inside the modular-monolith boundaries already used by the repo,
-3. expose a public `/v1/explorer/*` route group,
+3. expose a `/v1/explorer/*` route group,
 4. preserve entity, tag, and source-path overlays where they add value.
 
 ## Explorer Module Shape
@@ -27,11 +27,11 @@ Keep explorer reads in a dedicated `explorer-query` module.
 This keeps the split clear:
 
 - `investigation-query` stays analyst-oriented and authenticated,
-- `explorer-query` stays public, read-only, and Dogecoin-focused.
+- `explorer-query` stays read-only, API-key protected, and Dogecoin-focused.
 
 ## Route Surface
 
-Public routes:
+Explorer routes:
 
 - `GET /v1/explorer/networks`
   - active Dogecoin networks plus indexing status
@@ -91,21 +91,23 @@ Used for:
 
 ## Auth And Cache Policy
 
-Explorer routes are intentionally public.
+Explorer routes require the same `x-api-token` authentication as the rest of `/v1`.
 
-- `/up`, `/v1/heartbeat`, `/openapi`, and `/v1/explorer/*` bypass API token enforcement
-- all existing admin and investigation routes stay protected
+- `/up`, `/v1/heartbeat`, and `/openapi` bypass API token enforcement
+- `POST /v1/keys` stays open only until the first API key exists
+- `/v1/explorer/*` is authenticated like the other protected `/v1` routes
 
 Cache policy:
 
-- `/v1/explorer/search`: `public, max-age=5, stale-while-revalidate=15`
-- `/v1/explorer/addresses*`: `public, max-age=15, stale-while-revalidate=60`
-- `/v1/explorer/blocks*`, `/v1/explorer/transactions*`, `/v1/explorer/networks`: `public, max-age=30, stale-while-revalidate=120`
+- `/v1/explorer/search`: `private, max-age=5, stale-while-revalidate=15`
+- `/v1/explorer/addresses*`: `private, max-age=15, stale-while-revalidate=60`
+- `/v1/explorer/blocks*`, `/v1/explorer/transactions*`, `/v1/explorer/networks`: `private, max-age=30, stale-while-revalidate=120`
+- all explorer cacheable responses vary by `x-api-token`
 
 ## Test Coverage
 
 The explorer work should stay covered by the same layers used elsewhere:
 
-- API integration tests for public access, block/tx/address reads, and OpenAPI exposure
+- API integration tests for authenticated access, block/tx/address reads, and OpenAPI exposure
 - warehouse contract tests for block refs, tx refs, address summaries, history, and UTXOs
 - existing indexer integration tests continue proving the underlying Dogecoin projection data

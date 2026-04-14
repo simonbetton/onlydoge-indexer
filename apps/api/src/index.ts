@@ -200,13 +200,15 @@ function resolveCachePolicy(
 
   if (normalizedPath.startsWith('/v1/explorer/search')) {
     return {
-      cacheControl: 'public, max-age=5, stale-while-revalidate=15',
+      cacheControl: 'private, max-age=5, stale-while-revalidate=15',
+      vary: 'x-api-token',
     };
   }
 
   if (normalizedPath.startsWith('/v1/explorer/addresses')) {
     return {
-      cacheControl: 'public, max-age=15, stale-while-revalidate=60',
+      cacheControl: 'private, max-age=15, stale-while-revalidate=60',
+      vary: 'x-api-token',
     };
   }
 
@@ -216,7 +218,8 @@ function resolveCachePolicy(
     normalizedPath.startsWith('/v1/explorer/networks')
   ) {
     return {
-      cacheControl: 'public, max-age=30, stale-while-revalidate=120',
+      cacheControl: 'private, max-age=30, stale-while-revalidate=120',
+      vary: 'x-api-token',
     };
   }
 

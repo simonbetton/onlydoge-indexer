@@ -16,7 +16,7 @@ The runtime stack uses TypeScript, Bun, Elysia, OpenAPI, Biome, and Vitest.
 ## Business Objectives
 
 - Provide a programmable investigation API for entities, tags, addresses, networks, tokens, stats, and heartbeat checks.
-- Provide a public Dogecoin explorer API for networks, search, blocks, transactions, addresses, address history, and UTXOs.
+- Provide a Dogecoin explorer API for networks, search, blocks, transactions, addresses, address history, and UTXOs.
 - Support Dogecoin as the UTXO family and EVM as the account-based family.
 - Separate domain logic from transport, storage, and RPC concerns.
 - Run the system as a modular monolith while preserving clear domain boundaries and testability.
@@ -213,7 +213,6 @@ The local setup intentionally favors developer feedback over immutability.
 - A MinIO bootstrap job creates the S3 bucket automatically.
 - ClickHouse is initialized with the baseline `balances` and `links` tables.
 - `/v1/heartbeat` stays open.
-- `/v1/explorer/*` stays open.
 - `POST /v1/keys` stays open only until the first API key is created.
 - Every other `/v1` route requires `x-api-token`.
 

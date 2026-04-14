@@ -89,7 +89,6 @@ export async function enforceApiTokenAuth(
   if (
     normalizedPath === '/up' ||
     normalizedPath.startsWith('/v1/heartbeat') ||
-    normalizedPath.startsWith('/v1/explorer') ||
     normalizedPath.startsWith('/openapi')
   ) {
     return;

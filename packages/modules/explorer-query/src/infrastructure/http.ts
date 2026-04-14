@@ -1,3 +1,4 @@
+import { protectedOperationDetail } from '@onlydoge/access-control';
 import { Elysia, t } from 'elysia';
 
 import type { ExplorerQueryService } from '../application/explorer-query-service';
@@ -12,17 +13,19 @@ function parsePagination(value: string | undefined): number | undefined {
 }
 
 export function buildExplorerQueryHttp(service: ExplorerQueryService) {
+  const describeProtected = (description: string) => ({
+    ...protectedOperationDetail,
+    description,
+  });
+
   return new Elysia({ prefix: '/v1/explorer' })
     .get('/networks', () => service.listNetworks(), {
-      detail: {
-        description: 'Lists public Dogecoin explorer networks and their indexing status.',
-      },
+      detail: describeProtected('Lists Dogecoin explorer networks and their indexing status.'),
     })
     .get('/search', ({ query }) => service.search(query.q, query.network), {
-      detail: {
-        description:
-          'Searches the indexed Dogecoin explorer by block height, block hash, txid, or address.',
-      },
+      detail: describeProtected(
+        'Searches the indexed Dogecoin explorer by block height, block hash, txid, or address.',
+      ),
       query: t.Object({
         q: t.Optional(t.String()),
         network: t.Optional(t.String()),
@@ -37,9 +40,7 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
           parsePagination(query.limit),
         ),
       {
-        detail: {
-          description: 'Lists recent indexed Dogecoin blocks.',
-        },
+        detail: describeProtected('Lists recent indexed Dogecoin blocks.'),
         query: t.Object({
           network: t.Optional(t.String()),
           offset: t.Optional(t.String()),
@@ -48,9 +49,7 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
       },
     )
     .get('/blocks/:ref', ({ params, query }) => service.getBlock(params.ref, query.network), {
-      detail: {
-        description: 'Returns a block by indexed height or block hash.',
-      },
+      detail: describeProtected('Returns a block by indexed height or block hash.'),
       params: t.Object({
         ref: t.String(),
       }),
@@ -62,9 +61,9 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
       '/transactions/:txid',
       ({ params, query }) => service.getTransaction(params.txid, query.network),
       {
-        detail: {
-          description: 'Returns a Dogecoin transaction with inputs, outputs, and label overlays.',
-        },
+        detail: describeProtected(
+          'Returns a Dogecoin transaction with inputs, outputs, and label overlays.',
+        ),
         params: t.Object({
           txid: t.String(),
         }),
@@ -77,9 +76,7 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
       '/addresses/:address',
       ({ params, query }) => service.getAddress(params.address, query.network),
       {
-        detail: {
-          description: 'Returns an address summary with public investigation overlay data.',
-        },
+        detail: describeProtected('Returns an address summary with investigation overlay data.'),
         params: t.Object({
           address: t.String(),
         }),
@@ -98,9 +95,9 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
           parsePagination(query.limit),
         ),
       {
-        detail: {
-          description: 'Returns reverse-chronological transaction history for a Dogecoin address.',
-        },
+        detail: describeProtected(
+          'Returns reverse-chronological transaction history for a Dogecoin address.',
+        ),
         params: t.Object({
           address: t.String(),
         }),
@@ -121,9 +118,7 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
           parsePagination(query.limit),
         ),
       {
-        detail: {
-          description: 'Returns current spendable UTXOs for a Dogecoin address.',
-        },
+        detail: describeProtected('Returns current spendable UTXOs for a Dogecoin address.'),
         params: t.Object({
           address: t.String(),
         }),

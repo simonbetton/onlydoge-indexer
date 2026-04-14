@@ -10,6 +10,7 @@ COPY packages/platform/package.json packages/platform/package.json
 COPY packages/shared-kernel/package.json packages/shared-kernel/package.json
 COPY packages/modules/access-control/package.json packages/modules/access-control/package.json
 COPY packages/modules/entity-labeling/package.json packages/modules/entity-labeling/package.json
+COPY packages/modules/explorer-query/package.json packages/modules/explorer-query/package.json
 COPY packages/modules/indexing-pipeline/package.json packages/modules/indexing-pipeline/package.json
 COPY packages/modules/investigation-query/package.json packages/modules/investigation-query/package.json
 COPY packages/modules/network-catalog/package.json packages/modules/network-catalog/package.json

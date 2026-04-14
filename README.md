@@ -7,6 +7,7 @@ This repository is organized around business modules with Clean/Hexagonal bounda
 - `access-control`
 - `network-catalog`
 - `entity-labeling`
+- `explorer-query`
 - `investigation-query`
 - `indexing-pipeline`
 
@@ -15,6 +16,7 @@ The runtime stack uses TypeScript, Bun, Elysia, OpenAPI, Biome, and Vitest.
 ## Business Objectives
 
 - Provide a programmable investigation API for entities, tags, addresses, networks, tokens, stats, and heartbeat checks.
+- Provide a public Dogecoin explorer API for networks, search, blocks, transactions, addresses, address history, and UTXOs.
 - Support Dogecoin as the UTXO family and EVM as the account-based family.
 - Separate domain logic from transport, storage, and RPC concerns.
 - Run the system as a modular monolith while preserving clear domain boundaries and testability.
@@ -41,6 +43,7 @@ flowchart LR
   API --> AC["Access Control"]
   API --> NC["Network Catalog"]
   API --> EL["Entity Labeling"]
+  API --> EQ["Explorer Query"]
   API --> IQ["Investigation Query"]
   IDX --> IP["Indexing Pipeline"]
   NC --> RPC["Blockchain RPC Gateway"]
@@ -101,6 +104,7 @@ packages/
     access-control/
     network-catalog/
     entity-labeling/
+    explorer-query/
     investigation-query/
     indexing-pipeline/
 
@@ -209,6 +213,7 @@ The local setup intentionally favors developer feedback over immutability.
 - A MinIO bootstrap job creates the S3 bucket automatically.
 - ClickHouse is initialized with the baseline `balances` and `links` tables.
 - `/v1/heartbeat` stays open.
+- `/v1/explorer/*` stays open.
 - `POST /v1/keys` stays open only until the first API key is created.
 - Every other `/v1` route requires `x-api-token`.
 
@@ -445,6 +450,7 @@ The full system is not a good fit for Vercel-style request-only serverless deplo
 Current `/v1` route groups:
 
 - `/v1/heartbeat`
+- `/v1/explorer`
 - `/v1/stats`
 - `/v1/info`
 - `/v1/keys`
@@ -459,6 +465,19 @@ Error payload shape:
 ```json
 {"error":"..."}
 ```
+
+Public explorer reads:
+
+- `GET /v1/explorer/networks`
+- `GET /v1/explorer/search?q=...`
+- `GET /v1/explorer/blocks`
+- `GET /v1/explorer/blocks/:ref`
+- `GET /v1/explorer/transactions/:txid`
+- `GET /v1/explorer/addresses/:address`
+- `GET /v1/explorer/addresses/:address/transactions`
+- `GET /v1/explorer/addresses/:address/utxos`
+
+Explorer routes are public and read only indexed data plus stored raw block snapshots. Analyst and admin routes stay behind `x-api-token`.
 
 ## Quality Gates
 

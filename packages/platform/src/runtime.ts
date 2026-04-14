@@ -1,5 +1,6 @@
 import { AccessControlService } from '@onlydoge/access-control';
 import { EntityLabelingService } from '@onlydoge/entity-labeling';
+import { ExplorerQueryService } from '@onlydoge/explorer-query';
 import { IndexingPipelineService } from '@onlydoge/indexing-pipeline';
 import { InvestigationQueryService } from '@onlydoge/investigation-query';
 import { NetworkCatalogService } from '@onlydoge/network-catalog';
@@ -13,6 +14,7 @@ import { createWarehouse } from './warehouse';
 export interface Runtime {
   accessControl: AccessControlService;
   entityLabeling: EntityLabelingService;
+  explorerQuery: ExplorerQueryService;
   indexingPipeline: IndexingPipelineService;
   investigationQuery: InvestigationQueryService;
   metadata: RelationalMetadataStore;
@@ -46,6 +48,13 @@ export async function createRuntime(input?: {
       entityLabeling.softDeleteAddressesByNetworkIds(networkIds),
   });
   const investigationQuery = new InvestigationQueryService(metadata, warehouse, metadata);
+  const explorerQuery = new ExplorerQueryService(
+    metadata,
+    metadata,
+    warehouse,
+    rawBlockStorage,
+    metadata,
+  );
   const indexingPipeline = new IndexingPipelineService(
     metadata,
     metadata,
@@ -62,6 +71,7 @@ export async function createRuntime(input?: {
     accessControl,
     networkCatalog,
     entityLabeling,
+    explorerQuery,
     investigationQuery,
     indexingPipeline,
   };

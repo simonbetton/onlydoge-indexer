@@ -6,6 +6,7 @@
   "dependencies": {
     "@onlydoge/access-control": "workspace:*",
     "@onlydoge/entity-labeling": "workspace:*",
+    "@onlydoge/explorer-query": "workspace:*",
     "@onlydoge/indexing-pipeline": "workspace:*",
     "@onlydoge/investigation-query": "workspace:*",
     "@onlydoge/network-catalog": "workspace:*",

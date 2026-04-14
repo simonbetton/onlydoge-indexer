@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { dogecoinFixture } from '../fixtures/dogecoin';
 import { createTestApp, installRpcMock, request } from '../helpers';
 
 describe('api integration', () => {
@@ -231,6 +232,142 @@ describe('api integration', () => {
     await ctx.cleanup();
   });
 
+  it('serves public explorer endpoints from indexed dogecoin data', async () => {
+    const ctx = await createTestApp();
+    const network = await ctx.runtime.networkCatalog.createNetwork({
+      name: 'Dogecoin Mainnet',
+      architecture: 'dogecoin',
+      chainId: 0,
+      blockTime: 60,
+      rpcEndpoint: 'https://doge.example/rpc',
+    });
+    const highRiskTag = await ctx.runtime.entityLabeling.createTag({
+      name: 'High Risk Source',
+      riskLevel: 'high',
+    });
+    const sourceEntity = await ctx.runtime.entityLabeling.createEntity({
+      name: 'Source Entity',
+      description: 'Known source',
+      tags: [highRiskTag.id],
+    });
+    const targetEntity = await ctx.runtime.entityLabeling.createEntity({
+      name: 'Target Entity',
+      description: 'Known target',
+    });
+    await ctx.runtime.entityLabeling.createAddresses({
+      entity: sourceEntity.entity.id,
+      network: network.id,
+      addresses: [
+        {
+          address: dogecoinFixture.sourceAddress,
+          description: 'Source wallet',
+        },
+      ],
+    });
+    const [targetAddressRecord] = await ctx.runtime.entityLabeling.createAddresses({
+      entity: targetEntity.entity.id,
+      network: network.id,
+      addresses: [
+        {
+          address: dogecoinFixture.targetAddress,
+          description: 'Target wallet',
+        },
+      ],
+    });
+
+    expect(targetAddressRecord?.address).toBe(dogecoinFixture.targetAddress);
+
+    await ctx.runtime.indexingPipeline.runOnce();
+
+    const networks = await request(ctx.app, '/v1/explorer/networks');
+    expect(networks.status).toBe(200);
+    expect(networks.headers.get('cache-control')).toBe(
+      'public, max-age=30, stale-while-revalidate=120',
+    );
+    const networksBody = await readJsonObject(networks);
+    const [networkSummary] = readObjectArrayField(networksBody, 'networks');
+    expect(requireStringField(networkSummary ?? {}, 'id')).toBe(network.id);
+
+    const searchByHeight = await request(ctx.app, '/v1/explorer/search?q=2');
+    expect(searchByHeight.status).toBe(200);
+    expect(searchByHeight.headers.get('cache-control')).toBe(
+      'public, max-age=5, stale-while-revalidate=15',
+    );
+    const heightMatch = readObjectArrayField(await readJsonObject(searchByHeight), 'matches')[0];
+    expect(requireStringField(heightMatch ?? {}, 'type')).toBe('block');
+
+    const searchByTx = await request(ctx.app, '/v1/explorer/search?q=doge-tx-2');
+    const txMatch = readObjectArrayField(await readJsonObject(searchByTx), 'matches')[0];
+    expect(requireStringField(txMatch ?? {}, 'txid')).toBe('doge-tx-2');
+
+    const searchByAddress = await request(
+      ctx.app,
+      `/v1/explorer/search?q=${dogecoinFixture.targetAddress}`,
+    );
+    const addressMatch = readObjectArrayField(await readJsonObject(searchByAddress), 'matches')[0];
+    expect(requireStringField(addressMatch ?? {}, 'address')).toBe(dogecoinFixture.targetAddress);
+
+    const blocks = await request(ctx.app, '/v1/explorer/blocks');
+    const [block] = readObjectArrayField(await readJsonObject(blocks), 'blocks');
+    expect(requireNumberField(block ?? {}, 'height')).toBe(2);
+
+    const blockDetail = await request(ctx.app, '/v1/explorer/blocks/2');
+    const blockDetailBody = await readJsonObject(blockDetail);
+    expect(requireNumberField(readObjectField(blockDetailBody, 'block'), 'height')).toBe(2);
+    const [blockTx] = readObjectArrayField(blockDetailBody, 'transactions');
+    expect(requireStringField(blockTx ?? {}, 'txid')).toBe('doge-tx-2');
+
+    const transaction = await request(ctx.app, '/v1/explorer/transactions/doge-tx-2');
+    const transactionBody = await readJsonObject(transaction);
+    expect(requireStringField(readObjectField(transactionBody, 'transaction'), 'txid')).toBe(
+      'doge-tx-2',
+    );
+    const [transactionInput] = readObjectArrayField(transactionBody, 'inputs');
+    const [transactionOutput] = readObjectArrayField(transactionBody, 'outputs');
+    expect(requireStringField(transactionInput ?? {}, 'address')).toBe(
+      dogecoinFixture.intermediaryAddress,
+    );
+    expect(requireStringField(transactionOutput ?? {}, 'address')).toBe(
+      dogecoinFixture.targetAddress,
+    );
+
+    const address = await request(
+      ctx.app,
+      `/v1/explorer/addresses/${dogecoinFixture.targetAddress}`,
+    );
+    expect(address.status).toBe(200);
+    expect(address.headers.get('cache-control')).toBe(
+      'public, max-age=15, stale-while-revalidate=60',
+    );
+    const addressBody = await readJsonObject(address);
+    const addressSummary = readObjectField(addressBody, 'address');
+    expect(requireStringField(addressSummary, 'balance')).toBe('2500000000');
+    const overlay = readObjectField(addressBody, 'overlay');
+    const risk = readObjectField(overlay, 'risk');
+    expect(readStringArrayField(risk, 'reasons')).toContain('source');
+
+    const history = await request(
+      ctx.app,
+      `/v1/explorer/addresses/${dogecoinFixture.targetAddress}/transactions`,
+    );
+    const [historyItem] = readObjectArrayField(await readJsonObject(history), 'transactions');
+    expect(requireStringField(readObjectField(historyItem ?? {}, 'transaction'), 'txid')).toBe(
+      'doge-tx-2',
+    );
+
+    const utxos = await request(
+      ctx.app,
+      `/v1/explorer/addresses/${dogecoinFixture.targetAddress}/utxos`,
+    );
+    const [utxo] = readObjectArrayField(await readJsonObject(utxos), 'utxos');
+    expect(requireStringField(utxo ?? {}, 'outputKey')).toBe('doge-tx-2:0');
+
+    const deniedInfo = await request(ctx.app, `/v1/info?q=${dogecoinFixture.targetAddress}`);
+    expect(deniedInfo.status).toBe(401);
+
+    await ctx.cleanup();
+  });
+
   it('returns a clean validation error when info is requested without q', async () => {
     const ctx = await createTestApp();
     const created = await request(ctx.app, '/v1/keys/', {
@@ -336,6 +473,15 @@ function requireStringField(record: Record<string, unknown>, field: string): str
   const value = record[field];
   if (typeof value !== 'string') {
     throw new TypeError(`expected string for ${field}`);
+  }
+
+  return value;
+}
+
+function requireNumberField(record: Record<string, unknown>, field: string): number {
+  const value = record[field];
+  if (typeof value !== 'number') {
+    throw new TypeError(`expected number for ${field}`);
   }
 
   return value;

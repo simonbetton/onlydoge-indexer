@@ -78,5 +78,53 @@ describe('projection warehouse contract', () => {
         }),
       ]),
     );
+    await expect(warehouse.listAppliedBlocks(7)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          blockHeight: 2,
+          blockHash: 'doge-block-2',
+        }),
+      ]),
+    );
+    await expect(warehouse.getAppliedBlockByHash(7, 'doge-block-1')).resolves.toEqual(
+      expect.objectContaining({
+        blockHeight: 1,
+        blockHash: 'doge-block-1',
+      }),
+    );
+    await expect(warehouse.getTransactionRef(7, 'doge-tx-2')).resolves.toEqual(
+      expect.objectContaining({
+        blockHeight: 2,
+        txIndex: 0,
+      }),
+    );
+    await expect(warehouse.getAddressSummary(7, dogecoinFixture.targetAddress)).resolves.toEqual(
+      expect.objectContaining({
+        balance: '2500000000',
+        receivedBase: '2500000000',
+        sentBase: '0',
+        txCount: 1,
+        utxoCount: 1,
+      }),
+    );
+    await expect(
+      warehouse.listAddressTransactions(7, dogecoinFixture.targetAddress),
+    ).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          txid: 'doge-tx-2',
+          receivedBase: '2500000000',
+          sentBase: '0',
+        }),
+      ]),
+    );
+    await expect(warehouse.listAddressUtxos(7, dogecoinFixture.targetAddress)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          outputKey: 'doge-tx-2:0',
+          address: dogecoinFixture.targetAddress,
+        }),
+      ]),
+    );
   });
 });

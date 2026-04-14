@@ -5,6 +5,7 @@ import {
   enforceApiTokenAuth,
 } from '@onlydoge/access-control';
 import { buildEntityLabelingHttp } from '@onlydoge/entity-labeling';
+import { buildExplorerQueryHttp } from '@onlydoge/explorer-query';
 import { buildInvestigationQueryHttp } from '@onlydoge/investigation-query';
 import { buildNetworkCatalogHttp } from '@onlydoge/network-catalog';
 import type { Runtime } from '@onlydoge/platform';
@@ -96,6 +97,7 @@ export function buildApiApp(runtime: Runtime) {
     .use(buildAccessControlHttp(runtime.accessControl))
     .use(buildNetworkCatalogHttp(runtime.networkCatalog))
     .use(buildEntityLabelingHttp(runtime.entityLabeling))
+    .use(buildExplorerQueryHttp(runtime.explorerQuery))
     .use(buildInvestigationQueryHttp(runtime.investigationQuery))
     .use(
       openapi({
@@ -193,6 +195,28 @@ function resolveCachePolicy(
   if (normalizedPath === '/up' || normalizedPath.startsWith('/v1/heartbeat')) {
     return {
       cacheControl: 'no-store',
+    };
+  }
+
+  if (normalizedPath.startsWith('/v1/explorer/search')) {
+    return {
+      cacheControl: 'public, max-age=5, stale-while-revalidate=15',
+    };
+  }
+
+  if (normalizedPath.startsWith('/v1/explorer/addresses')) {
+    return {
+      cacheControl: 'public, max-age=15, stale-while-revalidate=60',
+    };
+  }
+
+  if (
+    normalizedPath.startsWith('/v1/explorer/blocks') ||
+    normalizedPath.startsWith('/v1/explorer/transactions') ||
+    normalizedPath.startsWith('/v1/explorer/networks')
+  ) {
+    return {
+      cacheControl: 'public, max-age=30, stale-while-revalidate=120',
     };
   }
 

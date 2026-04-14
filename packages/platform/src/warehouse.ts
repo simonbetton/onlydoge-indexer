@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 import { createClient } from '@clickhouse/client';
+import type { ExplorerWarehousePort } from '@onlydoge/explorer-query';
 import {
   type AddressMovement,
   addAmountBase,
@@ -87,7 +88,7 @@ function mergeWarehouseState(input: Partial<WarehouseState> | null | undefined):
 }
 
 export class InMemoryWarehouseAdapter
-  implements InvestigationWarehousePort, ProjectionWarehousePort
+  implements InvestigationWarehousePort, ProjectionWarehousePort, ExplorerWarehousePort
 {
   protected state: WarehouseState = emptyWarehouseState();
 
@@ -108,6 +109,168 @@ export class InMemoryWarehouseAdapter
         toAddress: link.toAddress,
         transferCount: link.hopCount,
       }));
+  }
+
+  public async listAppliedBlocks(networkId: PrimaryId, offset = 0, limit?: number) {
+    const rows = this.state.appliedBlocks
+      .filter((block) => block.networkId === networkId)
+      .sort((left, right) => right.blockHeight - left.blockHeight);
+
+    return rows.slice(offset, limit === undefined ? undefined : offset + limit);
+  }
+
+  public async getAppliedBlockByHash(networkId: PrimaryId, blockHash: string) {
+    return (
+      this.state.appliedBlocks.find(
+        (block) => block.networkId === networkId && block.blockHash === blockHash,
+      ) ?? null
+    );
+  }
+
+  public async getTransactionRef(networkId: PrimaryId, txid: string) {
+    const output = this.state.utxoOutputs.find(
+      (candidate) => candidate.networkId === networkId && candidate.txid === txid,
+    );
+    if (!output) {
+      return null;
+    }
+
+    return {
+      blockHeight: output.blockHeight,
+      blockHash: output.blockHash,
+      blockTime: output.blockTime,
+      txIndex: output.txIndex,
+    };
+  }
+
+  public async getAddressSummary(networkId: PrimaryId, address: string) {
+    const balance =
+      this.state.balances.find(
+        (candidate) =>
+          candidate.networkId === networkId &&
+          candidate.address === address &&
+          candidate.assetAddress === '',
+      )?.balance ?? '0';
+    const movements = this.state.addressMovements.filter(
+      (candidate) =>
+        candidate.networkId === networkId &&
+        candidate.address === address &&
+        candidate.assetAddress === '',
+    );
+    const utxoCount = this.state.utxoOutputs.filter(
+      (candidate) =>
+        candidate.networkId === networkId &&
+        candidate.address === address &&
+        candidate.isSpendable &&
+        candidate.spentByTxid === null,
+    ).length;
+
+    if (movements.length === 0 && balance === '0' && utxoCount === 0) {
+      return null;
+    }
+
+    let receivedBase = 0n;
+    let sentBase = 0n;
+    const txids = new Set<string>();
+    for (const movement of movements) {
+      txids.add(movement.txid);
+      if (movement.direction === 'credit') {
+        receivedBase += parseAmountBase(movement.amountBase);
+      } else {
+        sentBase += parseAmountBase(movement.amountBase);
+      }
+    }
+
+    return {
+      balance,
+      receivedBase: formatAmountBase(receivedBase),
+      sentBase: formatAmountBase(sentBase),
+      txCount: txids.size,
+      utxoCount,
+    };
+  }
+
+  public async listAddressTransactions(
+    networkId: PrimaryId,
+    address: string,
+    offset = 0,
+    limit?: number,
+  ) {
+    const aggregates = new Map<
+      string,
+      {
+        blockHash: string;
+        blockHeight: number;
+        blockTime: number;
+        receivedBase: bigint;
+        sentBase: bigint;
+        txIndex: number;
+        txid: string;
+      }
+    >();
+
+    for (const movement of this.state.addressMovements) {
+      if (
+        movement.networkId !== networkId ||
+        movement.address !== address ||
+        movement.assetAddress !== ''
+      ) {
+        continue;
+      }
+
+      const current = aggregates.get(movement.txid) ?? {
+        blockHeight: movement.blockHeight,
+        blockHash: movement.blockHash,
+        blockTime: movement.blockTime,
+        txid: movement.txid,
+        txIndex: movement.txIndex,
+        receivedBase: 0n,
+        sentBase: 0n,
+      };
+
+      if (movement.direction === 'credit') {
+        current.receivedBase += parseAmountBase(movement.amountBase);
+      } else {
+        current.sentBase += parseAmountBase(movement.amountBase);
+      }
+      aggregates.set(movement.txid, current);
+    }
+
+    return [...aggregates.values()]
+      .sort(
+        (left, right) =>
+          right.blockHeight - left.blockHeight ||
+          right.txIndex - left.txIndex ||
+          right.txid.localeCompare(left.txid),
+      )
+      .slice(offset, limit === undefined ? undefined : offset + limit)
+      .map((row) => ({
+        blockHash: row.blockHash,
+        blockHeight: row.blockHeight,
+        blockTime: row.blockTime,
+        txid: row.txid,
+        txIndex: row.txIndex,
+        receivedBase: formatAmountBase(row.receivedBase),
+        sentBase: formatAmountBase(row.sentBase),
+      }));
+  }
+
+  public async listAddressUtxos(networkId: PrimaryId, address: string, offset = 0, limit?: number) {
+    return this.state.utxoOutputs
+      .filter(
+        (candidate) =>
+          candidate.networkId === networkId &&
+          candidate.address === address &&
+          candidate.isSpendable &&
+          candidate.spentByTxid === null,
+      )
+      .sort(
+        (left, right) =>
+          right.blockHeight - left.blockHeight ||
+          right.txIndex - left.txIndex ||
+          left.vout - right.vout,
+      )
+      .slice(offset, limit === undefined ? undefined : offset + limit);
   }
 
   public async getUtxoOutput(
@@ -332,7 +495,7 @@ export class DuckDbWarehouseAdapter extends InMemoryWarehouseAdapter {
 }
 
 export class ClickHouseWarehouseAdapter
-  implements InvestigationWarehousePort, ProjectionWarehousePort
+  implements InvestigationWarehousePort, ProjectionWarehousePort, ExplorerWarehousePort
 {
   private readonly client: ReturnType<typeof createClient>;
 
@@ -416,6 +579,240 @@ export class ClickHouseWarehouseAdapter
       ),
     );
     const rows = rowChunks.flat();
+
+    return rows;
+  }
+
+  public async listAppliedBlocks(networkId: PrimaryId, offset = 0, limit?: number) {
+    const rows: Array<{
+      blockHash: string;
+      blockHeight: number;
+    }> = await this.client
+      .query({
+        query: `
+          SELECT
+            block_height AS "blockHeight",
+            block_hash AS "blockHash"
+          FROM applied_blocks_v2
+          WHERE network_id = {networkId:UInt64}
+          ORDER BY block_height DESC
+          ${limit !== undefined ? 'LIMIT {limit:UInt64}' : ''}
+          ${offset > 0 ? 'OFFSET {offset:UInt64}' : ''}
+        `,
+        query_params: {
+          networkId,
+          ...(limit !== undefined ? { limit } : {}),
+          ...(offset > 0 ? { offset } : {}),
+        },
+        format: 'JSONEachRow',
+      })
+      .then((result) => result.json());
+
+    return rows;
+  }
+
+  public async getAppliedBlockByHash(networkId: PrimaryId, blockHash: string) {
+    const rows: Array<{
+      blockHash: string;
+      blockHeight: number;
+    }> = await this.client
+      .query({
+        query: `
+          SELECT
+            block_height AS "blockHeight",
+            block_hash AS "blockHash"
+          FROM applied_blocks_v2
+          WHERE network_id = {networkId:UInt64} AND block_hash = {blockHash:String}
+          LIMIT 1
+        `,
+        query_params: { networkId, blockHash },
+        format: 'JSONEachRow',
+      })
+      .then((result) => result.json());
+
+    return rows[0] ?? null;
+  }
+
+  public async getTransactionRef(networkId: PrimaryId, txid: string) {
+    const rows: Array<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      txIndex: number;
+    }> = await this.client
+      .query({
+        query: `
+          SELECT
+            block_height AS "blockHeight",
+            block_hash AS "blockHash",
+            block_time AS "blockTime",
+            tx_index AS "txIndex"
+          FROM utxo_outputs_v2
+          WHERE network_id = {networkId:UInt64} AND txid = {txid:String}
+          ORDER BY version DESC
+          LIMIT 1
+        `,
+        query_params: { networkId, txid },
+        format: 'JSONEachRow',
+      })
+      .then((result) => result.json());
+
+    return rows[0] ?? null;
+  }
+
+  public async getAddressSummary(networkId: PrimaryId, address: string) {
+    const [movementRows, balanceRows, utxoRows] = await Promise.all([
+      this.client
+        .query({
+          query: `
+            SELECT
+              CAST(sumIf(toInt256(amount_base), direction = 'credit') AS String) AS "receivedBase",
+              CAST(sumIf(toInt256(amount_base), direction = 'debit') AS String) AS "sentBase",
+              uniqExact(txid) AS "txCount"
+            FROM address_movements_v2
+            WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
+          `,
+          query_params: { networkId, address },
+          format: 'JSONEachRow',
+        })
+        .then((result) =>
+          result.json<{
+            receivedBase: string;
+            sentBase: string;
+            txCount: number;
+          }>(),
+        ),
+      this.client
+        .query({
+          query: `
+            SELECT balance
+            FROM balances_v2
+            WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
+            ORDER BY version DESC
+            LIMIT 1
+          `,
+          query_params: { networkId, address },
+          format: 'JSONEachRow',
+        })
+        .then((result) => result.json<{ balance: string }>()),
+      this.client
+        .query({
+          query: `
+            SELECT count() AS "utxoCount"
+            FROM utxo_outputs_current_v2 FINAL
+            WHERE
+              network_id = {networkId:UInt64}
+              AND address = {address:String}
+              AND is_spendable = 1
+              AND spent_by_txid IS NULL
+          `,
+          query_params: { networkId, address },
+          format: 'JSONEachRow',
+        })
+        .then((result) => result.json<{ utxoCount: number }>()),
+    ]);
+
+    const movement = movementRows[0];
+    const balance = balanceRows[0]?.balance ?? '0';
+    const utxoCount = utxoRows[0]?.utxoCount ?? 0;
+    if (!movement && balance === '0' && utxoCount === 0) {
+      return null;
+    }
+
+    return {
+      balance,
+      receivedBase: movement?.receivedBase ?? '0',
+      sentBase: movement?.sentBase ?? '0',
+      txCount: movement?.txCount ?? 0,
+      utxoCount,
+    };
+  }
+
+  public async listAddressTransactions(
+    networkId: PrimaryId,
+    address: string,
+    offset = 0,
+    limit?: number,
+  ) {
+    const rows: Array<{
+      blockHash: string;
+      blockHeight: number;
+      blockTime: number;
+      receivedBase: string;
+      sentBase: string;
+      txIndex: number;
+      txid: string;
+    }> = await this.client
+      .query({
+        query: `
+          SELECT
+            block_height AS "blockHeight",
+            block_hash AS "blockHash",
+            block_time AS "blockTime",
+            txid,
+            tx_index AS "txIndex",
+            CAST(sumIf(toInt256(amount_base), direction = 'credit') AS String) AS "receivedBase",
+            CAST(sumIf(toInt256(amount_base), direction = 'debit') AS String) AS "sentBase"
+          FROM address_movements_v2
+          WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
+          GROUP BY block_height, block_hash, block_time, txid, tx_index
+          ORDER BY block_height DESC, tx_index DESC, txid DESC
+          ${limit !== undefined ? 'LIMIT {limit:UInt64}' : ''}
+          ${offset > 0 ? 'OFFSET {offset:UInt64}' : ''}
+        `,
+        query_params: {
+          networkId,
+          address,
+          ...(limit !== undefined ? { limit } : {}),
+          ...(offset > 0 ? { offset } : {}),
+        },
+        format: 'JSONEachRow',
+      })
+      .then((result) => result.json());
+
+    return rows;
+  }
+
+  public async listAddressUtxos(networkId: PrimaryId, address: string, offset = 0, limit?: number) {
+    const rows: ProjectionUtxoOutput[] = await this.client
+      .query({
+        query: `
+          SELECT
+            {networkId:UInt64} AS "networkId",
+            block_height AS "blockHeight",
+            block_hash AS "blockHash",
+            block_time AS "blockTime",
+            txid,
+            tx_index AS "txIndex",
+            vout,
+            output_key AS "outputKey",
+            address,
+            script_type AS "scriptType",
+            value_base AS "valueBase",
+            is_coinbase = 1 AS "isCoinbase",
+            is_spendable = 1 AS "isSpendable",
+            spent_by_txid AS "spentByTxid",
+            spent_in_block AS "spentInBlock",
+            spent_input_index AS "spentInputIndex"
+          FROM utxo_outputs_current_v2 FINAL
+          WHERE
+            network_id = {networkId:UInt64}
+            AND address = {address:String}
+            AND is_spendable = 1
+            AND spent_by_txid IS NULL
+          ORDER BY block_height DESC, tx_index DESC, vout ASC
+          ${limit !== undefined ? 'LIMIT {limit:UInt64}' : ''}
+          ${offset > 0 ? 'OFFSET {offset:UInt64}' : ''}
+        `,
+        query_params: {
+          networkId,
+          address,
+          ...(limit !== undefined ? { limit } : {}),
+          ...(offset > 0 ? { offset } : {}),
+        },
+        format: 'JSONEachRow',
+      })
+      .then((result) => result.json());
 
     return rows;
   }
@@ -564,7 +961,7 @@ export class ClickHouseWarehouseAdapter
       return;
     }
 
-    const appliedBlocks = await this.listAppliedBlocks(networkId, orderedBatches);
+    const appliedBlocks = await this.listAppliedBlockSet(networkId, orderedBatches);
     const pendingBatches = orderedBatches.filter(
       (batch) =>
         !appliedBlocks.has(blockIdentity(batch.networkId, batch.blockHeight, batch.blockHash)),
@@ -931,7 +1328,7 @@ export class ClickHouseWarehouseAdapter
     );
   }
 
-  private async listAppliedBlocks(
+  private async listAppliedBlockSet(
     networkId: PrimaryId,
     batches: BlockProjectionBatch[],
   ): Promise<Set<string>> {
@@ -1019,7 +1416,7 @@ export class ClickHouseWarehouseAdapter
 
 export async function createWarehouse(
   settings: WarehouseSettings,
-): Promise<InvestigationWarehousePort & ProjectionWarehousePort> {
+): Promise<InvestigationWarehousePort & ProjectionWarehousePort & ExplorerWarehousePort> {
   if (settings.driver === 'clickhouse') {
     return new ClickHouseWarehouseAdapter(settings);
   }

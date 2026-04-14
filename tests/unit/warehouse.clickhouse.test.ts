@@ -100,8 +100,9 @@ describe('clickhouse warehouse adapter', () => {
       query.mock.calls.every(
         ([parameters]) =>
           typeof parameters.query === 'string' &&
-          parameters.query.includes('FROM utxo_outputs_current_v2 FINAL') &&
-          !parameters.query.includes('LIMIT 1 BY output_key') &&
+          parameters.query.includes('FROM utxo_outputs_current_v2') &&
+          parameters.query.includes('LIMIT 1 BY output_key') &&
+          !parameters.query.includes('FINAL') &&
           !parameters.query.includes('argMax('),
       ),
     ).toBe(true);
@@ -235,7 +236,7 @@ describe('clickhouse warehouse adapter', () => {
 
     expect(
       statements.find((statement) => statement.includes('FROM utxo_outputs_current_v2')),
-    ).toContain('FROM utxo_outputs_current_v2 FINAL');
+    ).toContain('LIMIT 1 BY output_key');
     expect(statements.find((statement) => statement.includes('FROM balances_v2'))).toContain(
       "(address, asset_address) IN (('DInputAddress', 'DOGE'), ('DOutputAddress', 'DOGE'))",
     );
@@ -256,7 +257,7 @@ describe('clickhouse warehouse adapter', () => {
       location: 'http://clickhouse:8123',
     });
     const query = vi.fn(async ({ query: statement }: { query: string }) => {
-      if (statement.includes('LIMIT 1 BY output_key') && !statement.includes('FINAL')) {
+      if (statement.includes('FROM utxo_outputs_current_by_address_v2')) {
         return {
           json: async () => [
             {
@@ -269,7 +270,10 @@ describe('clickhouse warehouse adapter', () => {
         };
       }
 
-      if (statement.includes('FROM utxo_outputs_current_v2 FINAL')) {
+      if (
+        statement.includes('FROM utxo_outputs_current_v2') &&
+        statement.includes('AND output_key IN')
+      ) {
         return {
           json: async () => [
             {
@@ -311,7 +315,7 @@ describe('clickhouse warehouse adapter', () => {
       statements.some(
         (statement) =>
           statement.includes('LIMIT 1 BY output_key') &&
-          statement.includes('FROM utxo_outputs_current_v2') &&
+          statement.includes('FROM utxo_outputs_current_by_address_v2') &&
           !statement.includes('FINAL'),
       ),
     ).toBe(true);
@@ -369,8 +373,11 @@ describe('clickhouse warehouse adapter', () => {
       spentInBlock: 124,
     });
     expect(
-      query.mock.calls.some(([parameters]) =>
-        parameters.query.includes('FROM utxo_outputs_current_v2 FINAL'),
+      query.mock.calls.some(
+        ([parameters]) =>
+          parameters.query.includes('FROM utxo_outputs_current_v2') &&
+          parameters.query.includes('LIMIT 1 BY output_key') &&
+          !parameters.query.includes('FINAL'),
       ),
     ).toBe(true);
     expect(
@@ -387,5 +394,129 @@ describe('clickhouse warehouse adapter', () => {
         ],
       }),
     );
+  });
+
+  it('boots clickhouse with address-oriented read models and backfills them once', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const command = vi.fn(async () => undefined);
+    const query = vi.fn(async () => ({ json: async () => [] }));
+
+    (
+      adapter as unknown as {
+        client: {
+          command: typeof command;
+          query: typeof query;
+        };
+      }
+    ).client = {
+      command,
+      query,
+    };
+
+    await adapter.boot();
+
+    const statements = command.mock.calls.map(
+      (call) => ((call as Array<{ query: string }>).at(0)?.query ?? ''),
+    );
+
+    expect(
+      statements.some((statement) =>
+        statement.includes('CREATE TABLE IF NOT EXISTS utxo_outputs_current_by_address_v2'),
+      ),
+    ).toBe(true);
+    expect(
+      statements.some((statement) =>
+        statement.includes(
+          'CREATE MATERIALIZED VIEW IF NOT EXISTS utxo_outputs_current_by_address_v2_mv',
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      statements.some((statement) =>
+        statement.includes('CREATE TABLE IF NOT EXISTS address_movements_by_address_v2'),
+      ),
+    ).toBe(true);
+    expect(
+      statements.some((statement) =>
+        statement.includes(
+          'CREATE MATERIALIZED VIEW IF NOT EXISTS address_movements_by_address_v2_mv',
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      statements.some((statement) =>
+        statement.includes('INSERT INTO utxo_outputs_current_by_address_v2'),
+      ),
+    ).toBe(true);
+    expect(
+      statements.some((statement) =>
+        statement.includes('INSERT INTO address_movements_by_address_v2'),
+      ),
+    ).toBe(true);
+  });
+
+  it('uses address-oriented movement reads with a precomputed integer amount column', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+    });
+    const query = vi.fn(async ({ query: statement }: { query: string }) => {
+      if (statement.includes('FROM address_movements_by_address_v2')) {
+        return {
+          json: async () => [
+            {
+              receivedBase: '11',
+              sentBase: '7',
+              txCount: 2,
+            },
+          ],
+        };
+      }
+
+      if (statement.includes('FROM balances_v2')) {
+        return {
+          json: async () => [
+            {
+              balance: '4',
+            },
+          ],
+        };
+      }
+
+      if (statement.includes('FROM utxo_outputs_current_by_address_v2')) {
+        return {
+          json: async () => [
+            {
+              utxoCount: 1,
+            },
+          ],
+        };
+      }
+
+      return { json: async () => [] };
+    });
+
+    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+
+    const summary = await adapter.getAddressSummary(7, 'DInputAddress');
+    const statements = query.mock.calls.map(([parameters]) => parameters.query);
+
+    expect(summary).toMatchObject({
+      balance: '4',
+      receivedBase: '11',
+      sentBase: '7',
+      txCount: 2,
+      utxoCount: 1,
+    });
+    expect(
+      statements.some(
+        (statement) =>
+          statement.includes('FROM address_movements_by_address_v2') &&
+          statement.includes('sumIf(amount_base_i256'),
+      ),
+    ).toBe(true);
   });
 });

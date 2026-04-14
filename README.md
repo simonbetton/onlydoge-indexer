@@ -191,8 +191,17 @@ The app reads the following configuration surface:
 - `ONLYDOGE_S3_SECRET_ACCESS_KEY`
 - `ONLYDOGE_WAREHOUSE_USER`
 - `ONLYDOGE_WAREHOUSE_PASSWORD`
+- `ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS`
+- `ONLYDOGE_INDEXER_NETWORK_CONCURRENCY`
+- `ONLYDOGE_INDEXER_SYNC_WINDOW`
+- `ONLYDOGE_INDEXER_SYNC_CONCURRENCY`
+- `ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS`
 - `ONLYDOGE_INDEXER_PROJECT_WINDOW`
 - `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS`
+- `ONLYDOGE_INDEXER_RELINK_BATCH_SIZE`
+- `ONLYDOGE_INDEXER_RELINK_CONCURRENCY`
+- `ONLYDOGE_INDEXER_RELINK_FRONTIER_BATCH`
+- `ONLYDOGE_INDEXER_RELINK_TIMEOUT_MS`
 - `ONLYDOGE_MODE`
 - `ONLYDOGE_IP`
 - `ONLYDOGE_PORT`
@@ -203,6 +212,18 @@ For PostgreSQL, you can either supply a full DSN in `ONLYDOGE_DATABASE` or let O
 
 In the production image, startup fails fast if database config, `ONLYDOGE_STORAGE`, or `ONLYDOGE_WAREHOUSE` are missing. It will no longer silently fall back to local SQLite, file storage, or DuckDB when `NODE_ENV=production`.
 
+## ClickHouse Memory Posture
+
+The default ClickHouse profile is tuned for stability over peak throughput.
+
+- address-heavy explorer reads use address-oriented read tables instead of scanning the write-optimized facts directly
+- current-state UTXO lookups avoid `FINAL` and use bounded `LIMIT 1 BY output_key` reads
+- the ClickHouse server memory ratio is capped below total RAM to leave headroom for merges, the page cache, and the OS
+- default query and insert thread counts are capped to reduce memory spikes
+- external sort and group-by thresholds spill earlier instead of holding large intermediates in RAM
+
+The app also boots ClickHouse with runtime-safe warehouse migrations. Existing deployments automatically create and backfill the address-oriented read tables on startup before serving explorer traffic.
+
 ## Local Docker Workflow
 
 The local setup intentionally favors developer feedback over immutability.
@@ -211,7 +232,7 @@ The local setup intentionally favors developer feedback over immutability.
 - The app runs with `bun run --watch`.
 - Infrastructure is persisted in Docker volumes.
 - A MinIO bootstrap job creates the S3 bucket automatically.
-- ClickHouse is initialized with the baseline `balances` and `links` tables.
+- ClickHouse is initialized with the Dogecoin warehouse schema, including the address-oriented explorer read models.
 - `/v1/heartbeat` stays open.
 - `POST /v1/keys` stays open only until the first API key is created.
 - Every other `/v1` route requires `x-api-token`.

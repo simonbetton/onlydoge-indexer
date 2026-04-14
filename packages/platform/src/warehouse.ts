@@ -59,7 +59,11 @@ interface VersionedDirectLinkRow extends DirectLinkRecord {
 
 const maxClickHouseQueryValuesPerChunk = 256;
 const maxClickHouseQueryValueBytesPerChunk = 12_000;
+const maxClickHouseHotOutputKeyValuesPerChunk = 128;
+const maxClickHouseHotOutputKeyBytesPerChunk = 6_000;
+const addressMovementsByAddressTable = 'address_movements_by_address_v2';
 const utxoCurrentStateTable = 'utxo_outputs_current_v2';
+const utxoCurrentStateByAddressTable = 'utxo_outputs_current_by_address_v2';
 type ClickHouseClient = ReturnType<typeof createClient>;
 type ClickHouseCommandParameters = Parameters<ClickHouseClient['command']>[0];
 type ClickHouseInsertParameters = Parameters<ClickHouseClient['insert']>[0];
@@ -512,6 +516,10 @@ export class ClickHouseWarehouseAdapter
     });
   }
 
+  public async boot(): Promise<void> {
+    await this.migrate();
+  }
+
   public async getBalancesByAddresses(addresses: string[]) {
     if (addresses.length === 0) {
       return [];
@@ -661,10 +669,10 @@ export class ClickHouseWarehouseAdapter
       }>({
         query: `
             SELECT
-              CAST(sumIf(toInt256(amount_base), direction = 'credit') AS String) AS "receivedBase",
-              CAST(sumIf(toInt256(amount_base), direction = 'debit') AS String) AS "sentBase",
+              CAST(sumIf(amount_base_i256, direction = 'credit') AS String) AS "receivedBase",
+              CAST(sumIf(amount_base_i256, direction = 'debit') AS String) AS "sentBase",
               uniqExact(txid) AS "txCount"
-            FROM address_movements_v2
+            FROM ${addressMovementsByAddressTable}
             WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
           `,
         query_params: { networkId, address },
@@ -689,7 +697,7 @@ export class ClickHouseWarehouseAdapter
                 output_key,
                 is_spendable,
                 spent_by_txid
-              FROM utxo_outputs_current_v2
+              FROM ${utxoCurrentStateByAddressTable}
               WHERE network_id = {networkId:UInt64} AND address = {address:String}
               ORDER BY output_key ASC, version DESC
               LIMIT 1 BY output_key
@@ -739,9 +747,9 @@ export class ClickHouseWarehouseAdapter
             block_time AS "blockTime",
             txid,
             tx_index AS "txIndex",
-            CAST(sumIf(toInt256(amount_base), direction = 'credit') AS String) AS "receivedBase",
-            CAST(sumIf(toInt256(amount_base), direction = 'debit') AS String) AS "sentBase"
-          FROM address_movements_v2
+            CAST(sumIf(amount_base_i256, direction = 'credit') AS String) AS "receivedBase",
+            CAST(sumIf(amount_base_i256, direction = 'debit') AS String) AS "sentBase"
+          FROM ${addressMovementsByAddressTable}
           WHERE network_id = {networkId:UInt64} AND address = {address:String} AND asset_address = ''
           GROUP BY block_height, block_hash, block_time, txid, tx_index
           ORDER BY block_height DESC, tx_index DESC, txid DESC
@@ -783,7 +791,7 @@ export class ClickHouseWarehouseAdapter
               vout,
               is_spendable,
               spent_by_txid
-            FROM utxo_outputs_current_v2
+            FROM ${utxoCurrentStateByAddressTable}
             WHERE network_id = {networkId:UInt64} AND address = {address:String}
             ORDER BY output_key ASC, version DESC
             LIMIT 1 BY output_key
@@ -840,7 +848,6 @@ export class ClickHouseWarehouseAdapter
       utxoCurrentStateTable,
       networkId,
       outputKeys,
-      true,
     );
     const currentOutputs = new Map(currentRows.map((row) => [row.outputKey, row]));
     const missingOutputKeys = outputKeys.filter((outputKey) => !currentOutputs.has(outputKey));
@@ -852,7 +859,6 @@ export class ClickHouseWarehouseAdapter
       'utxo_outputs_v2',
       networkId,
       missingOutputKeys,
-      false,
     );
     if (fallbackRows.length > 0) {
       await this.insertRows(
@@ -1363,10 +1369,12 @@ export class ClickHouseWarehouseAdapter
     table: string,
     networkId: PrimaryId,
     outputKeys: string[],
-    useFinal: boolean,
   ): Promise<ProjectionUtxoOutput[]> {
     const rowChunks: ProjectionUtxoOutput[][] = await Promise.all(
-      chunkQueryValues(outputKeys).map((chunk) =>
+      chunkQueryValues(outputKeys, {
+        maxBytes: maxClickHouseHotOutputKeyBytesPerChunk,
+        maxValues: maxClickHouseHotOutputKeyValuesPerChunk,
+      }).map((chunk) =>
         this.queryRows<ProjectionUtxoOutput>({
           query: `
               SELECT
@@ -1386,9 +1394,10 @@ export class ClickHouseWarehouseAdapter
                 spent_by_txid AS "spentByTxid",
                 spent_in_block AS "spentInBlock",
                 spent_input_index AS "spentInputIndex"
-              FROM ${table}${useFinal ? ' FINAL' : ''}
+              FROM ${table}
               WHERE network_id = {networkId:UInt64} AND output_key IN ({outputKeys:Array(String)})
-              ${useFinal ? '' : 'ORDER BY output_key ASC, version DESC LIMIT 1 BY output_key'}
+              ORDER BY output_key ASC, version DESC
+              LIMIT 1 BY output_key
             `,
           query_params: { networkId, outputKeys: chunk },
           format: 'JSONEachRow',
@@ -1397,6 +1406,114 @@ export class ClickHouseWarehouseAdapter
     );
 
     return rowChunks.flat();
+  }
+
+  private async migrate(): Promise<void> {
+    for (const statement of clickHouseWarehouseBootstrapStatements) {
+      await this.executeCommand({ query: statement });
+    }
+
+    await this.backfillTableIfEmpty(
+      utxoCurrentStateByAddressTable,
+      `
+        INSERT INTO ${utxoCurrentStateByAddressTable} (
+          network_id,
+          block_height,
+          block_hash,
+          block_time,
+          txid,
+          tx_index,
+          vout,
+          output_key,
+          address,
+          script_type,
+          value_base,
+          is_coinbase,
+          is_spendable,
+          spent_by_txid,
+          spent_in_block,
+          spent_input_index,
+          version
+        )
+        SELECT
+          network_id,
+          block_height,
+          block_hash,
+          block_time,
+          txid,
+          tx_index,
+          vout,
+          output_key,
+          address,
+          script_type,
+          value_base,
+          is_coinbase,
+          is_spendable,
+          spent_by_txid,
+          spent_in_block,
+          spent_input_index,
+          version
+        FROM ${utxoCurrentStateTable}
+      `,
+    );
+    await this.backfillTableIfEmpty(
+      addressMovementsByAddressTable,
+      `
+        INSERT INTO ${addressMovementsByAddressTable} (
+          movement_id,
+          network_id,
+          block_height,
+          block_hash,
+          block_time,
+          txid,
+          tx_index,
+          entry_index,
+          address,
+          asset_address,
+          direction,
+          amount_base,
+          output_key,
+          derivation_method
+        )
+        SELECT
+          movement_id,
+          network_id,
+          block_height,
+          block_hash,
+          block_time,
+          txid,
+          tx_index,
+          entry_index,
+          address,
+          asset_address,
+          direction,
+          amount_base,
+          output_key,
+          derivation_method
+        FROM address_movements_v2
+      `,
+    );
+  }
+
+  private async backfillTableIfEmpty(table: string, statement: string): Promise<void> {
+    if (await this.tableHasRows(table)) {
+      return;
+    }
+
+    await this.executeCommand({ query: statement });
+  }
+
+  private async tableHasRows(table: string): Promise<boolean> {
+    const rows = await this.queryRows<{ present: number }>({
+      query: `
+        SELECT 1 AS present
+        FROM ${table}
+        LIMIT 1
+      `,
+      format: 'JSONEachRow',
+    });
+
+    return rows.length > 0;
   }
 
   private async queryRows<T>(parameters: ClickHouseJsonQueryParameters): Promise<T[]> {
@@ -1452,7 +1569,9 @@ export async function createWarehouse(
   settings: WarehouseSettings,
 ): Promise<InvestigationWarehousePort & ProjectionWarehousePort & ExplorerWarehousePort> {
   if (settings.driver === 'clickhouse') {
-    return new ClickHouseWarehouseAdapter(settings);
+    const adapter = new ClickHouseWarehouseAdapter(settings);
+    await adapter.boot();
+    return adapter;
   }
 
   const adapter = new DuckDbWarehouseAdapter(settings.location);
@@ -1477,7 +1596,13 @@ function directLinkKey(
   return `${networkId}:${fromAddress}:${toAddress}:${assetAddress}`;
 }
 
-function chunkQueryValues<T>(values: T[]): T[][] {
+function chunkQueryValues<T>(
+  values: T[],
+  options?: {
+    maxBytes?: number;
+    maxValues?: number;
+  },
+): T[][] {
   if (values.length === 0) {
     return [];
   }
@@ -1485,12 +1610,12 @@ function chunkQueryValues<T>(values: T[]): T[][] {
   const chunks: T[][] = [];
   let currentChunk: T[] = [];
   let currentBytes = 0;
+  const maxBytes = options?.maxBytes ?? maxClickHouseQueryValueBytesPerChunk;
+  const maxValues = options?.maxValues ?? maxClickHouseQueryValuesPerChunk;
 
   for (const value of values) {
     const valueBytes = String(value).length + 3;
-    const wouldOverflow =
-      currentChunk.length >= maxClickHouseQueryValuesPerChunk ||
-      currentBytes + valueBytes > maxClickHouseQueryValueBytesPerChunk;
+    const wouldOverflow = currentChunk.length >= maxValues || currentBytes + valueBytes > maxBytes;
 
     if (wouldOverflow && currentChunk.length > 0) {
       chunks.push(currentChunk);
@@ -1535,6 +1660,100 @@ function isWarehouseMemoryLimitMessage(message: string): boolean {
     message.includes('MEMORY_LIMIT_EXCEEDED') || message.includes('User memory limit exceeded')
   );
 }
+
+const clickHouseWarehouseBootstrapStatements = [
+  `
+    CREATE TABLE IF NOT EXISTS ${utxoCurrentStateByAddressTable}
+    (
+      network_id UInt64,
+      block_height UInt64,
+      block_hash String,
+      block_time UInt64,
+      txid String,
+      tx_index UInt64,
+      vout UInt64,
+      output_key String,
+      address String,
+      script_type String,
+      value_base String,
+      is_coinbase UInt8,
+      is_spendable UInt8,
+      spent_by_txid Nullable(String),
+      spent_in_block Nullable(UInt64),
+      spent_input_index Nullable(UInt64),
+      version UInt64
+    )
+    ENGINE = ReplacingMergeTree(version)
+    ORDER BY (network_id, address, output_key)
+  `,
+  `
+    CREATE MATERIALIZED VIEW IF NOT EXISTS ${utxoCurrentStateByAddressTable}_mv
+    TO ${utxoCurrentStateByAddressTable}
+    AS
+    SELECT
+      network_id,
+      block_height,
+      block_hash,
+      block_time,
+      txid,
+      tx_index,
+      vout,
+      output_key,
+      address,
+      script_type,
+      value_base,
+      is_coinbase,
+      is_spendable,
+      spent_by_txid,
+      spent_in_block,
+      spent_input_index,
+      version
+    FROM ${utxoCurrentStateTable}
+  `,
+  `
+    CREATE TABLE IF NOT EXISTS ${addressMovementsByAddressTable}
+    (
+      movement_id String,
+      network_id UInt64,
+      block_height UInt64,
+      block_hash String,
+      block_time UInt64,
+      txid String,
+      tx_index UInt64,
+      entry_index UInt64,
+      address String,
+      asset_address String,
+      direction String,
+      amount_base String,
+      amount_base_i256 Int256 MATERIALIZED toInt256(amount_base),
+      output_key Nullable(String),
+      derivation_method String
+    )
+    ENGINE = MergeTree
+    ORDER BY (network_id, address, block_height, tx_index, entry_index, movement_id)
+  `,
+  `
+    CREATE MATERIALIZED VIEW IF NOT EXISTS ${addressMovementsByAddressTable}_mv
+    TO ${addressMovementsByAddressTable}
+    AS
+    SELECT
+      movement_id,
+      network_id,
+      block_height,
+      block_hash,
+      block_time,
+      txid,
+      tx_index,
+      entry_index,
+      address,
+      asset_address,
+      direction,
+      amount_base,
+      output_key,
+      derivation_method
+    FROM address_movements_v2
+  `,
+];
 
 function formatBalanceTupleList(keys: string[]): string {
   return formatTupleList(

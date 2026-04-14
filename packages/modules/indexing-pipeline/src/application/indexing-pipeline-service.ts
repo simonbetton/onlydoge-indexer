@@ -47,14 +47,14 @@ type IndexedNetwork = Awaited<ReturnType<IndexedNetworkPort['listActiveNetworks'
 const defaultSettings: IndexingPipelineSettings = {
   leaseHeartbeatIntervalMs: 5_000,
   networkConcurrency: 2,
-  syncWindow: 64,
-  syncConcurrency: 8,
+  syncWindow: 32,
+  syncConcurrency: 4,
   syncTimeoutMs: 120_000,
-  projectWindow: 32,
+  projectWindow: 8,
   projectTimeoutMs: 120_000,
-  relinkBatchSize: 64,
-  relinkConcurrency: 4,
-  relinkFrontierBatch: 128,
+  relinkBatchSize: 16,
+  relinkConcurrency: 2,
+  relinkFrontierBatch: 32,
   relinkTimeoutMs: 120_000,
 };
 

@@ -76,9 +76,22 @@ Used for:
 
 - block ref lookup via `applied_blocks_v2`
 - tx lookup via `utxo_outputs_v2`
-- address history via `address_movements_v2`
-- current UTXOs via `utxo_outputs_current_v2`
+- address history via `address_movements_by_address_v2`
+- current UTXOs via `utxo_outputs_current_by_address_v2`
 - current balances via `balances_v2`
+
+The address-facing explorer routes now read from address-ordered ClickHouse tables instead of the write-oriented facts:
+
+- `address_movements_by_address_v2`
+  - materialized from `address_movements_v2`
+  - ordered by `network_id, address, block_height, tx_index, entry_index, movement_id`
+  - includes a precomputed `amount_base_i256` helper column so address aggregations do not repeatedly cast string amounts
+- `utxo_outputs_current_by_address_v2`
+  - materialized from `utxo_outputs_current_v2`
+  - ordered by `network_id, address, output_key`
+  - keeps the same current-state versioning model while aligning with address detail and UTXO page filters
+
+This keeps the immutable facts intact while giving the explorer API a cheaper physical read path.
 
 ### Metadata and overlay
 
@@ -111,3 +124,22 @@ The explorer work should stay covered by the same layers used elsewhere:
 - API integration tests for authenticated access, block/tx/address reads, and OpenAPI exposure
 - warehouse contract tests for block refs, tx refs, address summaries, history, and UTXOs
 - existing indexer integration tests continue proving the underlying Dogecoin projection data
+
+## ClickHouse Memory Strategy
+
+The explorer and projector now use a lower-memory ClickHouse posture by default.
+
+- current-state UTXO lookups avoid `FINAL`
+- hot output-key fetches are chunked more aggressively than general warehouse reads
+- address summary and history queries read from address-ordered tables instead of grouping over the write-optimized base tables
+- ClickHouse defaults now cap query thread fan-out and spill sort/group intermediates earlier
+- indexer defaults use smaller sync, projection, and relink windows so the background projector does not assume a large warehouse host
+
+## Runtime Migration
+
+ClickHouse read-model changes are applied both ways:
+
+- fresh Docker stacks get the optimized tables and materialized views from `docker/clickhouse/init/001_schema.sql`
+- existing deployments get the same objects from the platform warehouse boot path
+
+The runtime boot path also backfills the new address-oriented tables once when they are empty, so production rollouts do not require a manual warehouse rebuild before the explorer routes benefit from the new layout.

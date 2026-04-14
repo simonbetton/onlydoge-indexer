@@ -169,6 +169,52 @@ CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_current_v2
 ENGINE = ReplacingMergeTree(version)
 ORDER BY (network_id, output_key);
 
+CREATE TABLE IF NOT EXISTS onlydoge.utxo_outputs_current_by_address_v2
+(
+  network_id UInt64,
+  block_height UInt64,
+  block_hash String,
+  block_time UInt64,
+  txid String,
+  tx_index UInt64,
+  vout UInt64,
+  output_key String,
+  address String,
+  script_type String,
+  value_base String,
+  is_coinbase UInt8,
+  is_spendable UInt8,
+  spent_by_txid Nullable(String),
+  spent_in_block Nullable(UInt64),
+  spent_input_index Nullable(UInt64),
+  version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (network_id, address, output_key);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS onlydoge.utxo_outputs_current_by_address_v2_mv
+TO onlydoge.utxo_outputs_current_by_address_v2
+AS
+SELECT
+  network_id,
+  block_height,
+  block_hash,
+  block_time,
+  txid,
+  tx_index,
+  vout,
+  output_key,
+  address,
+  script_type,
+  value_base,
+  is_coinbase,
+  is_spendable,
+  spent_by_txid,
+  spent_in_block,
+  spent_input_index,
+  version
+FROM onlydoge.utxo_outputs_current_v2;
+
 CREATE TABLE IF NOT EXISTS onlydoge.address_movements_v2
 (
   movement_id String,
@@ -188,6 +234,47 @@ CREATE TABLE IF NOT EXISTS onlydoge.address_movements_v2
 )
 ENGINE = MergeTree
 ORDER BY (network_id, movement_id);
+
+CREATE TABLE IF NOT EXISTS onlydoge.address_movements_by_address_v2
+(
+  movement_id String,
+  network_id UInt64,
+  block_height UInt64,
+  block_hash String,
+  block_time UInt64,
+  txid String,
+  tx_index UInt64,
+  entry_index UInt64,
+  address String,
+  asset_address String,
+  direction String,
+  amount_base String,
+  amount_base_i256 Int256 MATERIALIZED toInt256(amount_base),
+  output_key Nullable(String),
+  derivation_method String
+)
+ENGINE = MergeTree
+ORDER BY (network_id, address, block_height, tx_index, entry_index, movement_id);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS onlydoge.address_movements_by_address_v2_mv
+TO onlydoge.address_movements_by_address_v2
+AS
+SELECT
+  movement_id,
+  network_id,
+  block_height,
+  block_hash,
+  block_time,
+  txid,
+  tx_index,
+  entry_index,
+  address,
+  asset_address,
+  direction,
+  amount_base,
+  output_key,
+  derivation_method
+FROM onlydoge.address_movements_v2;
 
 CREATE TABLE IF NOT EXISTS onlydoge.transfers_v2
 (

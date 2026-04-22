@@ -76,6 +76,27 @@ export interface DirectLinkDelta {
 
 export interface DirectLinkRecord extends DirectLinkDelta {}
 
+export interface ProjectionBalanceSnapshot {
+  address: string;
+  assetAddress: string;
+  asOfBlockHeight: number;
+  balance: string;
+  networkId: PrimaryId;
+}
+
+export interface ProjectionAppliedBlock {
+  blockHash: string;
+  blockHeight: number;
+  networkId: PrimaryId;
+}
+
+export interface ProjectionDirectLinkBatch {
+  blockHash: string;
+  blockHeight: number;
+  directLinkDeltas: DirectLinkDelta[];
+  networkId: PrimaryId;
+}
+
 export interface SourceLinkRecord {
   firstSeenBlockHeight: number;
   hopCount: number;
@@ -98,6 +119,24 @@ export interface BlockProjectionBatch {
   transfers: TransferFact[];
   utxoCreates: ProjectionUtxoOutput[];
   utxoSpends: ProjectionUtxoSpend[];
+}
+
+export interface ProjectionFactWindow {
+  addressMovements: AddressMovement[];
+  appliedBlocks: ProjectionAppliedBlock[];
+  balances: ProjectionBalanceSnapshot[];
+  directLinks: DirectLinkRecord[];
+  networkId: PrimaryId;
+  transfers: TransferFact[];
+  utxoOutputs: ProjectionUtxoOutput[];
+}
+
+export interface ProjectionStateBootstrapSnapshot {
+  appliedBlocks: ProjectionAppliedBlock[];
+  balances: ProjectionBalanceSnapshot[];
+  directLinks: DirectLinkRecord[];
+  sourceLinks: SourceLinkRecord[];
+  utxoOutputs: ProjectionUtxoOutput[];
 }
 
 export interface TrackedAddress {

@@ -419,7 +419,7 @@ describe('clickhouse warehouse adapter', () => {
     await adapter.boot();
 
     const statements = command.mock.calls.map(
-      (call) => ((call as Array<{ query: string }>).at(0)?.query ?? ''),
+      (call) => (call as Array<{ query: string }>).at(0)?.query ?? '',
     );
 
     expect(

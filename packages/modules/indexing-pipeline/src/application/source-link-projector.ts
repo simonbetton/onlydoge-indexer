@@ -1,4 +1,4 @@
-import type { ProjectionWarehousePort } from '../contracts/ports';
+import type { ProjectionStateStorePort } from '../contracts/ports';
 import type { SourceLinkRecord, TrackedAddress } from '../domain/projection-models';
 
 interface PathNode {
@@ -11,7 +11,7 @@ interface PathNode {
 }
 
 export class SourceLinkProjector {
-  public constructor(private readonly warehouse: ProjectionWarehousePort) {}
+  public constructor(private readonly warehouse: ProjectionStateStorePort) {}
 
   public async rebuild(
     networkId: number,

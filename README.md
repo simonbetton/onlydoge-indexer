@@ -193,11 +193,25 @@ The app reads the following configuration surface:
 - `ONLYDOGE_WAREHOUSE_PASSWORD`
 - `ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS`
 - `ONLYDOGE_INDEXER_NETWORK_CONCURRENCY`
+- `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES`
+- `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES`
+- `ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK`
+- `ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK`
 - `ONLYDOGE_INDEXER_SYNC_WINDOW`
+- `ONLYDOGE_INDEXER_SYNC_WINDOW_MIN`
+- `ONLYDOGE_INDEXER_SYNC_WINDOW_MAX`
 - `ONLYDOGE_INDEXER_SYNC_CONCURRENCY`
+- `ONLYDOGE_INDEXER_SYNC_TARGET_MS`
 - `ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS`
+- `ONLYDOGE_INDEXER_FACT_WINDOW`
+- `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS`
 - `ONLYDOGE_INDEXER_PROJECT_WINDOW`
+- `ONLYDOGE_INDEXER_PROJECT_WINDOW_MIN`
+- `ONLYDOGE_INDEXER_PROJECT_WINDOW_MAX`
+- `ONLYDOGE_INDEXER_PROJECT_TARGET_MS`
 - `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS`
+- `ONLYDOGE_INDEXER_RELINK_BACKLOG_THRESHOLD`
+- `ONLYDOGE_INDEXER_RELINK_TIP_DISTANCE`
 - `ONLYDOGE_INDEXER_RELINK_BATCH_SIZE`
 - `ONLYDOGE_INDEXER_RELINK_CONCURRENCY`
 - `ONLYDOGE_INDEXER_RELINK_FRONTIER_BATCH`
@@ -387,8 +401,31 @@ ghcr.io/simonbetton/onlydoge-indexer:latest
 - `ONLYDOGE_S3_SECRET_ACCESS_KEY`
 - `ONLYDOGE_WAREHOUSE_USER`
 - `ONLYDOGE_WAREHOUSE_PASSWORD`
+- `ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS=5000`
+- `ONLYDOGE_INDEXER_NETWORK_CONCURRENCY=2`
+- `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`
+- `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`
+- `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=4`
+- `ONLYDOGE_INDEXER_FACT_WINDOW=64`
+- `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`
 - `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`
+- `ONLYDOGE_INDEXER_PROJECT_WINDOW_MIN=2`
+- `ONLYDOGE_INDEXER_PROJECT_WINDOW_MAX=16`
+- `ONLYDOGE_INDEXER_PROJECT_TARGET_MS=30000`
 - `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS=300000`
+- `ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK=2048`
+- `ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK=512`
+- `ONLYDOGE_INDEXER_SYNC_WINDOW=32`
+- `ONLYDOGE_INDEXER_SYNC_WINDOW_MIN=32`
+- `ONLYDOGE_INDEXER_SYNC_WINDOW_MAX=256`
+- `ONLYDOGE_INDEXER_SYNC_TARGET_MS=15000`
+- `ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS=120000`
+- `ONLYDOGE_INDEXER_RELINK_BACKLOG_THRESHOLD=256`
+- `ONLYDOGE_INDEXER_RELINK_TIP_DISTANCE=512`
+- `ONLYDOGE_INDEXER_RELINK_BATCH_SIZE=16`
+- `ONLYDOGE_INDEXER_RELINK_CONCURRENCY=2`
+- `ONLYDOGE_INDEXER_RELINK_FRONTIER_BATCH=32`
+- `ONLYDOGE_INDEXER_RELINK_TIMEOUT_MS=120000`
 
 5. Leave the image command at its default unless you intentionally want to override the bundled `--mode=both --ip=0.0.0.0 --port=80`.
 
@@ -432,6 +469,50 @@ git push origin v0.1.0
 
 4. In ONCE, update the installed image tag from `latest` to the version you want to pin, or switch from one version tag to the next and let ONCE restart the app.
 
+### Checked-In ONCE Deploy Script
+
+Use the checked-in deploy script when you want the repo, not the host UI, to be the source of truth for the ONCE image and app env set.
+
+1. Create a local ONCE env file.
+
+```bash
+cp .env.once.example .env.once
+```
+
+2. Fill in the real production secrets and infrastructure values.
+
+3. Deploy with the checked-in script.
+
+```bash
+npm run deploy:once
+```
+
+The script:
+
+- reads `.env.once`
+- resolves `ghcr.io/simonbetton/onlydoge-indexer:latest` to an immutable digest
+- connects to the ONCE host over SSH
+- uses `once deploy` if the app does not exist yet
+- uses `once update` if it already exists
+- pushes the full app env set atomically instead of patching individual values
+- waits for `/up` and `/v1/heartbeat` to succeed
+
+Useful overrides:
+
+```bash
+npm run deploy:once -- --envFile .env.once --image ghcr.io/simonbetton/onlydoge-indexer:latest
+npm run deploy:once -- --dryRun
+npm run deploy:once -- --host platform.onlydoge.io --sshJump root@164.90.159.127 --sshTarget root@10.124.0.3
+```
+
+By default the script expects:
+
+- `ONCE_APP_HOST=platform.onlydoge.io`
+- `ONCE_SSH_JUMP=root@164.90.159.127`
+- `ONCE_SSH_TARGET=root@10.124.0.3`
+
+If your Postgres DSN uses `sslrootcert=/storage/do-ca.pem`, make sure that CA file already exists in the ONCE app volume before the first deploy. For the current production host that file is already present.
+
 ### Deployment Steps
 
 ```bash
@@ -451,8 +532,31 @@ For the bundled Compose production stack, ClickHouse and the indexer tuning are 
 
 - `docker/clickhouse/config.d/onlydoge-memory.xml`
 - `docker/clickhouse/users.d/onlydoge-memory.xml`
+- `ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS=5000`
+- `ONLYDOGE_INDEXER_NETWORK_CONCURRENCY=2`
+- `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`
+- `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`
+- `ONLYDOGE_INDEXER_FACT_WINDOW=64`
+- `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`
 - `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`
+- `ONLYDOGE_INDEXER_PROJECT_WINDOW_MIN=2`
+- `ONLYDOGE_INDEXER_PROJECT_WINDOW_MAX=16`
+- `ONLYDOGE_INDEXER_PROJECT_TARGET_MS=30000`
 - `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS=300000`
+- `ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK=2048`
+- `ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK=512`
+- `ONLYDOGE_INDEXER_SYNC_WINDOW=32`
+- `ONLYDOGE_INDEXER_SYNC_WINDOW_MIN=32`
+- `ONLYDOGE_INDEXER_SYNC_WINDOW_MAX=256`
+- `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=4`
+- `ONLYDOGE_INDEXER_SYNC_TARGET_MS=15000`
+- `ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS=120000`
+- `ONLYDOGE_INDEXER_RELINK_BACKLOG_THRESHOLD=256`
+- `ONLYDOGE_INDEXER_RELINK_TIP_DISTANCE=512`
+- `ONLYDOGE_INDEXER_RELINK_BATCH_SIZE=16`
+- `ONLYDOGE_INDEXER_RELINK_CONCURRENCY=2`
+- `ONLYDOGE_INDEXER_RELINK_FRONTIER_BATCH=32`
+- `ONLYDOGE_INDEXER_RELINK_TIMEOUT_MS=120000`
 
 ### Reverse Proxy Example Concerns
 
@@ -522,4 +626,4 @@ Vitest covers:
 - The local and production Compose stacks assume the warehouse database name is `onlydoge`.
 - Raw block storage is written to S3-compatible object storage in Dockerized environments.
 - The current checked-in ClickHouse memory profile assumes a warehouse node in roughly the `16 GB RAM` class. If you run a materially smaller box, lower the profile values before deployment.
-- The current checked-in indexer projection defaults are intentionally conservative for production backfill: `ONLYDOGE_INDEXER_PROJECT_WINDOW=4` and `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS=300000`.
+- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_INDEXER_FACT_WINDOW=64`, `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`, `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK=2048`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK=512`, and relink deferral near the values in `.env.production.example`.

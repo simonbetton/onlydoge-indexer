@@ -14,12 +14,29 @@ import type {
   TagRepository,
 } from '@onlydoge/entity-labeling';
 import {
+  addAmountBase,
+  type BlockProjectionBatch,
   type CoordinatorConfigPort,
   configKeyNewlyAddedAddress,
+  configKeyProjectionBootstrapTail,
+  type DirectLinkRecord,
+  formatAmountBase,
   type IndexedNetworkPort,
+  type ProjectionAppliedBlock,
+  type ProjectionBalanceSnapshot,
+  type ProjectionDirectLinkBatch,
   type ProjectionLinkSeedPort,
+  type ProjectionStateBootstrapSnapshot,
+  type ProjectionStateStorePort,
+  type ProjectionUtxoOutput,
+  parseAmountBase,
+  type SourceLinkRecord,
 } from '@onlydoge/indexing-pipeline';
-import type { ConfigReader, InvestigationMetadataPort } from '@onlydoge/investigation-query';
+import type {
+  ConfigReader,
+  InvestigationMetadataPort,
+  InvestigationWarehousePort,
+} from '@onlydoge/investigation-query';
 import type {
   NetworkRecord,
   NetworkRepository,
@@ -37,7 +54,7 @@ import { drizzle as drizzleLibsql } from 'drizzle-orm/libsql';
 import { drizzle as drizzleMysql } from 'drizzle-orm/mysql2';
 import { drizzle as drizzlePg } from 'drizzle-orm/node-postgres';
 import mysql from 'mysql2/promise';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 
 import type { DatabaseSettings } from './settings';
 
@@ -45,6 +62,12 @@ type SupportedClient =
   | { kind: 'sqlite'; raw: LibsqlClient }
   | { kind: 'postgres'; raw: Pool }
   | { kind: 'mysql'; raw: mysql.Pool };
+
+type SupportedExecutor =
+  | SupportedClient
+  | { kind: 'sqlite'; raw: LibsqlClient }
+  | { kind: 'postgres'; raw: PoolClient }
+  | { kind: 'mysql'; raw: mysql.PoolConnection };
 
 type SqlValue = boolean | number | string | null;
 
@@ -79,7 +102,9 @@ export class RelationalMetadataStore
     CoordinatorConfigPort,
     ConfigMutationPort,
     InvestigationMetadataPort,
+    InvestigationWarehousePort,
     IndexedNetworkPort,
+    ProjectionStateStorePort,
     ProjectionLinkSeedPort,
     NetworkReader
 {
@@ -942,6 +967,776 @@ export class RelationalMetadataStore
     );
   }
 
+  public async getBalancesByAddresses(addresses: string[]) {
+    if (addresses.length === 0) {
+      return [];
+    }
+
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT network_id, address, asset_address, balance, as_of_block_height
+        FROM projection_balances_current
+        WHERE address IN (${placeholders(addresses.length)})
+        ORDER BY network_id ASC, address ASC, asset_address ASC
+      `,
+      addresses,
+    );
+
+    return rows.map((row) => ({
+      networkId: Number(row.network_id),
+      assetAddress: String(row.asset_address),
+      balance: String(row.balance),
+    }));
+  }
+
+  public async getTokensByAddresses(addresses: string[]) {
+    if (addresses.length === 0) {
+      return [];
+    }
+
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT network_id, id, name, symbol, address, decimals
+        FROM tokens
+        WHERE address IN (${placeholders(addresses.length)})
+        ORDER BY network_id ASC, address ASC
+      `,
+      addresses,
+    );
+
+    return rows.map((row) => ({
+      networkId: Number(row.network_id),
+      id: String(row.id),
+      name: String(row.name),
+      symbol: String(row.symbol),
+      address: String(row.address),
+      decimals: Number(row.decimals),
+    }));
+  }
+
+  public async getDistinctLinksByAddresses(addresses: string[]) {
+    if (addresses.length === 0) {
+      return [];
+    }
+
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT DISTINCT network_id, source_address, to_address, hop_count
+        FROM projection_source_links_current
+        WHERE to_address IN (${placeholders(addresses.length)})
+        ORDER BY network_id ASC, source_address ASC, to_address ASC
+      `,
+      addresses,
+    );
+
+    return rows.map((row) => ({
+      networkId: Number(row.network_id),
+      fromAddress: String(row.source_address),
+      toAddress: String(row.to_address),
+      transferCount: Number(row.hop_count),
+    }));
+  }
+
+  public async getBalanceSnapshots(
+    networkId: PrimaryId,
+    keys: Array<{
+      address: string;
+      assetAddress: string;
+    }>,
+  ): Promise<Map<string, ProjectionBalanceSnapshot>> {
+    if (keys.length === 0) {
+      return new Map();
+    }
+
+    const rows = (
+      await Promise.all(
+        chunkArray(keys, 250).map((chunk) => {
+          const conditions = chunk.map(() => '(address = ? AND asset_address = ?)').join(' OR ');
+          return this.query<DatabaseRow>(
+            `
+              SELECT network_id, address, asset_address, balance, as_of_block_height
+              FROM projection_balances_current
+              WHERE network_id = ? AND (${conditions})
+            `,
+            [networkId, ...chunk.flatMap((key) => [key.address, key.assetAddress])],
+          );
+        }),
+      )
+    ).flat();
+
+    return new Map(
+      rows.map((row) => {
+        const snapshot: ProjectionBalanceSnapshot = {
+          networkId: Number(row.network_id),
+          address: String(row.address),
+          assetAddress: String(row.asset_address),
+          balance: String(row.balance),
+          asOfBlockHeight: Number(row.as_of_block_height),
+        };
+        return [projectionBalanceSnapshotKey(snapshot.address, snapshot.assetAddress), snapshot];
+      }),
+    );
+  }
+
+  public async getDirectLinkSnapshots(
+    networkId: PrimaryId,
+    keys: Array<{
+      assetAddress: string;
+      fromAddress: string;
+      toAddress: string;
+    }>,
+  ): Promise<Map<string, DirectLinkRecord>> {
+    if (keys.length === 0) {
+      return new Map();
+    }
+
+    const rows = (
+      await Promise.all(
+        chunkArray(keys, 200).map((chunk) => {
+          const conditions = chunk
+            .map(() => '(from_address = ? AND to_address = ? AND asset_address = ?)')
+            .join(' OR ');
+          return this.query<DatabaseRow>(
+            `
+              SELECT
+                network_id,
+                from_address,
+                to_address,
+                asset_address,
+                transfer_count,
+                total_amount_base,
+                first_seen_block_height,
+                last_seen_block_height
+              FROM projection_direct_links_current
+              WHERE network_id = ? AND (${conditions})
+            `,
+            [
+              networkId,
+              ...chunk.flatMap((key) => [key.fromAddress, key.toAddress, key.assetAddress]),
+            ],
+          );
+        }),
+      )
+    ).flat();
+
+    return new Map(
+      rows.map((row) => {
+        const snapshot: DirectLinkRecord = {
+          networkId: Number(row.network_id),
+          fromAddress: String(row.from_address),
+          toAddress: String(row.to_address),
+          assetAddress: String(row.asset_address),
+          transferCount: Number(row.transfer_count),
+          totalAmountBase: String(row.total_amount_base),
+          firstSeenBlockHeight: Number(row.first_seen_block_height),
+          lastSeenBlockHeight: Number(row.last_seen_block_height),
+        };
+        return [
+          projectionDirectLinkSnapshotKey(
+            snapshot.fromAddress,
+            snapshot.toAddress,
+            snapshot.assetAddress,
+          ),
+          snapshot,
+        ];
+      }),
+    );
+  }
+
+  public async getProjectionBootstrapTail(networkId: PrimaryId): Promise<number | null> {
+    return this.getJsonValue<number>(configKeyProjectionBootstrapTail(networkId));
+  }
+
+  public async getCurrentAddressSummary(
+    networkId: PrimaryId,
+    address: string,
+  ): Promise<{
+    balance: string;
+    utxoCount: number;
+  } | null> {
+    const [balanceRow, utxoRow] = await Promise.all([
+      this.one<DatabaseRow>(
+        `
+          SELECT balance
+          FROM projection_balances_current
+          WHERE network_id = ? AND address = ? AND asset_address = ''
+          LIMIT 1
+        `,
+        [networkId, address],
+      ),
+      this.one<DatabaseRow>(
+        `
+          SELECT COUNT(*) AS utxo_count
+          FROM projection_utxo_outputs_current
+          WHERE
+            network_id = ?
+            AND address = ?
+            AND ${this.booleanCondition('is_spendable', true)}
+            AND spent_by_txid IS NULL
+        `,
+        [networkId, address],
+      ),
+    ]);
+
+    const balance = balanceRow?.balance ? String(balanceRow.balance) : '0';
+    const utxoCount = Number(utxoRow?.utxo_count ?? 0);
+    if (balance === '0' && utxoCount === 0) {
+      return null;
+    }
+
+    return {
+      balance,
+      utxoCount,
+    };
+  }
+
+  public async getUtxoOutputs(
+    networkId: PrimaryId,
+    outputKeys: string[],
+  ): Promise<Map<string, ProjectionUtxoOutput>> {
+    if (outputKeys.length === 0) {
+      return new Map();
+    }
+
+    const rows = (
+      await Promise.all(
+        chunkArray(outputKeys, 1_000).map((chunk) =>
+          this.query<DatabaseRow>(
+            `
+              SELECT
+                network_id,
+                block_height,
+                block_hash,
+                block_time,
+                txid,
+                tx_index,
+                vout,
+                output_key,
+                address,
+                script_type,
+                value_base,
+                is_coinbase,
+                is_spendable,
+                spent_by_txid,
+                spent_in_block,
+                spent_input_index
+              FROM projection_utxo_outputs_current
+              WHERE network_id = ? AND output_key IN (${placeholders(chunk.length)})
+            `,
+            [networkId, ...chunk],
+          ),
+        ),
+      )
+    ).flat();
+
+    return new Map(
+      rows.map((row) => {
+        const output = this.mapProjectionUtxoOutput(row);
+        return [output.outputKey, output];
+      }),
+    );
+  }
+
+  public async listAddressUtxos(
+    networkId: PrimaryId,
+    address: string,
+    offset = 0,
+    limit?: number,
+  ): Promise<ProjectionUtxoOutput[]> {
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT
+          network_id,
+          block_height,
+          block_hash,
+          block_time,
+          txid,
+          tx_index,
+          vout,
+          output_key,
+          address,
+          script_type,
+          value_base,
+          is_coinbase,
+          is_spendable,
+          spent_by_txid,
+          spent_in_block,
+          spent_input_index
+        FROM projection_utxo_outputs_current
+        WHERE
+          network_id = ?
+          AND address = ?
+          AND ${this.booleanCondition('is_spendable', true)}
+          AND spent_by_txid IS NULL
+        ORDER BY block_height DESC, tx_index DESC, vout ASC
+        ${limit !== undefined ? 'LIMIT ?' : ''}
+        ${offset > 0 ? 'OFFSET ?' : ''}
+      `,
+      [
+        networkId,
+        address,
+        ...(limit !== undefined ? [limit] : []),
+        ...(offset > 0 ? [offset] : []),
+      ],
+    );
+
+    return rows.map((row) => this.mapProjectionUtxoOutput(row));
+  }
+
+  public async hasAppliedBlock(
+    networkId: PrimaryId,
+    blockHeight: number,
+    blockHash: string,
+  ): Promise<boolean> {
+    const row = await this.one<DatabaseRow>(
+      `
+        SELECT 1 AS present
+        FROM projection_applied_blocks
+        WHERE network_id = ? AND block_height = ? AND block_hash = ?
+        LIMIT 1
+      `,
+      [networkId, blockHeight, blockHash],
+    );
+    if (row) {
+      return true;
+    }
+
+    const bootstrapTail = await this.getProjectionBootstrapTail(networkId);
+    return bootstrapTail !== null && blockHeight <= bootstrapTail;
+  }
+
+  public async listAppliedBlockSet(
+    networkId: PrimaryId,
+    blocks: Array<{
+      blockHash: string;
+      blockHeight: number;
+    }>,
+  ): Promise<Set<string>> {
+    if (blocks.length === 0) {
+      return new Set();
+    }
+
+    const conditions = blocks.map(() => '(block_height = ? AND block_hash = ?)').join(' OR ');
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT block_height, block_hash
+        FROM projection_applied_blocks
+        WHERE network_id = ? AND (${conditions})
+      `,
+      [networkId, ...blocks.flatMap((block) => [block.blockHeight, block.blockHash])],
+    );
+
+    const identities = new Set(
+      rows.map((row) =>
+        appliedBlockIdentity(networkId, Number(row.block_height), String(row.block_hash)),
+      ),
+    );
+    const bootstrapTail = await this.getProjectionBootstrapTail(networkId);
+    if (bootstrapTail !== null) {
+      for (const block of blocks) {
+        if (block.blockHeight <= bootstrapTail) {
+          identities.add(appliedBlockIdentity(networkId, block.blockHeight, block.blockHash));
+        }
+      }
+    }
+
+    return identities;
+  }
+
+  public async applyDirectLinkDeltasWindow(batches: ProjectionDirectLinkBatch[]): Promise<void> {
+    if (batches.length === 0) {
+      return;
+    }
+
+    const orderedBatches = [...batches].sort((left, right) => left.blockHeight - right.blockHeight);
+    const networkId = orderedBatches[0]?.networkId;
+    if (networkId === undefined) {
+      return;
+    }
+
+    const appliedBlocks = await this.listDirectLinkAppliedBlockSet(
+      networkId,
+      orderedBatches.map((batch) => ({
+        blockHeight: batch.blockHeight,
+        blockHash: batch.blockHash,
+      })),
+    );
+    const pendingBatches = orderedBatches.filter(
+      (batch) =>
+        !appliedBlocks.has(
+          appliedBlockIdentity(batch.networkId, batch.blockHeight, batch.blockHash),
+        ),
+    );
+    if (pendingBatches.length === 0) {
+      return;
+    }
+
+    const directLinkKeys = [
+      ...new Set(
+        pendingBatches.flatMap((batch) =>
+          batch.directLinkDeltas.map((delta) =>
+            projectionDirectLinkSnapshotKey(delta.fromAddress, delta.toAddress, delta.assetAddress),
+          ),
+        ),
+      ),
+    ].map(parseProjectionDirectLinkKey);
+    const currentDirectLinks = await this.getDirectLinkSnapshots(networkId, directLinkKeys);
+    const nextDirectLinks = new Map<string, DirectLinkRecord>();
+
+    for (const batch of pendingBatches) {
+      for (const delta of batch.directLinkDeltas) {
+        const key = projectionDirectLinkSnapshotKey(
+          delta.fromAddress,
+          delta.toAddress,
+          delta.assetAddress,
+        );
+        const current = nextDirectLinks.get(key) ?? currentDirectLinks.get(key);
+        if (current) {
+          nextDirectLinks.set(key, {
+            ...current,
+            transferCount: current.transferCount + delta.transferCount,
+            totalAmountBase: addAmountBase(current.totalAmountBase, delta.totalAmountBase),
+            firstSeenBlockHeight: Math.min(
+              current.firstSeenBlockHeight,
+              delta.firstSeenBlockHeight,
+            ),
+            lastSeenBlockHeight: Math.max(current.lastSeenBlockHeight, delta.lastSeenBlockHeight),
+          });
+          continue;
+        }
+
+        nextDirectLinks.set(key, { ...delta });
+      }
+    }
+
+    const timestamp = nowIsoString();
+    await this.withTransaction(async (executor) => {
+      await this.upsertProjectionDirectLinks([...nextDirectLinks.values()], timestamp, executor);
+      await this.insertProjectionDirectLinkAppliedBlocks(
+        pendingBatches.map((batch) => ({
+          networkId: batch.networkId,
+          blockHeight: batch.blockHeight,
+          blockHash: batch.blockHash,
+        })),
+        timestamp,
+        executor,
+      );
+    });
+  }
+
+  private async listDirectLinkAppliedBlockSet(
+    networkId: PrimaryId,
+    blocks: Array<{
+      blockHash: string;
+      blockHeight: number;
+    }>,
+  ): Promise<Set<string>> {
+    if (blocks.length === 0) {
+      return new Set();
+    }
+
+    const conditions = blocks.map(() => '(block_height = ? AND block_hash = ?)').join(' OR ');
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT block_height, block_hash
+        FROM projection_direct_link_applied_blocks
+        WHERE network_id = ? AND (${conditions})
+      `,
+      [networkId, ...blocks.flatMap((block) => [block.blockHeight, block.blockHash])],
+    );
+
+    return new Set(
+      rows.map((row) =>
+        appliedBlockIdentity(networkId, Number(row.block_height), String(row.block_hash)),
+      ),
+    );
+  }
+
+  public async hasProjectionState(networkId: PrimaryId): Promise<boolean> {
+    const bootstrapTail = await this.getProjectionBootstrapTail(networkId);
+    if (bootstrapTail !== null) {
+      return true;
+    }
+
+    const row = await this.one<DatabaseRow>(
+      `
+        SELECT 1 AS present
+        FROM projection_applied_blocks
+        WHERE network_id = ?
+        LIMIT 1
+      `,
+      [networkId],
+    );
+
+    return Boolean(row);
+  }
+
+  public async importProjectionStateSnapshot(
+    networkId: PrimaryId,
+    snapshot: ProjectionStateBootstrapSnapshot,
+    processTail: number,
+  ): Promise<void> {
+    const timestamp = nowIsoString();
+    await this.withTransaction(async (executor) => {
+      await this.executeWithExecutor(
+        executor,
+        'DELETE FROM projection_utxo_outputs_current WHERE network_id = ?',
+        [networkId],
+      );
+      await this.executeWithExecutor(
+        executor,
+        'DELETE FROM projection_balances_current WHERE network_id = ?',
+        [networkId],
+      );
+      await this.executeWithExecutor(
+        executor,
+        'DELETE FROM projection_direct_links_current WHERE network_id = ?',
+        [networkId],
+      );
+      await this.executeWithExecutor(
+        executor,
+        'DELETE FROM projection_source_links_current WHERE network_id = ?',
+        [networkId],
+      );
+      await this.executeWithExecutor(
+        executor,
+        'DELETE FROM projection_direct_link_applied_blocks WHERE network_id = ?',
+        [networkId],
+      );
+      await this.executeWithExecutor(
+        executor,
+        'DELETE FROM projection_applied_blocks WHERE network_id = ?',
+        [networkId],
+      );
+      await this.upsertProjectionUtxoOutputs(snapshot.utxoOutputs, timestamp, executor);
+      await this.upsertProjectionBalances(snapshot.balances, timestamp, executor);
+      await this.upsertProjectionDirectLinks(snapshot.directLinks, timestamp, executor);
+      await this.insertProjectionSourceLinks(snapshot.sourceLinks, timestamp, executor);
+      await this.insertProjectionAppliedBlocks(snapshot.appliedBlocks, timestamp, executor);
+    });
+    await this.setJsonValue(configKeyProjectionBootstrapTail(networkId), processTail);
+  }
+
+  public async listDirectLinksFromAddresses(networkId: PrimaryId, fromAddresses: string[]) {
+    if (fromAddresses.length === 0) {
+      return [];
+    }
+
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT
+          network_id,
+          from_address,
+          to_address,
+          asset_address,
+          transfer_count,
+          total_amount_base,
+          first_seen_block_height,
+          last_seen_block_height
+        FROM projection_direct_links_current
+        WHERE network_id = ? AND from_address IN (${placeholders(fromAddresses.length)})
+        ORDER BY from_address ASC, to_address ASC, asset_address ASC
+      `,
+      [networkId, ...fromAddresses],
+    );
+
+    return rows.map((row) => ({
+      networkId: Number(row.network_id),
+      fromAddress: String(row.from_address),
+      toAddress: String(row.to_address),
+      assetAddress: String(row.asset_address),
+      transferCount: Number(row.transfer_count),
+      totalAmountBase: String(row.total_amount_base),
+      firstSeenBlockHeight: Number(row.first_seen_block_height),
+      lastSeenBlockHeight: Number(row.last_seen_block_height),
+    }));
+  }
+
+  public async listSourceSeedIdsReachingAddresses(
+    networkId: PrimaryId,
+    addresses: string[],
+  ): Promise<PrimaryId[]> {
+    if (addresses.length === 0) {
+      return [];
+    }
+
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT DISTINCT source_address_id
+        FROM projection_source_links_current
+        WHERE network_id = ? AND to_address IN (${placeholders(addresses.length)})
+      `,
+      [networkId, ...addresses],
+    );
+
+    return rows.map((row) => Number(row.source_address_id));
+  }
+
+  public async replaceSourceLinks(
+    networkId: PrimaryId,
+    sourceAddressId: PrimaryId,
+    rows: SourceLinkRecord[],
+  ): Promise<void> {
+    const timestamp = nowIsoString();
+    await this.withTransaction(async (executor) => {
+      await this.executeWithExecutor(
+        executor,
+        'DELETE FROM projection_source_links_current WHERE network_id = ? AND source_address_id = ?',
+        [networkId, sourceAddressId],
+      );
+      await this.insertProjectionSourceLinks(rows, timestamp, executor);
+    });
+  }
+
+  public async applyProjectionWindow(batches: BlockProjectionBatch[]): Promise<void> {
+    if (batches.length === 0) {
+      return;
+    }
+
+    const orderedBatches = [...batches].sort((left, right) => left.blockHeight - right.blockHeight);
+    const networkId = orderedBatches[0]?.networkId;
+    if (networkId === undefined) {
+      return;
+    }
+
+    const appliedBlocks = await this.listAppliedBlockSet(
+      networkId,
+      orderedBatches.map((batch) => ({
+        blockHeight: batch.blockHeight,
+        blockHash: batch.blockHash,
+      })),
+    );
+    const pendingBatches = orderedBatches.filter(
+      (batch) =>
+        !appliedBlocks.has(
+          appliedBlockIdentity(batch.networkId, batch.blockHeight, batch.blockHash),
+        ),
+    );
+    if (pendingBatches.length === 0) {
+      return;
+    }
+
+    const spendKeys = [
+      ...new Set(
+        pendingBatches.flatMap((batch) => batch.utxoSpends.map((spend) => spend.outputKey)),
+      ),
+    ];
+    const currentOutputs = await this.getUtxoOutputs(networkId, spendKeys);
+    const nextOutputs = new Map<string, ProjectionUtxoOutput>();
+
+    for (const batch of pendingBatches) {
+      for (const output of batch.utxoCreates) {
+        nextOutputs.set(output.outputKey, { ...output });
+      }
+
+      for (const spend of batch.utxoSpends) {
+        const current = nextOutputs.get(spend.outputKey) ?? currentOutputs.get(spend.outputKey);
+        if (!current) {
+          throw new Error(`missing utxo output: ${spend.outputKey}`);
+        }
+
+        nextOutputs.set(spend.outputKey, {
+          ...current,
+          spentByTxid: spend.spentByTxid,
+          spentInBlock: spend.spentInBlock,
+          spentInputIndex: spend.spentInputIndex,
+        });
+      }
+    }
+
+    const balanceKeys = [
+      ...new Set(
+        pendingBatches.flatMap((batch) =>
+          batch.addressMovements.map((movement) =>
+            projectionBalanceSnapshotKey(movement.address, movement.assetAddress),
+          ),
+        ),
+      ),
+    ].map(parseProjectionBalanceKey);
+    const currentBalances = await this.getBalanceSnapshots(networkId, balanceKeys);
+    const nextBalances = new Map<string, ProjectionBalanceSnapshot>();
+
+    for (const batch of pendingBatches) {
+      for (const movement of batch.addressMovements) {
+        const key = projectionBalanceSnapshotKey(movement.address, movement.assetAddress);
+        const current = nextBalances.get(key) ?? currentBalances.get(key);
+        const currentAmount = parseAmountBase(current?.balance ?? '0');
+        const movementAmount = parseAmountBase(movement.amountBase);
+        const nextAmount =
+          movement.direction === 'credit'
+            ? currentAmount + movementAmount
+            : currentAmount - movementAmount;
+        if (nextAmount < 0n) {
+          throw new Error(
+            `negative balance for ${movement.networkId}:${movement.address}:${movement.assetAddress}`,
+          );
+        }
+
+        nextBalances.set(key, {
+          networkId: movement.networkId,
+          address: movement.address,
+          assetAddress: movement.assetAddress,
+          balance: formatAmountBase(nextAmount),
+          asOfBlockHeight: batch.blockHeight,
+        });
+      }
+    }
+
+    const directLinkKeys = [
+      ...new Set(
+        pendingBatches.flatMap((batch) =>
+          batch.directLinkDeltas.map((delta) =>
+            projectionDirectLinkSnapshotKey(delta.fromAddress, delta.toAddress, delta.assetAddress),
+          ),
+        ),
+      ),
+    ].map(parseProjectionDirectLinkKey);
+    const currentDirectLinks = await this.getDirectLinkSnapshots(networkId, directLinkKeys);
+    const nextDirectLinks = new Map<string, DirectLinkRecord>();
+
+    for (const batch of pendingBatches) {
+      for (const delta of batch.directLinkDeltas) {
+        const key = projectionDirectLinkSnapshotKey(
+          delta.fromAddress,
+          delta.toAddress,
+          delta.assetAddress,
+        );
+        const current = nextDirectLinks.get(key) ?? currentDirectLinks.get(key);
+        if (current) {
+          nextDirectLinks.set(key, {
+            ...current,
+            transferCount: current.transferCount + delta.transferCount,
+            totalAmountBase: addAmountBase(current.totalAmountBase, delta.totalAmountBase),
+            firstSeenBlockHeight: Math.min(
+              current.firstSeenBlockHeight,
+              delta.firstSeenBlockHeight,
+            ),
+            lastSeenBlockHeight: Math.max(current.lastSeenBlockHeight, delta.lastSeenBlockHeight),
+          });
+          continue;
+        }
+
+        nextDirectLinks.set(key, { ...delta });
+      }
+    }
+
+    const timestamp = nowIsoString();
+    await this.withTransaction(async (executor) => {
+      await this.upsertProjectionUtxoOutputs([...nextOutputs.values()], timestamp, executor);
+      await this.upsertProjectionBalances([...nextBalances.values()], timestamp, executor);
+      await this.upsertProjectionDirectLinks([...nextDirectLinks.values()], timestamp, executor);
+      await this.insertProjectionAppliedBlocks(
+        pendingBatches.map((batch) => ({
+          networkId: batch.networkId,
+          blockHeight: batch.blockHeight,
+          blockHash: batch.blockHash,
+        })),
+        timestamp,
+        executor,
+      );
+    });
+  }
+
   public async getActiveNetworkById(id: string) {
     const network = await this.getNetworkById(id);
     return network && !network.isDeleted ? network : null;
@@ -1018,48 +1813,490 @@ export class RelationalMetadataStore
     }));
   }
 
+  private mapProjectionUtxoOutput(row: DatabaseRow): ProjectionUtxoOutput {
+    return {
+      networkId: Number(row.network_id),
+      blockHeight: Number(row.block_height),
+      blockHash: String(row.block_hash),
+      blockTime: Number(row.block_time),
+      txid: String(row.txid),
+      txIndex: Number(row.tx_index),
+      vout: Number(row.vout),
+      outputKey: String(row.output_key),
+      address: String(row.address),
+      scriptType: String(row.script_type),
+      valueBase: String(row.value_base),
+      isCoinbase: toBoolean(row.is_coinbase),
+      isSpendable: toBoolean(row.is_spendable),
+      spentByTxid: row.spent_by_txid === null ? null : String(row.spent_by_txid),
+      spentInBlock:
+        row.spent_in_block === null || row.spent_in_block === undefined
+          ? null
+          : Number(row.spent_in_block),
+      spentInputIndex:
+        row.spent_input_index === null || row.spent_input_index === undefined
+          ? null
+          : Number(row.spent_input_index),
+    };
+  }
+
+  private async upsertProjectionUtxoOutputs(
+    outputs: ProjectionUtxoOutput[],
+    timestamp: string,
+    executor: SupportedExecutor = this.client,
+  ): Promise<void> {
+    if (outputs.length === 0) {
+      return;
+    }
+
+    for (const chunk of chunkArray(outputs, this.bulkChunkSize(executor.kind))) {
+      const params = chunk.flatMap((output) => [
+        output.networkId,
+        output.outputKey,
+        output.blockHeight,
+        output.blockHash,
+        output.blockTime,
+        output.txid,
+        output.txIndex,
+        output.vout,
+        output.address,
+        output.scriptType,
+        output.valueBase,
+        this.booleanValue(output.isCoinbase),
+        this.booleanValue(output.isSpendable),
+        output.spentByTxid,
+        output.spentInBlock,
+        output.spentInputIndex,
+        timestamp,
+      ]);
+
+      const values = multiRowPlaceholders(chunk.length, 17);
+      if (executor.kind === 'mysql') {
+        await this.executeWithExecutor(
+          executor,
+          `
+            INSERT INTO projection_utxo_outputs_current (
+              network_id, output_key, block_height, block_hash, block_time, txid, tx_index, vout,
+              address, script_type, value_base, is_coinbase, is_spendable,
+              spent_by_txid, spent_in_block, spent_input_index, updated_at
+            )
+            VALUES ${values}
+            ON DUPLICATE KEY UPDATE
+              block_height = VALUES(block_height),
+              block_hash = VALUES(block_hash),
+              block_time = VALUES(block_time),
+              txid = VALUES(txid),
+              tx_index = VALUES(tx_index),
+              vout = VALUES(vout),
+              address = VALUES(address),
+              script_type = VALUES(script_type),
+              value_base = VALUES(value_base),
+              is_coinbase = VALUES(is_coinbase),
+              is_spendable = VALUES(is_spendable),
+              spent_by_txid = VALUES(spent_by_txid),
+              spent_in_block = VALUES(spent_in_block),
+              spent_input_index = VALUES(spent_input_index),
+              updated_at = VALUES(updated_at)
+          `,
+          params,
+        );
+        continue;
+      }
+
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO projection_utxo_outputs_current (
+            network_id, output_key, block_height, block_hash, block_time, txid, tx_index, vout,
+            address, script_type, value_base, is_coinbase, is_spendable,
+            spent_by_txid, spent_in_block, spent_input_index, updated_at
+          )
+          VALUES ${values}
+          ON CONFLICT (network_id, output_key) DO UPDATE SET
+            block_height = excluded.block_height,
+            block_hash = excluded.block_hash,
+            block_time = excluded.block_time,
+            txid = excluded.txid,
+            tx_index = excluded.tx_index,
+            vout = excluded.vout,
+            address = excluded.address,
+            script_type = excluded.script_type,
+            value_base = excluded.value_base,
+            is_coinbase = excluded.is_coinbase,
+            is_spendable = excluded.is_spendable,
+            spent_by_txid = excluded.spent_by_txid,
+            spent_in_block = excluded.spent_in_block,
+            spent_input_index = excluded.spent_input_index,
+            updated_at = excluded.updated_at
+        `,
+        params,
+      );
+    }
+  }
+
+  private async upsertProjectionBalances(
+    balances: ProjectionBalanceSnapshot[],
+    timestamp: string,
+    executor: SupportedExecutor = this.client,
+  ): Promise<void> {
+    if (balances.length === 0) {
+      return;
+    }
+
+    for (const chunk of chunkArray(balances, this.bulkChunkSize(executor.kind))) {
+      const params = chunk.flatMap((balance) => [
+        balance.networkId,
+        balance.address,
+        balance.assetAddress,
+        balance.balance,
+        balance.asOfBlockHeight,
+        timestamp,
+      ]);
+      const values = multiRowPlaceholders(chunk.length, 6);
+
+      if (executor.kind === 'mysql') {
+        await this.executeWithExecutor(
+          executor,
+          `
+            INSERT INTO projection_balances_current (
+              network_id, address, asset_address, balance, as_of_block_height, updated_at
+            )
+            VALUES ${values}
+            ON DUPLICATE KEY UPDATE
+              balance = VALUES(balance),
+              as_of_block_height = VALUES(as_of_block_height),
+              updated_at = VALUES(updated_at)
+          `,
+          params,
+        );
+        continue;
+      }
+
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO projection_balances_current (
+            network_id, address, asset_address, balance, as_of_block_height, updated_at
+          )
+          VALUES ${values}
+          ON CONFLICT (network_id, address, asset_address) DO UPDATE SET
+            balance = excluded.balance,
+            as_of_block_height = excluded.as_of_block_height,
+            updated_at = excluded.updated_at
+        `,
+        params,
+      );
+    }
+  }
+
+  private async upsertProjectionDirectLinks(
+    links: DirectLinkRecord[],
+    timestamp: string,
+    executor: SupportedExecutor = this.client,
+  ): Promise<void> {
+    if (links.length === 0) {
+      return;
+    }
+
+    for (const chunk of chunkArray(links, this.bulkChunkSize(executor.kind))) {
+      const params = chunk.flatMap((link) => [
+        link.networkId,
+        link.fromAddress,
+        link.toAddress,
+        link.assetAddress,
+        link.transferCount,
+        link.totalAmountBase,
+        link.firstSeenBlockHeight,
+        link.lastSeenBlockHeight,
+        timestamp,
+      ]);
+      const values = multiRowPlaceholders(chunk.length, 9);
+
+      if (executor.kind === 'mysql') {
+        await this.executeWithExecutor(
+          executor,
+          `
+            INSERT INTO projection_direct_links_current (
+              network_id, from_address, to_address, asset_address, transfer_count,
+              total_amount_base, first_seen_block_height, last_seen_block_height, updated_at
+            )
+            VALUES ${values}
+            ON DUPLICATE KEY UPDATE
+              transfer_count = VALUES(transfer_count),
+              total_amount_base = VALUES(total_amount_base),
+              first_seen_block_height = VALUES(first_seen_block_height),
+              last_seen_block_height = VALUES(last_seen_block_height),
+              updated_at = VALUES(updated_at)
+          `,
+          params,
+        );
+        continue;
+      }
+
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO projection_direct_links_current (
+            network_id, from_address, to_address, asset_address, transfer_count,
+            total_amount_base, first_seen_block_height, last_seen_block_height, updated_at
+          )
+          VALUES ${values}
+          ON CONFLICT (network_id, from_address, to_address, asset_address) DO UPDATE SET
+            transfer_count = excluded.transfer_count,
+            total_amount_base = excluded.total_amount_base,
+            first_seen_block_height = excluded.first_seen_block_height,
+            last_seen_block_height = excluded.last_seen_block_height,
+            updated_at = excluded.updated_at
+        `,
+        params,
+      );
+    }
+  }
+
+  private async insertProjectionSourceLinks(
+    rows: SourceLinkRecord[],
+    timestamp: string,
+    executor: SupportedExecutor = this.client,
+  ): Promise<void> {
+    if (rows.length === 0) {
+      return;
+    }
+
+    for (const chunk of chunkArray(rows, this.bulkChunkSize(executor.kind))) {
+      const params = chunk.flatMap((row) => [
+        row.networkId,
+        row.sourceAddressId,
+        row.sourceAddress,
+        row.toAddress,
+        row.hopCount,
+        row.pathTransferCount,
+        JSON.stringify(row.pathAddresses),
+        row.firstSeenBlockHeight,
+        row.lastSeenBlockHeight,
+        timestamp,
+        timestamp,
+      ]);
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO projection_source_links_current (
+            network_id, source_address_id, source_address, to_address, hop_count,
+            path_transfer_count, path_addresses, first_seen_block_height, last_seen_block_height,
+            updated_at, created_at
+          )
+          VALUES ${multiRowPlaceholders(chunk.length, 11)}
+        `,
+        params,
+      );
+    }
+  }
+
+  private async insertProjectionAppliedBlocks(
+    blocks: ProjectionAppliedBlock[],
+    timestamp: string,
+    executor: SupportedExecutor = this.client,
+  ): Promise<void> {
+    if (blocks.length === 0) {
+      return;
+    }
+
+    for (const chunk of chunkArray(blocks, this.bulkChunkSize(executor.kind))) {
+      const params = chunk.flatMap((block) => [
+        block.networkId,
+        block.blockHeight,
+        block.blockHash,
+        timestamp,
+        timestamp,
+      ]);
+      const values = multiRowPlaceholders(chunk.length, 5);
+
+      if (executor.kind === 'mysql') {
+        await this.executeWithExecutor(
+          executor,
+          `
+            INSERT INTO projection_applied_blocks (
+              network_id, block_height, block_hash, updated_at, created_at
+            )
+            VALUES ${values}
+            ON DUPLICATE KEY UPDATE
+              updated_at = VALUES(updated_at)
+          `,
+          params,
+        );
+        continue;
+      }
+
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO projection_applied_blocks (
+            network_id, block_height, block_hash, updated_at, created_at
+          )
+          VALUES ${values}
+          ON CONFLICT (network_id, block_height, block_hash) DO UPDATE SET
+            updated_at = excluded.updated_at
+        `,
+        params,
+      );
+    }
+  }
+
+  private async insertProjectionDirectLinkAppliedBlocks(
+    blocks: ProjectionAppliedBlock[],
+    timestamp: string,
+    executor: SupportedExecutor = this.client,
+  ): Promise<void> {
+    if (blocks.length === 0) {
+      return;
+    }
+
+    for (const chunk of chunkArray(blocks, this.bulkChunkSize(executor.kind))) {
+      const params = chunk.flatMap((block) => [
+        block.networkId,
+        block.blockHeight,
+        block.blockHash,
+        timestamp,
+        timestamp,
+      ]);
+      const values = multiRowPlaceholders(chunk.length, 5);
+
+      if (executor.kind === 'mysql') {
+        await this.executeWithExecutor(
+          executor,
+          `
+            INSERT INTO projection_direct_link_applied_blocks (
+              network_id, block_height, block_hash, updated_at, created_at
+            )
+            VALUES ${values}
+            ON DUPLICATE KEY UPDATE
+              updated_at = VALUES(updated_at)
+          `,
+          params,
+        );
+        continue;
+      }
+
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO projection_direct_link_applied_blocks (
+            network_id, block_height, block_hash, updated_at, created_at
+          )
+          VALUES ${values}
+          ON CONFLICT (network_id, block_height, block_hash) DO UPDATE SET
+            updated_at = excluded.updated_at
+        `,
+        params,
+      );
+    }
+  }
+
   private async query<T extends DatabaseRow>(
     statement: string,
     params: SqlValue[] = [],
   ): Promise<T[]> {
-    const compiled = compileQuery(this.client.kind, statement);
-
-    if (this.client.kind === 'sqlite') {
-      const result = await this.client.raw.execute({ sql: compiled, args: params });
-      return (result.rows ?? []) as unknown as T[];
-    }
-
-    if (this.client.kind === 'postgres') {
-      const result = await this.client.raw.query(compiled, params);
-      return result.rows as T[];
-    }
-
-    const [rows] = await this.client.raw.query(compiled, params);
-    return rows as T[];
+    return this.queryWithExecutor<T>(this.client, statement, params);
   }
 
   private async one<T extends DatabaseRow>(
     statement: string,
     params: SqlValue[] = [],
   ): Promise<T | null> {
-    const rows = await this.query<T>(statement, params);
+    const rows = await this.queryWithExecutor<T>(this.client, statement, params);
     return rows[0] ?? null;
   }
 
   private async execute(statement: string, params: SqlValue[] = []): Promise<void> {
-    const compiled = compileQuery(this.client.kind, statement);
+    await this.executeWithExecutor(this.client, statement, params);
+  }
 
+  private async withTransaction<T>(work: (executor: SupportedExecutor) => Promise<T>): Promise<T> {
     if (this.client.kind === 'sqlite') {
-      await this.client.raw.execute({ sql: compiled, args: params });
-      return;
+      await this.executeWithExecutor(this.client, 'BEGIN IMMEDIATE');
+      try {
+        const result = await work(this.client);
+        await this.executeWithExecutor(this.client, 'COMMIT');
+        return result;
+      } catch (error) {
+        await this.executeWithExecutor(this.client, 'ROLLBACK');
+        throw error;
+      }
     }
 
     if (this.client.kind === 'postgres') {
-      await this.client.raw.query(compiled, params);
+      const client = await this.client.raw.connect();
+      const executor: SupportedExecutor = { kind: 'postgres', raw: client };
+      try {
+        await this.executeWithExecutor(executor, 'BEGIN');
+        const result = await work(executor);
+        await this.executeWithExecutor(executor, 'COMMIT');
+        return result;
+      } catch (error) {
+        await this.executeWithExecutor(executor, 'ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+
+    const connection = await this.client.raw.getConnection();
+    const executor: SupportedExecutor = { kind: 'mysql', raw: connection };
+    try {
+      await connection.beginTransaction();
+      const result = await work(executor);
+      await connection.commit();
+      return result;
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
+  private async queryWithExecutor<T extends DatabaseRow>(
+    executor: SupportedExecutor,
+    statement: string,
+    params: SqlValue[] = [],
+  ): Promise<T[]> {
+    const compiled = compileQuery(executor.kind, statement);
+
+    if (executor.kind === 'sqlite') {
+      const result = await executor.raw.execute({ sql: compiled, args: params });
+      return (result.rows ?? []) as unknown as T[];
+    }
+
+    if (executor.kind === 'postgres') {
+      const result = await executor.raw.query(compiled, params);
+      return result.rows as T[];
+    }
+
+    const [rows] = await executor.raw.query(compiled, params);
+    return rows as T[];
+  }
+
+  private async executeWithExecutor(
+    executor: SupportedExecutor,
+    statement: string,
+    params: SqlValue[] = [],
+  ): Promise<void> {
+    const compiled = compileQuery(executor.kind, statement);
+
+    if (executor.kind === 'sqlite') {
+      await executor.raw.execute({ sql: compiled, args: params });
       return;
     }
 
-    await this.client.raw.query(compiled, params);
+    if (executor.kind === 'postgres') {
+      await executor.raw.query(compiled, params);
+      return;
+    }
+
+    await executor.raw.query(compiled, params);
+  }
+
+  private bulkChunkSize(kind: SupportedExecutor['kind']): number {
+    return kind === 'sqlite' ? 200 : 500;
   }
 
   private booleanLiteral(value: boolean): string {
@@ -1190,6 +2427,30 @@ function placeholders(count: number): string {
   return Array.from({ length: count }, () => '?').join(', ');
 }
 
+function multiRowPlaceholders(rowCount: number, valueCount: number): string {
+  return Array.from({ length: rowCount }, () => `(${placeholders(valueCount)})`).join(', ');
+}
+
+function chunkArray<T>(values: T[], size: number): T[][] {
+  if (values.length === 0) {
+    return [];
+  }
+
+  const chunks: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function appliedBlockIdentity(
+  networkId: PrimaryId,
+  blockHeight: number,
+  blockHash: string,
+): string {
+  return `${networkId}:${blockHeight}:${blockHash}`;
+}
+
 function parsePendingRelinkAddressId(key: string, networkId: PrimaryId): PrimaryId | null {
   const match = key.match(new RegExp(`^newly_added_address_n${networkId}_a(\\d+)$`, 'u'));
   if (!match?.[1]) {
@@ -1197,6 +2458,44 @@ function parsePendingRelinkAddressId(key: string, networkId: PrimaryId): Primary
   }
 
   return Number(match[1]);
+}
+
+function projectionBalanceSnapshotKey(address: string, assetAddress: string): string {
+  return `${address}:${assetAddress}`;
+}
+
+function parseProjectionBalanceKey(key: string): {
+  address: string;
+  assetAddress: string;
+} {
+  const [networkId, address, ...assetAddressParts] = key.split(':');
+  void networkId;
+  return {
+    address: address ?? '',
+    assetAddress: assetAddressParts.join(':'),
+  };
+}
+
+function projectionDirectLinkSnapshotKey(
+  fromAddress: string,
+  toAddress: string,
+  assetAddress: string,
+): string {
+  return `${fromAddress}:${toAddress}:${assetAddress}`;
+}
+
+function parseProjectionDirectLinkKey(key: string): {
+  assetAddress: string;
+  fromAddress: string;
+  toAddress: string;
+} {
+  const [networkId, fromAddress, toAddress, ...assetAddressParts] = key.split(':');
+  void networkId;
+  return {
+    fromAddress: fromAddress ?? '',
+    toAddress: toAddress ?? '',
+    assetAddress: assetAddressParts.join(':'),
+  };
 }
 
 const sqliteMigrations = [
@@ -1279,6 +2578,83 @@ const sqliteMigrations = [
       created_at TEXT NOT NULL,
       UNIQUE(network_id, address)
     )`,
+  `CREATE TABLE IF NOT EXISTS projection_applied_blocks (
+      network_id INTEGER NOT NULL,
+      block_height INTEGER NOT NULL,
+      block_hash TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height, block_hash)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_direct_link_applied_blocks (
+      network_id INTEGER NOT NULL,
+      block_height INTEGER NOT NULL,
+      block_hash TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height, block_hash)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_utxo_outputs_current (
+      network_id INTEGER NOT NULL,
+      output_key TEXT NOT NULL,
+      block_height INTEGER NOT NULL,
+      block_hash TEXT NOT NULL,
+      block_time INTEGER NOT NULL,
+      txid TEXT NOT NULL,
+      tx_index INTEGER NOT NULL,
+      vout INTEGER NOT NULL,
+      address TEXT NOT NULL,
+      script_type TEXT NOT NULL,
+      value_base TEXT NOT NULL,
+      is_coinbase INTEGER NOT NULL,
+      is_spendable INTEGER NOT NULL,
+      spent_by_txid TEXT NULL,
+      spent_in_block INTEGER NULL,
+      spent_input_index INTEGER NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, output_key)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_balances_current (
+      network_id INTEGER NOT NULL,
+      address TEXT NOT NULL,
+      asset_address TEXT NOT NULL,
+      balance TEXT NOT NULL,
+      as_of_block_height INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, address, asset_address)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_direct_links_current (
+      network_id INTEGER NOT NULL,
+      from_address TEXT NOT NULL,
+      to_address TEXT NOT NULL,
+      asset_address TEXT NOT NULL,
+      transfer_count INTEGER NOT NULL,
+      total_amount_base TEXT NOT NULL,
+      first_seen_block_height INTEGER NOT NULL,
+      last_seen_block_height INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, from_address, to_address, asset_address)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_source_links_current (
+      network_id INTEGER NOT NULL,
+      source_address_id INTEGER NOT NULL,
+      source_address TEXT NOT NULL,
+      to_address TEXT NOT NULL,
+      hop_count INTEGER NOT NULL,
+      path_transfer_count INTEGER NOT NULL,
+      path_addresses TEXT NOT NULL,
+      first_seen_block_height INTEGER NOT NULL,
+      last_seen_block_height INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, source_address_id, to_address)
+    )`,
+  `CREATE INDEX IF NOT EXISTS idx_projection_balances_current_address
+    ON projection_balances_current (address)`,
+  `CREATE INDEX IF NOT EXISTS idx_projection_direct_links_current_from
+    ON projection_direct_links_current (network_id, from_address)`,
+  `CREATE INDEX IF NOT EXISTS idx_projection_source_links_current_to
+    ON projection_source_links_current (network_id, to_address)`,
 ];
 
 const postgresMigrations = [
@@ -1361,6 +2737,83 @@ const postgresMigrations = [
       created_at TEXT NOT NULL,
       UNIQUE(network_id, address)
     )`,
+  `CREATE TABLE IF NOT EXISTS projection_applied_blocks (
+      network_id BIGINT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height, block_hash)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_direct_link_applied_blocks (
+      network_id BIGINT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height, block_hash)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_utxo_outputs_current (
+      network_id BIGINT NOT NULL,
+      output_key TEXT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash TEXT NOT NULL,
+      block_time BIGINT NOT NULL,
+      txid TEXT NOT NULL,
+      tx_index BIGINT NOT NULL,
+      vout BIGINT NOT NULL,
+      address TEXT NOT NULL,
+      script_type TEXT NOT NULL,
+      value_base TEXT NOT NULL,
+      is_coinbase BOOLEAN NOT NULL,
+      is_spendable BOOLEAN NOT NULL,
+      spent_by_txid TEXT NULL,
+      spent_in_block BIGINT NULL,
+      spent_input_index BIGINT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, output_key)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_balances_current (
+      network_id BIGINT NOT NULL,
+      address TEXT NOT NULL,
+      asset_address TEXT NOT NULL,
+      balance TEXT NOT NULL,
+      as_of_block_height BIGINT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, address, asset_address)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_direct_links_current (
+      network_id BIGINT NOT NULL,
+      from_address TEXT NOT NULL,
+      to_address TEXT NOT NULL,
+      asset_address TEXT NOT NULL,
+      transfer_count BIGINT NOT NULL,
+      total_amount_base TEXT NOT NULL,
+      first_seen_block_height BIGINT NOT NULL,
+      last_seen_block_height BIGINT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, from_address, to_address, asset_address)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_source_links_current (
+      network_id BIGINT NOT NULL,
+      source_address_id BIGINT NOT NULL,
+      source_address TEXT NOT NULL,
+      to_address TEXT NOT NULL,
+      hop_count BIGINT NOT NULL,
+      path_transfer_count BIGINT NOT NULL,
+      path_addresses TEXT NOT NULL,
+      first_seen_block_height BIGINT NOT NULL,
+      last_seen_block_height BIGINT NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, source_address_id, to_address)
+    )`,
+  `CREATE INDEX IF NOT EXISTS idx_projection_balances_current_address
+    ON projection_balances_current (address)`,
+  `CREATE INDEX IF NOT EXISTS idx_projection_direct_links_current_from
+    ON projection_direct_links_current (network_id, from_address)`,
+  `CREATE INDEX IF NOT EXISTS idx_projection_source_links_current_to
+    ON projection_source_links_current (network_id, to_address)`,
 ];
 
 const mysqlMigrations = [
@@ -1443,5 +2896,76 @@ const mysqlMigrations = [
       updated_at TEXT NULL,
       created_at TEXT NOT NULL,
       UNIQUE KEY uq_tokens_network_address (network_id, address(255))
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_applied_blocks (
+      network_id BIGINT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash VARCHAR(255) NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height, block_hash)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_direct_link_applied_blocks (
+      network_id BIGINT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash VARCHAR(255) NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height, block_hash)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_utxo_outputs_current (
+      network_id BIGINT NOT NULL,
+      output_key VARCHAR(255) NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash TEXT NOT NULL,
+      block_time BIGINT NOT NULL,
+      txid TEXT NOT NULL,
+      tx_index BIGINT NOT NULL,
+      vout BIGINT NOT NULL,
+      address TEXT NOT NULL,
+      script_type TEXT NOT NULL,
+      value_base TEXT NOT NULL,
+      is_coinbase BOOLEAN NOT NULL,
+      is_spendable BOOLEAN NOT NULL,
+      spent_by_txid TEXT NULL,
+      spent_in_block BIGINT NULL,
+      spent_input_index BIGINT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, output_key)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_balances_current (
+      network_id BIGINT NOT NULL,
+      address VARCHAR(255) NOT NULL,
+      asset_address VARCHAR(255) NOT NULL,
+      balance TEXT NOT NULL,
+      as_of_block_height BIGINT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, address, asset_address)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_direct_links_current (
+      network_id BIGINT NOT NULL,
+      from_address VARCHAR(255) NOT NULL,
+      to_address VARCHAR(255) NOT NULL,
+      asset_address VARCHAR(255) NOT NULL,
+      transfer_count BIGINT NOT NULL,
+      total_amount_base TEXT NOT NULL,
+      first_seen_block_height BIGINT NOT NULL,
+      last_seen_block_height BIGINT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, from_address, to_address, asset_address)
+    )`,
+  `CREATE TABLE IF NOT EXISTS projection_source_links_current (
+      network_id BIGINT NOT NULL,
+      source_address_id BIGINT NOT NULL,
+      source_address VARCHAR(255) NOT NULL,
+      to_address VARCHAR(255) NOT NULL,
+      hop_count BIGINT NOT NULL,
+      path_transfer_count BIGINT NOT NULL,
+      path_addresses JSON NOT NULL,
+      first_seen_block_height BIGINT NOT NULL,
+      last_seen_block_height BIGINT NOT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, source_address_id, to_address)
     )`,
 ];

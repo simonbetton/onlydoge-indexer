@@ -1,6 +1,6 @@
 import { InfrastructureError } from '@onlydoge/shared-kernel';
 
-import type { ProjectionWarehousePort } from '../contracts/ports';
+import type { ProjectionStateStorePort } from '../contracts/ports';
 import {
   addAmountBase,
   formatAmountBase,
@@ -48,14 +48,33 @@ interface ProjectionState {
   persistedOutputs?: Map<string, ProjectionUtxoOutput>;
 }
 
+export interface DogecoinProjectOptions {
+  includeDirectLinkDeltas?: boolean;
+  includeTransfers?: boolean;
+  maxTransferEdges?: number;
+  maxTransferInputAddresses?: number;
+}
+
+const defaultProjectOptions: Required<DogecoinProjectOptions> = {
+  includeDirectLinkDeltas: true,
+  includeTransfers: true,
+  maxTransferEdges: 1024,
+  maxTransferInputAddresses: 64,
+};
+
 export class DogecoinBlockProjector {
-  public constructor(private readonly warehouse: ProjectionWarehousePort) {}
+  public constructor(private readonly warehouse: ProjectionStateStorePort) {}
 
   public async project(
     networkId: number,
     snapshot: Record<string, unknown>,
     state?: ProjectionState,
+    options?: DogecoinProjectOptions,
   ): Promise<BlockProjectionBatch> {
+    const resolvedOptions = {
+      ...defaultProjectOptions,
+      ...(options ?? {}),
+    };
     const block = this.parseBlock(snapshot);
     const utxoCreates: ProjectionUtxoOutput[] = [];
     const utxoSpends: BlockProjectionBatch['utxoSpends'] = [];
@@ -188,18 +207,22 @@ export class DogecoinBlockProjector {
         });
       }
 
-      transfers.push(
-        ...this.projectTransfers({
-          txid,
-          txIndex,
-          networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-          inputs: resolvedInputs,
-          outputs: projectedOutputs,
-        }),
-      );
+      if (resolvedOptions.includeTransfers) {
+        transfers.push(
+          ...this.projectTransfers({
+            txid,
+            txIndex,
+            networkId,
+            blockHeight: block.height,
+            blockHash: block.hash,
+            blockTime: block.time,
+            inputs: resolvedInputs,
+            outputs: projectedOutputs,
+            maxTransferEdges: resolvedOptions.maxTransferEdges,
+            maxTransferInputAddresses: resolvedOptions.maxTransferInputAddresses,
+          }),
+        );
+      }
     }
 
     return {
@@ -211,7 +234,9 @@ export class DogecoinBlockProjector {
       utxoSpends,
       addressMovements,
       transfers,
-      directLinkDeltas: this.buildDirectLinkDeltas(networkId, block.height, transfers),
+      directLinkDeltas: resolvedOptions.includeDirectLinkDeltas
+        ? this.buildDirectLinkDeltas(networkId, block.height, transfers)
+        : [],
     };
   }
 
@@ -305,6 +330,8 @@ export class DogecoinBlockProjector {
     blockHeight: number;
     blockTime: number;
     inputs: Array<{ address: string; amountBase: string; outputKey: string }>;
+    maxTransferEdges: number;
+    maxTransferInputAddresses: number;
     networkId: number;
     outputs: Array<{ address: string; amountBase: string; isSpendable: boolean }>;
     txIndex: number;
@@ -322,6 +349,17 @@ export class DogecoinBlockProjector {
 
     const totalInput = [...inputTotals.values()].reduce((sum, value) => sum + value, 0n);
     const inputAddresses = [...inputTotals.keys()].sort((left, right) => left.localeCompare(right));
+    const estimatedEdges = inputAddresses.length * input.outputs.length;
+    if (
+      inputAddresses.length > input.maxTransferInputAddresses ||
+      estimatedEdges > input.maxTransferEdges
+    ) {
+      console.warn(
+        `[onlydoge] dogecoin transfer derivation skipped tx=${input.txid} inputAddresses=${inputAddresses.length} outputs=${input.outputs.length} estimatedEdges=${estimatedEdges} reason=guardrail`,
+      );
+      return [];
+    }
+
     const uniqueOutputs = [...new Set(input.outputs.map((output) => output.address))].length;
     const confidence = inputAddresses.length <= 1 ? 1 : 0.5;
     const transfers: TransferFact[] = [];

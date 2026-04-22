@@ -30,9 +30,21 @@ describe('shared kernel', () => {
     expect(settings.mode).toBe('both');
     expect(settings.database.driver).toBe('sqlite');
     expect(settings.indexer).toMatchObject({
+      dogecoinTransferMaxEdges: 1024,
+      dogecoinTransferMaxInputAddresses: 64,
       leaseHeartbeatIntervalMs: 5000,
+      syncBacklogHighWatermark: 2048,
+      syncBacklogLowWatermark: 512,
+      syncTargetMs: 15000,
       syncTimeoutMs: 120000,
+      syncWindowMax: 256,
+      syncWindowMin: 32,
+      projectTargetMs: 30000,
       projectTimeoutMs: 120000,
+      projectWindowMax: 16,
+      projectWindowMin: 2,
+      relinkBacklogThreshold: 256,
+      relinkTipDistance: 512,
       relinkTimeoutMs: 120000,
     });
     expect(settings.storage.driver).toBe('file');
@@ -46,17 +58,41 @@ describe('shared kernel', () => {
         ONLYDOGE_STORAGE: 'file:///tmp/storage',
         ONLYDOGE_WAREHOUSE: '/tmp/warehouse.json',
         ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS: '2500',
+        ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES: '12',
+        ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES: '48',
+        ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK: '128',
+        ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK: '32',
+        ONLYDOGE_INDEXER_SYNC_WINDOW_MIN: '16',
+        ONLYDOGE_INDEXER_SYNC_WINDOW_MAX: '96',
+        ONLYDOGE_INDEXER_SYNC_TARGET_MS: '12000',
         ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS: '45000',
+        ONLYDOGE_INDEXER_PROJECT_WINDOW_MIN: '4',
+        ONLYDOGE_INDEXER_PROJECT_WINDOW_MAX: '12',
+        ONLYDOGE_INDEXER_PROJECT_TARGET_MS: '20000',
         ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS: '60000',
+        ONLYDOGE_INDEXER_RELINK_BACKLOG_THRESHOLD: '64',
+        ONLYDOGE_INDEXER_RELINK_TIP_DISTANCE: '128',
         ONLYDOGE_INDEXER_RELINK_TIMEOUT_MS: '90000',
       },
       mode: parseMode('indexer'),
     });
 
     expect(settings.indexer).toMatchObject({
+      dogecoinTransferMaxInputAddresses: 12,
+      dogecoinTransferMaxEdges: 48,
       leaseHeartbeatIntervalMs: 2500,
+      syncBacklogHighWatermark: 128,
+      syncBacklogLowWatermark: 32,
+      syncWindowMin: 16,
+      syncWindowMax: 96,
+      syncTargetMs: 12000,
       syncTimeoutMs: 45000,
+      projectWindowMin: 4,
+      projectWindowMax: 12,
+      projectTargetMs: 20000,
       projectTimeoutMs: 60000,
+      relinkBacklogThreshold: 64,
+      relinkTipDistance: 128,
       relinkTimeoutMs: 90000,
     });
   });

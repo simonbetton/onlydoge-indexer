@@ -34,8 +34,26 @@ interface ParsedEvmBlock {
   transactions: EvmTransaction[];
 }
 
+export interface EvmProjectOptions {
+  includeDirectLinkDeltas?: boolean;
+  includeTransfers?: boolean;
+}
+
+const defaultProjectOptions: Required<EvmProjectOptions> = {
+  includeDirectLinkDeltas: true,
+  includeTransfers: true,
+};
+
 export class EvmBlockProjector {
-  public project(networkId: number, snapshot: Record<string, unknown>): BlockProjectionBatch {
+  public project(
+    networkId: number,
+    snapshot: Record<string, unknown>,
+    options?: EvmProjectOptions,
+  ): BlockProjectionBatch {
+    const resolvedOptions = {
+      ...defaultProjectOptions,
+      ...(options ?? {}),
+    };
     const block = this.parseBlock(snapshot);
     const receipts = this.parseReceipts(snapshot);
     const receiptByHash = new Map(receipts.map((receipt) => [receipt.transactionHash, receipt]));
@@ -82,26 +100,28 @@ export class EvmBlockProjector {
           outputKey: null,
           derivationMethod: 'evm_native_transfer_v1',
         });
-        transfers.push({
-          transferId: `${txid}:${transferIndex}`,
-          networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-          txid,
-          txIndex,
-          transferIndex,
-          assetAddress: '',
-          fromAddress,
-          toAddress,
-          amountBase: valueBase,
-          derivationMethod: 'evm_native_transfer_v1',
-          confidence: 1,
-          isChange: false,
-          inputAddressCount: 1,
-          outputAddressCount: 1,
-        });
-        transferIndex += 1;
+        if (resolvedOptions.includeTransfers) {
+          transfers.push({
+            transferId: `${txid}:${transferIndex}`,
+            networkId,
+            blockHeight: block.height,
+            blockHash: block.hash,
+            blockTime: block.time,
+            txid,
+            txIndex,
+            transferIndex,
+            assetAddress: '',
+            fromAddress,
+            toAddress,
+            amountBase: valueBase,
+            derivationMethod: 'evm_native_transfer_v1',
+            confidence: 1,
+            isChange: false,
+            inputAddressCount: 1,
+            outputAddressCount: 1,
+          });
+          transferIndex += 1;
+        }
       }
 
       const receipt = receiptByHash.get(txid);
@@ -143,26 +163,28 @@ export class EvmBlockProjector {
           outputKey: null,
           derivationMethod: 'evm_erc20_transfer_v1',
         });
-        transfers.push({
-          transferId: `${txid}:${transferIndex}`,
-          networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-          txid,
-          txIndex,
-          transferIndex,
-          assetAddress: parsedTransfer.assetAddress,
-          fromAddress: parsedTransfer.fromAddress,
-          toAddress: parsedTransfer.toAddress,
-          amountBase: parsedTransfer.amountBase,
-          derivationMethod: 'evm_erc20_transfer_v1',
-          confidence: 1,
-          isChange: false,
-          inputAddressCount: 1,
-          outputAddressCount: 1,
-        });
-        transferIndex += 1;
+        if (resolvedOptions.includeTransfers) {
+          transfers.push({
+            transferId: `${txid}:${transferIndex}`,
+            networkId,
+            blockHeight: block.height,
+            blockHash: block.hash,
+            blockTime: block.time,
+            txid,
+            txIndex,
+            transferIndex,
+            assetAddress: parsedTransfer.assetAddress,
+            fromAddress: parsedTransfer.fromAddress,
+            toAddress: parsedTransfer.toAddress,
+            amountBase: parsedTransfer.amountBase,
+            derivationMethod: 'evm_erc20_transfer_v1',
+            confidence: 1,
+            isChange: false,
+            inputAddressCount: 1,
+            outputAddressCount: 1,
+          });
+          transferIndex += 1;
+        }
       }
     }
 
@@ -175,7 +197,9 @@ export class EvmBlockProjector {
       utxoSpends: [],
       addressMovements,
       transfers,
-      directLinkDeltas: this.buildDirectLinkDeltas(networkId, block.height, transfers),
+      directLinkDeltas: resolvedOptions.includeDirectLinkDeltas
+        ? this.buildDirectLinkDeltas(networkId, block.height, transfers)
+        : [],
     };
   }
 

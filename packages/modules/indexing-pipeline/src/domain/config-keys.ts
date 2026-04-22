@@ -32,6 +32,18 @@ export function configKeyIndexerProcessProgress(networkId: PrimaryId): string {
   return `indexer_process_progress_n${networkId}`;
 }
 
+export function configKeyIndexerFactTail(networkId: PrimaryId): string {
+  return `indexer_fact_tail_n${networkId}`;
+}
+
+export function configKeyIndexerFactProgress(networkId: PrimaryId): string {
+  return `indexer_fact_progress_n${networkId}`;
+}
+
+export function configKeyProjectionBootstrapTail(networkId: PrimaryId): string {
+  return `projection_bootstrap_tail_n${networkId}`;
+}
+
 export function configKeyIndexerLink(networkId: PrimaryId, addressId: PrimaryId): string {
   return `indexer_link_n${networkId}_a${addressId}`;
 }

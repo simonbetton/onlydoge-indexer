@@ -3,6 +3,10 @@ import type { PrimaryId } from '@onlydoge/shared-kernel';
 import type {
   BlockProjectionBatch,
   DirectLinkRecord,
+  ProjectionBalanceSnapshot,
+  ProjectionDirectLinkBatch,
+  ProjectionFactWindow,
+  ProjectionStateBootstrapSnapshot,
   ProjectionUtxoOutput,
   SourceLinkRecord,
   TrackedAddress,
@@ -61,6 +65,13 @@ export interface BlockchainRpcPort {
 export interface ProjectionWarehousePort {
   applyProjectionWindow(batches: BlockProjectionBatch[]): Promise<void>;
   hasAppliedBlock(networkId: PrimaryId, blockHeight: number, blockHash: string): Promise<boolean>;
+  listAppliedBlockSet(
+    networkId: PrimaryId,
+    blocks: Array<{
+      blockHash: string;
+      blockHeight: number;
+    }>,
+  ): Promise<Set<string>>;
   getUtxoOutputs(
     networkId: PrimaryId,
     outputKeys: string[],
@@ -78,6 +89,100 @@ export interface ProjectionWarehousePort {
     sourceAddressId: PrimaryId,
     rows: SourceLinkRecord[],
   ): Promise<void>;
+}
+
+export interface ProjectionStateStorePort {
+  applyDirectLinkDeltasWindow(batches: ProjectionDirectLinkBatch[]): Promise<void>;
+  applyProjectionWindow(batches: BlockProjectionBatch[]): Promise<void>;
+  getCurrentAddressSummary(
+    networkId: PrimaryId,
+    address: string,
+  ): Promise<{
+    balance: string;
+    utxoCount: number;
+  } | null>;
+  getBalanceSnapshots(
+    networkId: PrimaryId,
+    keys: Array<{
+      address: string;
+      assetAddress: string;
+    }>,
+  ): Promise<Map<string, ProjectionBalanceSnapshot>>;
+  getDirectLinkSnapshots(
+    networkId: PrimaryId,
+    keys: Array<{
+      assetAddress: string;
+      fromAddress: string;
+      toAddress: string;
+    }>,
+  ): Promise<Map<string, DirectLinkRecord>>;
+  getDistinctLinksByAddresses(addresses: string[]): Promise<
+    Array<{
+      fromAddress: string;
+      networkId: PrimaryId;
+      toAddress: string;
+      transferCount: number;
+    }>
+  >;
+  getBalancesByAddresses(addresses: string[]): Promise<
+    Array<{
+      assetAddress: string;
+      balance: string;
+      networkId: PrimaryId;
+    }>
+  >;
+  getProjectionBootstrapTail(networkId: PrimaryId): Promise<number | null>;
+  getUtxoOutputs(
+    networkId: PrimaryId,
+    outputKeys: string[],
+  ): Promise<Map<string, ProjectionUtxoOutput>>;
+  hasAppliedBlock(networkId: PrimaryId, blockHeight: number, blockHash: string): Promise<boolean>;
+  hasProjectionState(networkId: PrimaryId): Promise<boolean>;
+  importProjectionStateSnapshot(
+    networkId: PrimaryId,
+    snapshot: ProjectionStateBootstrapSnapshot,
+    processTail: number,
+  ): Promise<void>;
+  listDirectLinksFromAddresses(
+    networkId: PrimaryId,
+    fromAddresses: string[],
+  ): Promise<DirectLinkRecord[]>;
+  listAddressUtxos(
+    networkId: PrimaryId,
+    address: string,
+    offset?: number,
+    limit?: number,
+  ): Promise<ProjectionUtxoOutput[]>;
+  listAppliedBlockSet(
+    networkId: PrimaryId,
+    blocks: Array<{
+      blockHash: string;
+      blockHeight: number;
+    }>,
+  ): Promise<Set<string>>;
+  listSourceSeedIdsReachingAddresses(
+    networkId: PrimaryId,
+    addresses: string[],
+  ): Promise<PrimaryId[]>;
+  replaceSourceLinks(
+    networkId: PrimaryId,
+    sourceAddressId: PrimaryId,
+    rows: SourceLinkRecord[],
+  ): Promise<void>;
+}
+
+export interface ProjectionFactWarehousePort {
+  applyProjectionFacts(window: ProjectionFactWindow): Promise<void>;
+  exportProjectionStateSnapshot(networkId: PrimaryId): Promise<ProjectionStateBootstrapSnapshot>;
+  getAppliedBlockTail(networkId: PrimaryId): Promise<number | null>;
+  hasAppliedBlock(networkId: PrimaryId, blockHeight: number, blockHash: string): Promise<boolean>;
+  listAppliedBlockSet(
+    networkId: PrimaryId,
+    blocks: Array<{
+      blockHash: string;
+      blockHeight: number;
+    }>,
+  ): Promise<Set<string>>;
 }
 
 export interface ProjectionLinkSeedPort {

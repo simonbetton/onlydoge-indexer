@@ -244,4 +244,182 @@ describe('dogecoin block projector', () => {
       }),
     ]);
   });
+
+  it('can derive state without transfer and link facts', async () => {
+    const warehouse = new InMemoryWarehouseAdapter();
+    const projector = new DogecoinBlockProjector(warehouse);
+
+    const batch = await projector.project(
+      1,
+      {
+        block: {
+          hash: 'block-10',
+          height: 10,
+          time: 1_700_000_000,
+          tx: [
+            {
+              txid: 'tx-spend',
+              vin: [{ txid: 'tx-prev', vout: 1 }],
+              vout: [
+                {
+                  n: 0,
+                  value: '30.00000000',
+                  scriptPubKey: {
+                    type: 'pubkeyhash',
+                    addresses: ['DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        persistedOutputs: new Map([
+          [
+            'tx-prev:1',
+            {
+              networkId: 1,
+              blockHeight: 5,
+              blockHash: 'block-5',
+              blockTime: 1_699_999_000,
+              txid: 'tx-prev',
+              txIndex: 0,
+              vout: 1,
+              outputKey: 'tx-prev:1',
+              address: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+              scriptType: 'pubkeyhash',
+              valueBase: '3000000000',
+              isCoinbase: false,
+              isSpendable: true,
+              spentByTxid: null,
+              spentInBlock: null,
+              spentInputIndex: null,
+            },
+          ],
+        ]),
+      },
+      {
+        includeTransfers: false,
+        includeDirectLinkDeltas: false,
+      },
+    );
+
+    expect(batch.utxoSpends).toEqual([
+      expect.objectContaining({
+        outputKey: 'tx-prev:1',
+        spentByTxid: 'tx-spend',
+      }),
+    ]);
+    expect(batch.addressMovements).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          direction: 'debit',
+          address: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+        }),
+        expect.objectContaining({
+          direction: 'credit',
+          address: 'DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+        }),
+      ]),
+    );
+    expect(batch.transfers).toEqual([]);
+    expect(batch.directLinkDeltas).toEqual([]);
+  });
+
+  it('skips pathological transfer derivation when guardrails are exceeded', async () => {
+    const warehouse = new InMemoryWarehouseAdapter();
+    const projector = new DogecoinBlockProjector(warehouse);
+
+    const batch = await projector.project(
+      1,
+      {
+        block: {
+          hash: 'block-10',
+          height: 10,
+          time: 1_700_000_000,
+          tx: [
+            {
+              txid: 'tx-spend',
+              vin: [
+                { txid: 'tx-prev-a', vout: 0 },
+                { txid: 'tx-prev-b', vout: 0 },
+              ],
+              vout: [
+                {
+                  n: 0,
+                  value: '20.00000000',
+                  scriptPubKey: {
+                    type: 'pubkeyhash',
+                    addresses: ['DCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'],
+                  },
+                },
+                {
+                  n: 1,
+                  value: '20.00000000',
+                  scriptPubKey: {
+                    type: 'pubkeyhash',
+                    addresses: ['DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD'],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        persistedOutputs: new Map([
+          [
+            'tx-prev-a:0',
+            {
+              networkId: 1,
+              blockHeight: 5,
+              blockHash: 'block-5',
+              blockTime: 1_699_999_000,
+              txid: 'tx-prev-a',
+              txIndex: 0,
+              vout: 0,
+              outputKey: 'tx-prev-a:0',
+              address: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+              scriptType: 'pubkeyhash',
+              valueBase: '2000000000',
+              isCoinbase: false,
+              isSpendable: true,
+              spentByTxid: null,
+              spentInBlock: null,
+              spentInputIndex: null,
+            },
+          ],
+          [
+            'tx-prev-b:0',
+            {
+              networkId: 1,
+              blockHeight: 5,
+              blockHash: 'block-5',
+              blockTime: 1_699_999_000,
+              txid: 'tx-prev-b',
+              txIndex: 1,
+              vout: 0,
+              outputKey: 'tx-prev-b:0',
+              address: 'DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+              scriptType: 'pubkeyhash',
+              valueBase: '2000000000',
+              isCoinbase: false,
+              isSpendable: true,
+              spentByTxid: null,
+              spentInBlock: null,
+              spentInputIndex: null,
+            },
+          ],
+        ]),
+      },
+      {
+        maxTransferEdges: 1,
+      },
+    );
+
+    expect(batch.addressMovements).toHaveLength(4);
+    expect(batch.transfers).toEqual([]);
+    expect(batch.directLinkDeltas).toEqual([]);
+  });
 });

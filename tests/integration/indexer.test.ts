@@ -271,9 +271,103 @@ describe('indexer integration', () => {
 
     pipeline.warehouse.applyProjectionWindow = originalApplyProjectionWindow;
 
-    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
+    const secondStartedAt = Date.now();
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(false);
+    expect(Date.now() - secondStartedAt).toBeLessThan(1000);
     await expect(
       ctx.runtime.metadata.getJsonValue<number>(`indexer_process_tail_n${network?.networkId}`),
+    ).resolves.toBeNull();
+
+    await ctx.cleanup();
+  });
+
+  it('advances processed state even when fact persistence times out', async () => {
+    const ctx = await createTestApp('indexer');
+
+    const network = await ctx.runtime.networkCatalog.createNetwork({
+      name: 'Dogecoin Mainnet',
+      architecture: 'dogecoin',
+      chainId: 0,
+      blockTime: 60,
+      rpcEndpoint: 'https://doge.example/rpc',
+    });
+
+    const pipeline = ctx.runtime.indexingPipeline as unknown as {
+      factWarehouse: {
+        applyProjectionFacts: (window: unknown) => Promise<void>;
+      };
+      settings: {
+        factTimeoutMs: number;
+      };
+    };
+    pipeline.settings.factTimeoutMs = 25;
+
+    const originalApplyProjectionFacts = pipeline.factWarehouse.applyProjectionFacts.bind(
+      pipeline.factWarehouse,
+    );
+    pipeline.factWarehouse.applyProjectionFacts = () => new Promise<void>(() => {});
+
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
+
+    const internalNetwork = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
+    expect(internalNetwork?.networkId).toBeDefined();
+    await expect(
+      ctx.runtime.metadata.getJsonValue<number>(
+        `indexer_process_tail_n${internalNetwork?.networkId}`,
+      ),
+    ).resolves.toBe(2);
+    await expect(
+      ctx.runtime.metadata.getJsonValue<number>(`indexer_fact_tail_n${internalNetwork?.networkId}`),
+    ).resolves.toBe(-1);
+
+    await expect(
+      ctx.runtime.explorerQuery.getAddress(dogecoinFixture.targetAddress, network.id),
+    ).resolves.toMatchObject({
+      address: {
+        balance: '2500000000',
+        utxoCount: 1,
+      },
+    });
+    await expect(
+      ctx.runtime.explorerQuery.listAddressUtxos(dogecoinFixture.targetAddress, network.id),
+    ).resolves.toMatchObject({
+      utxos: [
+        expect.objectContaining({
+          address: dogecoinFixture.targetAddress,
+          outputKey: 'doge-tx-2:0',
+          valueBase: '2500000000',
+        }),
+      ],
+    });
+
+    pipeline.factWarehouse.applyProjectionFacts = originalApplyProjectionFacts;
+    await ctx.cleanup();
+  });
+
+  it('bootstraps the fact tail from existing warehouse state', async () => {
+    const ctx = await createTestApp('indexer');
+
+    await ctx.runtime.networkCatalog.createNetwork({
+      name: 'Dogecoin Mainnet',
+      architecture: 'dogecoin',
+      chainId: 0,
+      blockTime: 60,
+      rpcEndpoint: 'https://doge.example/rpc',
+    });
+
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
+
+    const internalNetwork = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
+    expect(internalNetwork?.networkId).toBeDefined();
+
+    await ctx.runtime.metadata.deleteByPrefix(`indexer_fact_tail_n${internalNetwork?.networkId}`);
+    await ctx.runtime.metadata.deleteByPrefix(
+      `indexer_fact_progress_n${internalNetwork?.networkId}`,
+    );
+
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(false);
+    await expect(
+      ctx.runtime.metadata.getJsonValue<number>(`indexer_fact_tail_n${internalNetwork?.networkId}`),
     ).resolves.toBe(2);
 
     await ctx.cleanup();

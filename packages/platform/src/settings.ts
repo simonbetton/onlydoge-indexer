@@ -33,16 +33,30 @@ export interface WarehouseSettings {
 }
 
 export interface IndexerSettings {
+  dogecoinTransferMaxEdges: number;
+  dogecoinTransferMaxInputAddresses: number;
+  factTimeoutMs: number;
+  factWindow: number;
   leaseHeartbeatIntervalMs: number;
+  projectTargetMs: number;
+  projectWindowMax: number;
+  projectWindowMin: number;
   projectTimeoutMs: number;
   networkConcurrency: number;
   projectWindow: number;
+  relinkBacklogThreshold: number;
   relinkBatchSize: number;
   relinkConcurrency: number;
   relinkFrontierBatch: number;
+  relinkTipDistance: number;
   relinkTimeoutMs: number;
+  syncBacklogHighWatermark: number;
+  syncBacklogLowWatermark: number;
   syncConcurrency: number;
+  syncTargetMs: number;
   syncTimeoutMs: number;
+  syncWindowMax: number;
+  syncWindowMin: number;
   syncWindow: number;
 }
 
@@ -240,19 +254,48 @@ function parseWarehouseSettings(location: string, env: NodeJS.ProcessEnv): Wareh
 
 function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
   return {
+    dogecoinTransferMaxInputAddresses: parsePositiveInteger(
+      env.ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES,
+      64,
+    ),
+    dogecoinTransferMaxEdges: parsePositiveInteger(
+      env.ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES,
+      1024,
+    ),
+    factWindow: parsePositiveInteger(env.ONLYDOGE_INDEXER_FACT_WINDOW, 64),
+    factTimeoutMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_FACT_TIMEOUT_MS, 300_000),
     leaseHeartbeatIntervalMs: parsePositiveInteger(
       env.ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS,
       5_000,
     ),
     networkConcurrency: parsePositiveInteger(env.ONLYDOGE_INDEXER_NETWORK_CONCURRENCY, 2),
     syncWindow: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_WINDOW, 32),
+    syncWindowMin: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_WINDOW_MIN, 32),
+    syncWindowMax: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_WINDOW_MAX, 256),
     syncConcurrency: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_CONCURRENCY, 4),
+    syncTargetMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_TARGET_MS, 15_000),
     syncTimeoutMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS, 120_000),
     projectWindow: parsePositiveInteger(env.ONLYDOGE_INDEXER_PROJECT_WINDOW, 8),
+    projectWindowMin: parsePositiveInteger(env.ONLYDOGE_INDEXER_PROJECT_WINDOW_MIN, 2),
+    projectWindowMax: parsePositiveInteger(env.ONLYDOGE_INDEXER_PROJECT_WINDOW_MAX, 16),
+    projectTargetMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_PROJECT_TARGET_MS, 30_000),
     projectTimeoutMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS, 120_000),
+    syncBacklogHighWatermark: parsePositiveInteger(
+      env.ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK,
+      2_048,
+    ),
+    syncBacklogLowWatermark: parsePositiveInteger(
+      env.ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK,
+      512,
+    ),
     relinkBatchSize: parsePositiveInteger(env.ONLYDOGE_INDEXER_RELINK_BATCH_SIZE, 16),
     relinkConcurrency: parsePositiveInteger(env.ONLYDOGE_INDEXER_RELINK_CONCURRENCY, 2),
     relinkFrontierBatch: parsePositiveInteger(env.ONLYDOGE_INDEXER_RELINK_FRONTIER_BATCH, 32),
+    relinkBacklogThreshold: parsePositiveInteger(
+      env.ONLYDOGE_INDEXER_RELINK_BACKLOG_THRESHOLD,
+      256,
+    ),
+    relinkTipDistance: parsePositiveInteger(env.ONLYDOGE_INDEXER_RELINK_TIP_DISTANCE, 512),
     relinkTimeoutMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_RELINK_TIMEOUT_MS, 120_000),
   };
 }

@@ -9,7 +9,11 @@ import { RelationalMetadataStore } from './metadata-store';
 import { createRawBlockStorage } from './raw-block-storage';
 import { HttpBlockchainRpcGateway } from './rpc';
 import { type AppSettings, loadSettings } from './settings';
-import { createWarehouse } from './warehouse';
+import {
+  CompositeWarehouseAdapter,
+  createFactWarehouse,
+  MirroredProjectionStateStore,
+} from './warehouse';
 
 export interface Runtime {
   accessControl: AccessControlService;
@@ -31,7 +35,9 @@ export async function createRuntime(input?: {
   const metadata = await RelationalMetadataStore.connect(settings.database);
   const rawBlockStorage = createRawBlockStorage(settings.storage);
   const rpc = new HttpBlockchainRpcGateway();
-  const warehouse = await createWarehouse(settings.warehouse);
+  const factWarehouse = await createFactWarehouse(settings.warehouse);
+  const stateStore = new MirroredProjectionStateStore(metadata, factWarehouse, factWarehouse);
+  const explorerWarehouse = new CompositeWarehouseAdapter(stateStore, factWarehouse);
 
   const accessControl = new AccessControlService(metadata);
   const entityLabeling = new EntityLabelingService(
@@ -47,11 +53,11 @@ export async function createRuntime(input?: {
     softDeleteAddressesByNetworkIds: (networkIds) =>
       entityLabeling.softDeleteAddressesByNetworkIds(networkIds),
   });
-  const investigationQuery = new InvestigationQueryService(metadata, warehouse, metadata);
+  const investigationQuery = new InvestigationQueryService(metadata, explorerWarehouse, metadata);
   const explorerQuery = new ExplorerQueryService(
     metadata,
     metadata,
-    warehouse,
+    explorerWarehouse,
     rawBlockStorage,
     metadata,
   );
@@ -61,7 +67,8 @@ export async function createRuntime(input?: {
     metadata,
     rawBlockStorage,
     rpc,
-    warehouse,
+    stateStore,
+    factWarehouse,
     settings.indexer,
   );
 

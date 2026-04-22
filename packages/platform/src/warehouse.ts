@@ -9,6 +9,12 @@ import {
   type BlockProjectionBatch,
   type DirectLinkRecord,
   formatAmountBase,
+  type ProjectionBalanceSnapshot,
+  type ProjectionDirectLinkBatch,
+  type ProjectionFactWarehousePort,
+  type ProjectionFactWindow,
+  type ProjectionStateBootstrapSnapshot,
+  type ProjectionStateStorePort,
   type ProjectionUtxoOutput,
   type ProjectionWarehousePort,
   parseAmountBase,
@@ -29,6 +35,11 @@ interface BalanceRow {
 
 interface WarehouseState {
   appliedBlocks: Array<{
+    blockHash: string;
+    blockHeight: number;
+    networkId: PrimaryId;
+  }>;
+  directLinkAppliedBlocks: Array<{
     blockHash: string;
     blockHeight: number;
     networkId: PrimaryId;
@@ -71,6 +82,7 @@ type ClickHouseJsonQueryParameters = Parameters<ClickHouseClient['query']>[0];
 
 const emptyWarehouseState = (): WarehouseState => ({
   appliedBlocks: [],
+  directLinkAppliedBlocks: [],
   utxoOutputs: [],
   addressMovements: [],
   transfers: [],
@@ -85,6 +97,7 @@ function mergeWarehouseState(input: Partial<WarehouseState> | null | undefined):
     ...emptyWarehouseState(),
     ...(input ?? {}),
     appliedBlocks: input?.appliedBlocks ?? [],
+    directLinkAppliedBlocks: input?.directLinkAppliedBlocks ?? [],
     utxoOutputs: input?.utxoOutputs ?? [],
     addressMovements: input?.addressMovements ?? [],
     transfers: input?.transfers ?? [],
@@ -96,7 +109,11 @@ function mergeWarehouseState(input: Partial<WarehouseState> | null | undefined):
 }
 
 export class InMemoryWarehouseAdapter
-  implements InvestigationWarehousePort, ProjectionWarehousePort, ExplorerWarehousePort
+  implements
+    InvestigationWarehousePort,
+    ProjectionWarehousePort,
+    ProjectionFactWarehousePort,
+    ExplorerWarehousePort
 {
   protected state: WarehouseState = emptyWarehouseState();
 
@@ -117,6 +134,80 @@ export class InMemoryWarehouseAdapter
         toAddress: link.toAddress,
         transferCount: link.hopCount,
       }));
+  }
+
+  public async getBalanceSnapshots(
+    networkId: PrimaryId,
+    keys: Array<{
+      address: string;
+      assetAddress: string;
+    }>,
+  ): Promise<Map<string, ProjectionBalanceSnapshot>> {
+    const keySet = new Set(keys.map((key) => balanceSnapshotKey(key.address, key.assetAddress)));
+    const rows = this.state.balances.filter(
+      (balance) =>
+        balance.networkId === networkId &&
+        keySet.has(balanceSnapshotKey(balance.address, balance.assetAddress)),
+    );
+
+    return new Map(
+      rows.map((row) => [balanceSnapshotKey(row.address, row.assetAddress), { ...row }]),
+    );
+  }
+
+  public async getDirectLinkSnapshots(
+    networkId: PrimaryId,
+    keys: Array<{
+      assetAddress: string;
+      fromAddress: string;
+      toAddress: string;
+    }>,
+  ): Promise<Map<string, DirectLinkRecord>> {
+    const keySet = new Set(
+      keys.map((key) => directLinkSnapshotKey(key.fromAddress, key.toAddress, key.assetAddress)),
+    );
+    const rows = this.state.directLinks.filter(
+      (link) =>
+        link.networkId === networkId &&
+        keySet.has(directLinkSnapshotKey(link.fromAddress, link.toAddress, link.assetAddress)),
+    );
+
+    return new Map(
+      rows.map((row) => [
+        directLinkSnapshotKey(row.fromAddress, row.toAddress, row.assetAddress),
+        { ...row },
+      ]),
+    );
+  }
+
+  public async getProjectionBootstrapTail(): Promise<number | null> {
+    return null;
+  }
+
+  public async getCurrentAddressSummary(networkId: PrimaryId, address: string) {
+    const balance =
+      this.state.balances.find(
+        (candidate) =>
+          candidate.networkId === networkId &&
+          candidate.address === address &&
+          candidate.assetAddress === '',
+      )?.balance ?? '0';
+    const utxoCount = this.state.utxoOutputs.filter(
+      (candidate) =>
+        candidate.networkId === networkId &&
+        candidate.address === address &&
+        candidate.isSpendable &&
+        candidate.spentByTxid === null,
+    ).length;
+
+    if (balance === '0' && utxoCount === 0) {
+      return null;
+    }
+
+    return {
+      balance,
+      utxoCount,
+    };
   }
 
   public async listAppliedBlocks(networkId: PrimaryId, offset = 0, limit?: number) {
@@ -316,6 +407,69 @@ export class InMemoryWarehouseAdapter
     );
   }
 
+  public async listAppliedBlockSet(
+    networkId: PrimaryId,
+    blocks: Array<{
+      blockHash: string;
+      blockHeight: number;
+    }>,
+  ): Promise<Set<string>> {
+    return new Set(
+      blocks
+        .filter((block) =>
+          this.state.appliedBlocks.some(
+            (candidate) =>
+              candidate.networkId === networkId &&
+              candidate.blockHeight === block.blockHeight &&
+              candidate.blockHash === block.blockHash,
+          ),
+        )
+        .map((block) => blockIdentity(networkId, block.blockHeight, block.blockHash)),
+    );
+  }
+
+  public async hasProjectionState(networkId: PrimaryId): Promise<boolean> {
+    return this.state.appliedBlocks.some((candidate) => candidate.networkId === networkId);
+  }
+
+  public async getAppliedBlockTail(networkId: PrimaryId): Promise<number | null> {
+    const tail = this.state.appliedBlocks
+      .filter((candidate) => candidate.networkId === networkId)
+      .reduce<number | null>(
+        (current, candidate) =>
+          current === null ? candidate.blockHeight : Math.max(current, candidate.blockHeight),
+        null,
+      );
+    return tail;
+  }
+
+  public async importProjectionStateSnapshot(
+    networkId: PrimaryId,
+    snapshot: ProjectionStateBootstrapSnapshot,
+  ): Promise<void> {
+    this.state.appliedBlocks = [
+      ...this.state.appliedBlocks.filter((row) => row.networkId !== networkId),
+      ...snapshot.appliedBlocks,
+    ];
+    this.state.utxoOutputs = [
+      ...this.state.utxoOutputs.filter((row) => row.networkId !== networkId),
+      ...snapshot.utxoOutputs,
+    ];
+    this.state.balances = [
+      ...this.state.balances.filter((row) => row.networkId !== networkId),
+      ...snapshot.balances,
+    ];
+    this.state.directLinks = [
+      ...this.state.directLinks.filter((row) => row.networkId !== networkId),
+      ...snapshot.directLinks,
+    ];
+    this.state.sourceLinks = [
+      ...this.state.sourceLinks.filter((row) => row.networkId !== networkId),
+      ...snapshot.sourceLinks,
+    ];
+    await this.afterMutation();
+  }
+
   public async listDirectLinksFromAddresses(networkId: PrimaryId, fromAddresses: string[]) {
     return this.state.directLinks.filter(
       (link) => link.networkId === networkId && fromAddresses.includes(link.fromAddress),
@@ -339,6 +493,145 @@ export class InMemoryWarehouseAdapter
     for (const batch of batches) {
       await this.applyBlockProjection(batch);
     }
+  }
+
+  public async applyDirectLinkDeltasWindow(batches: ProjectionDirectLinkBatch[]): Promise<void> {
+    for (const batch of batches) {
+      const alreadyApplied = this.state.directLinkAppliedBlocks.some(
+        (candidate) =>
+          candidate.networkId === batch.networkId &&
+          candidate.blockHeight === batch.blockHeight &&
+          candidate.blockHash === batch.blockHash,
+      );
+      if (alreadyApplied) {
+        continue;
+      }
+
+      for (const delta of batch.directLinkDeltas) {
+        const current = this.state.directLinks.find(
+          (candidate) =>
+            candidate.networkId === delta.networkId &&
+            candidate.fromAddress === delta.fromAddress &&
+            candidate.toAddress === delta.toAddress &&
+            candidate.assetAddress === delta.assetAddress,
+        );
+        if (current) {
+          current.transferCount += delta.transferCount;
+          current.totalAmountBase = addAmountBase(current.totalAmountBase, delta.totalAmountBase);
+          current.firstSeenBlockHeight = Math.min(
+            current.firstSeenBlockHeight,
+            delta.firstSeenBlockHeight,
+          );
+          current.lastSeenBlockHeight = Math.max(
+            current.lastSeenBlockHeight,
+            delta.lastSeenBlockHeight,
+          );
+          continue;
+        }
+
+        this.state.directLinks.push({ ...delta });
+      }
+
+      this.state.directLinkAppliedBlocks.push({
+        networkId: batch.networkId,
+        blockHeight: batch.blockHeight,
+        blockHash: batch.blockHash,
+      });
+    }
+
+    await this.afterMutation();
+  }
+
+  public async applyProjectionFacts(window: ProjectionFactWindow): Promise<void> {
+    for (const output of window.utxoOutputs) {
+      const existingIndex = this.state.utxoOutputs.findIndex(
+        (candidate) =>
+          candidate.networkId === output.networkId && candidate.outputKey === output.outputKey,
+      );
+      if (existingIndex >= 0) {
+        this.state.utxoOutputs[existingIndex] = { ...output };
+      } else {
+        this.state.utxoOutputs.push({ ...output });
+      }
+    }
+
+    for (const movement of window.addressMovements) {
+      const exists = this.state.addressMovements.some(
+        (candidate) =>
+          candidate.networkId === movement.networkId &&
+          candidate.movementId === movement.movementId,
+      );
+      if (!exists) {
+        this.state.addressMovements.push(movement);
+      }
+    }
+
+    for (const transfer of window.transfers) {
+      const exists = this.state.transfers.some(
+        (candidate) =>
+          candidate.networkId === transfer.networkId &&
+          candidate.transferId === transfer.transferId,
+      );
+      if (!exists) {
+        this.state.transfers.push(transfer);
+      }
+    }
+
+    for (const balance of window.balances) {
+      const existing = this.state.balances.find(
+        (candidate) =>
+          candidate.networkId === balance.networkId &&
+          candidate.address === balance.address &&
+          candidate.assetAddress === balance.assetAddress,
+      );
+      if (existing) {
+        existing.balance = balance.balance;
+        existing.asOfBlockHeight = balance.asOfBlockHeight;
+      } else {
+        this.state.balances.push({ ...balance });
+      }
+    }
+
+    for (const link of window.directLinks) {
+      const existing = this.state.directLinks.find(
+        (candidate) =>
+          candidate.networkId === link.networkId &&
+          candidate.fromAddress === link.fromAddress &&
+          candidate.toAddress === link.toAddress &&
+          candidate.assetAddress === link.assetAddress,
+      );
+      if (existing) {
+        Object.assign(existing, link);
+      } else {
+        this.state.directLinks.push({ ...link });
+      }
+    }
+
+    for (const block of window.appliedBlocks) {
+      const exists = this.state.appliedBlocks.some(
+        (candidate) =>
+          candidate.networkId === block.networkId &&
+          candidate.blockHeight === block.blockHeight &&
+          candidate.blockHash === block.blockHash,
+      );
+      if (!exists) {
+        this.state.appliedBlocks.push({ ...block });
+      }
+    }
+
+    await this.afterMutation();
+  }
+
+  public async exportProjectionStateSnapshot(
+    networkId: PrimaryId,
+  ): Promise<ProjectionStateBootstrapSnapshot> {
+    return {
+      appliedBlocks: this.state.appliedBlocks.filter((row) => row.networkId === networkId),
+      utxoOutputs: this.state.utxoOutputs.filter((row) => row.networkId === networkId),
+      balances: this.state.balances.filter((row) => row.networkId === networkId),
+      directLinks: this.state.directLinks.filter((row) => row.networkId === networkId),
+      sourceLinks: this.state.sourceLinks.filter((row) => row.networkId === networkId),
+    };
   }
 
   public async applyBlockProjection(batch: BlockProjectionBatch): Promise<void> {
@@ -503,7 +796,11 @@ export class DuckDbWarehouseAdapter extends InMemoryWarehouseAdapter {
 }
 
 export class ClickHouseWarehouseAdapter
-  implements InvestigationWarehousePort, ProjectionWarehousePort, ExplorerWarehousePort
+  implements
+    InvestigationWarehousePort,
+    ProjectionWarehousePort,
+    ProjectionFactWarehousePort,
+    ExplorerWarehousePort
 {
   private readonly client: ReturnType<typeof createClient>;
 
@@ -518,6 +815,18 @@ export class ClickHouseWarehouseAdapter
 
   public async boot(): Promise<void> {
     await this.migrate();
+  }
+
+  public async getCurrentAddressSummary(networkId: PrimaryId, address: string) {
+    const summary = await this.getAddressSummary(networkId, address);
+    if (!summary) {
+      return null;
+    }
+
+    return {
+      balance: summary.balance,
+      utxoCount: summary.utxoCount,
+    };
   }
 
   public async getBalancesByAddresses(addresses: string[]) {
@@ -895,6 +1204,60 @@ export class ClickHouseWarehouseAdapter
     return rows.length > 0;
   }
 
+  public async listAppliedBlockSet(
+    networkId: PrimaryId,
+    blocks: Array<{
+      blockHash: string;
+      blockHeight: number;
+    }>,
+  ): Promise<Set<string>> {
+    if (blocks.length === 0) {
+      return new Set();
+    }
+
+    const heights = [...new Set(blocks.map((block) => block.blockHeight))];
+    const rows = await this.queryRows<{
+      blockHash: string;
+      blockHeight: number;
+      networkId: PrimaryId;
+    }>({
+      query: `
+          SELECT
+            network_id AS "networkId",
+            block_height AS "blockHeight",
+            block_hash AS "blockHash"
+          FROM applied_blocks_v2
+          WHERE network_id = {networkId:UInt64} AND block_height IN ({heights:Array(UInt64)})
+        `,
+      query_params: { networkId, heights },
+      format: 'JSONEachRow',
+    });
+
+    const requested = new Set(
+      blocks.map((block) => blockIdentity(networkId, block.blockHeight, block.blockHash)),
+    );
+    return new Set(
+      rows
+        .map((row) => blockIdentity(row.networkId, row.blockHeight, row.blockHash))
+        .filter((identity) => requested.has(identity)),
+    );
+  }
+
+  public async getAppliedBlockTail(networkId: PrimaryId): Promise<number | null> {
+    const rows = await this.queryRows<{ blockHeight: number | null }>({
+      query: `
+          SELECT max(block_height) AS "blockHeight"
+          FROM applied_blocks_v2
+          WHERE network_id = {networkId:UInt64}
+        `,
+      query_params: { networkId },
+      format: 'JSONEachRow',
+    });
+
+    const blockHeight = rows[0]?.blockHeight;
+    return blockHeight === null || blockHeight === undefined ? null : Number(blockHeight);
+  }
+
   public async listDirectLinksFromAddresses(networkId: PrimaryId, fromAddresses: string[]) {
     if (fromAddresses.length === 0) {
       return [];
@@ -1172,6 +1535,91 @@ export class ClickHouseWarehouseAdapter
     );
   }
 
+  public async applyProjectionFacts(window: ProjectionFactWindow): Promise<void> {
+    await this.insertRows(
+      'address_movements_v2',
+      window.addressMovements.map((row) => ({
+        movement_id: row.movementId,
+        network_id: row.networkId,
+        block_height: row.blockHeight,
+        block_hash: row.blockHash,
+        block_time: row.blockTime,
+        txid: row.txid,
+        tx_index: row.txIndex,
+        entry_index: row.entryIndex,
+        address: row.address,
+        asset_address: row.assetAddress,
+        direction: row.direction,
+        amount_base: row.amountBase,
+        output_key: row.outputKey,
+        derivation_method: row.derivationMethod,
+      })),
+    );
+    await this.insertRows(
+      'transfers_v2',
+      window.transfers.map((row) => ({
+        transfer_id: row.transferId,
+        network_id: row.networkId,
+        block_height: row.blockHeight,
+        block_hash: row.blockHash,
+        block_time: row.blockTime,
+        txid: row.txid,
+        tx_index: row.txIndex,
+        transfer_index: row.transferIndex,
+        asset_address: row.assetAddress,
+        from_address: row.fromAddress,
+        to_address: row.toAddress,
+        amount_base: row.amountBase,
+        derivation_method: row.derivationMethod,
+        confidence: row.confidence,
+        is_change: row.isChange ? 1 : 0,
+        input_address_count: row.inputAddressCount,
+        output_address_count: row.outputAddressCount,
+      })),
+    );
+    await this.insertRows(
+      'utxo_outputs_v2',
+      window.utxoOutputs.map((row) => toUtxoInsertRow(row, row.spentInBlock ?? row.blockHeight)),
+    );
+    await this.insertRows(
+      utxoCurrentStateTable,
+      window.utxoOutputs.map((row) => toUtxoInsertRow(row, row.spentInBlock ?? row.blockHeight)),
+    );
+    await this.insertRows(
+      'balances_v2',
+      window.balances.map((row) => ({
+        network_id: row.networkId,
+        address: row.address,
+        asset_address: row.assetAddress,
+        balance: row.balance,
+        as_of_block_height: row.asOfBlockHeight,
+        version: row.asOfBlockHeight,
+      })),
+    );
+    await this.insertRows(
+      'direct_links_v2',
+      window.directLinks.map((row) => ({
+        network_id: row.networkId,
+        from_address: row.fromAddress,
+        to_address: row.toAddress,
+        asset_address: row.assetAddress,
+        transfer_count: row.transferCount,
+        total_amount_base: row.totalAmountBase,
+        first_seen_block_height: row.firstSeenBlockHeight,
+        last_seen_block_height: row.lastSeenBlockHeight,
+        version: row.lastSeenBlockHeight,
+      })),
+    );
+    await this.insertRows(
+      'applied_blocks_v2',
+      window.appliedBlocks.map((row) => ({
+        network_id: row.networkId,
+        block_height: row.blockHeight,
+        block_hash: row.blockHash,
+      })),
+    );
+  }
+
   public async applyBlockProjection(batch: BlockProjectionBatch): Promise<void> {
     await this.applyProjectionWindow([batch]);
   }
@@ -1202,6 +1650,104 @@ export class ClickHouseWarehouseAdapter
         last_seen_block_height: row.lastSeenBlockHeight,
       })),
     );
+  }
+
+  public async exportProjectionStateSnapshot(
+    networkId: PrimaryId,
+  ): Promise<ProjectionStateBootstrapSnapshot> {
+    const [utxoOutputs, balances, directLinks, sourceLinks] = await Promise.all([
+      this.queryRows<ProjectionUtxoOutput>({
+        query: `
+            SELECT
+              network_id AS "networkId",
+              block_height AS "blockHeight",
+              block_hash AS "blockHash",
+              block_time AS "blockTime",
+              txid,
+              tx_index AS "txIndex",
+              vout,
+              output_key AS "outputKey",
+              address,
+              script_type AS "scriptType",
+              value_base AS "valueBase",
+              is_coinbase = 1 AS "isCoinbase",
+              is_spendable = 1 AS "isSpendable",
+              spent_by_txid AS "spentByTxid",
+              spent_in_block AS "spentInBlock",
+              spent_input_index AS "spentInputIndex"
+            FROM ${utxoCurrentStateTable}
+            WHERE network_id = {networkId:UInt64}
+            ORDER BY output_key ASC, version DESC
+            LIMIT 1 BY output_key
+          `,
+        query_params: { networkId },
+        format: 'JSONEachRow',
+      }),
+      this.queryRows<ProjectionBalanceSnapshot>({
+        query: `
+            SELECT
+              network_id AS "networkId",
+              address,
+              asset_address AS "assetAddress",
+              balance,
+              as_of_block_height AS "asOfBlockHeight"
+            FROM balances_v2
+            WHERE network_id = {networkId:UInt64}
+            ORDER BY address ASC, asset_address ASC, version DESC
+            LIMIT 1 BY network_id, address, asset_address
+          `,
+        query_params: { networkId },
+        format: 'JSONEachRow',
+      }),
+      this.queryRows<DirectLinkRecord>({
+        query: `
+            SELECT
+              network_id AS "networkId",
+              from_address AS "fromAddress",
+              to_address AS "toAddress",
+              asset_address AS "assetAddress",
+              transfer_count AS "transferCount",
+              total_amount_base AS "totalAmountBase",
+              first_seen_block_height AS "firstSeenBlockHeight",
+              last_seen_block_height AS "lastSeenBlockHeight"
+            FROM direct_links_v2
+            WHERE network_id = {networkId:UInt64}
+            ORDER BY from_address ASC, to_address ASC, asset_address ASC, version DESC
+            LIMIT 1 BY network_id, from_address, to_address, asset_address
+          `,
+        query_params: { networkId },
+        format: 'JSONEachRow',
+      }),
+      this.queryRows<SourceLinkRecord>({
+        query: `
+            SELECT
+              network_id AS "networkId",
+              source_address_id AS "sourceAddressId",
+              source_address AS "sourceAddress",
+              to_address AS "toAddress",
+              hop_count AS "hopCount",
+              path_transfer_count AS "pathTransferCount",
+              path_addresses AS "pathAddresses",
+              first_seen_block_height AS "firstSeenBlockHeight",
+              last_seen_block_height AS "lastSeenBlockHeight"
+            FROM source_links
+            WHERE network_id = {networkId:UInt64}
+          `,
+        query_params: { networkId },
+        format: 'JSONEachRow',
+      }),
+    ]);
+
+    return {
+      appliedBlocks: [],
+      utxoOutputs,
+      balances,
+      directLinks,
+      sourceLinks: sourceLinks.map((row) => ({
+        ...row,
+        pathAddresses: Array.isArray(row.pathAddresses) ? row.pathAddresses : [],
+      })),
+    };
   }
 
   private async getBalanceRowsByKeys(
@@ -1322,35 +1868,6 @@ export class ClickHouseWarehouseAdapter
         },
       ]),
     );
-  }
-
-  private async listAppliedBlockSet(
-    networkId: PrimaryId,
-    batches: BlockProjectionBatch[],
-  ): Promise<Set<string>> {
-    const heights = [...new Set(batches.map((batch) => batch.blockHeight))];
-    if (heights.length === 0) {
-      return new Set();
-    }
-
-    const rows = await this.queryRows<{
-      blockHash: string;
-      blockHeight: number;
-      networkId: PrimaryId;
-    }>({
-      query: `
-          SELECT
-            network_id AS "networkId",
-            block_height AS "blockHeight",
-            block_hash AS "blockHash"
-          FROM applied_blocks_v2
-          WHERE network_id = {networkId:UInt64} AND block_height IN ({heights:Array(UInt64)})
-        `,
-      query_params: { networkId, heights },
-      format: 'JSONEachRow',
-    });
-
-    return new Set(rows.map((row) => blockIdentity(row.networkId, row.blockHeight, row.blockHash)));
   }
 
   private async insertRows(table: string, values: Record<string, unknown>[]): Promise<void> {
@@ -1579,8 +2096,349 @@ export async function createWarehouse(
   return adapter;
 }
 
+export async function createFactWarehouse(
+  settings: WarehouseSettings,
+): Promise<
+  ProjectionFactWarehousePort &
+    Pick<
+      ProjectionStateStorePort,
+      | 'getCurrentAddressSummary'
+      | 'getBalanceSnapshots'
+      | 'getDirectLinkSnapshots'
+      | 'getDistinctLinksByAddresses'
+      | 'getBalancesByAddresses'
+      | 'getUtxoOutputs'
+      | 'hasAppliedBlock'
+      | 'listAddressUtxos'
+      | 'listAppliedBlockSet'
+      | 'listDirectLinksFromAddresses'
+      | 'listSourceSeedIdsReachingAddresses'
+    > &
+    InvestigationWarehousePort &
+    ProjectionWarehousePort &
+    ExplorerWarehousePort
+> {
+  return createWarehouse(settings) as Promise<
+    ProjectionFactWarehousePort &
+      Pick<
+        ProjectionStateStorePort,
+        | 'getCurrentAddressSummary'
+        | 'getBalanceSnapshots'
+        | 'getDirectLinkSnapshots'
+        | 'getDistinctLinksByAddresses'
+        | 'getBalancesByAddresses'
+        | 'getUtxoOutputs'
+        | 'hasAppliedBlock'
+        | 'listAddressUtxos'
+        | 'listAppliedBlockSet'
+        | 'listDirectLinksFromAddresses'
+        | 'listSourceSeedIdsReachingAddresses'
+      > &
+      InvestigationWarehousePort &
+      ProjectionWarehousePort &
+      ExplorerWarehousePort
+  >;
+}
+
+export class CompositeWarehouseAdapter
+  implements
+    InvestigationWarehousePort,
+    ExplorerWarehousePort,
+    Pick<ProjectionWarehousePort, 'getUtxoOutputs'>
+{
+  public constructor(
+    private readonly stateStore: Pick<
+      ProjectionStateStorePort,
+      | 'getBalancesByAddresses'
+      | 'getCurrentAddressSummary'
+      | 'getDistinctLinksByAddresses'
+      | 'getUtxoOutputs'
+      | 'listAddressUtxos'
+    >,
+    private readonly historyWarehouse: InvestigationWarehousePort & ExplorerWarehousePort,
+  ) {}
+
+  public getBalancesByAddresses(addresses: string[]) {
+    return this.stateStore.getBalancesByAddresses(addresses);
+  }
+
+  public getDistinctLinksByAddresses(addresses: string[]) {
+    return this.stateStore.getDistinctLinksByAddresses(addresses);
+  }
+
+  public getTokensByAddresses(addresses: string[]) {
+    return this.historyWarehouse.getTokensByAddresses(addresses);
+  }
+
+  public getUtxoOutputs(networkId: PrimaryId, outputKeys: string[]) {
+    return this.stateStore.getUtxoOutputs(networkId, outputKeys);
+  }
+
+  public getAddressSummary(networkId: PrimaryId, address: string) {
+    return Promise.all([
+      this.stateStore.getCurrentAddressSummary(networkId, address),
+      this.historyWarehouse.getAddressSummary(networkId, address),
+    ]).then(([current, historical]) => {
+      if (!current && !historical) {
+        return null;
+      }
+
+      return {
+        balance: current?.balance ?? historical?.balance ?? '0',
+        receivedBase: historical?.receivedBase ?? '0',
+        sentBase: historical?.sentBase ?? '0',
+        txCount: historical?.txCount ?? 0,
+        utxoCount: current?.utxoCount ?? historical?.utxoCount ?? 0,
+      };
+    });
+  }
+
+  public getAppliedBlockByHash(networkId: PrimaryId, blockHash: string) {
+    return this.historyWarehouse.getAppliedBlockByHash(networkId, blockHash);
+  }
+
+  public getTransactionRef(networkId: PrimaryId, txid: string) {
+    return this.historyWarehouse.getTransactionRef(networkId, txid);
+  }
+
+  public listAddressTransactions(
+    networkId: PrimaryId,
+    address: string,
+    offset?: number,
+    limit?: number,
+  ) {
+    return this.historyWarehouse.listAddressTransactions(networkId, address, offset, limit);
+  }
+
+  public listAddressUtxos(networkId: PrimaryId, address: string, offset?: number, limit?: number) {
+    return this.stateStore.listAddressUtxos(networkId, address, offset, limit);
+  }
+
+  public listAppliedBlocks(networkId: PrimaryId, offset?: number, limit?: number) {
+    return this.historyWarehouse.listAppliedBlocks(networkId, offset, limit);
+  }
+}
+
+export class MirroredProjectionStateStore implements ProjectionStateStorePort {
+  public constructor(
+    private readonly primary: ProjectionStateStorePort,
+    private readonly fallback?: Pick<
+      ProjectionStateStorePort,
+      | 'getCurrentAddressSummary'
+      | 'getBalanceSnapshots'
+      | 'getBalancesByAddresses'
+      | 'getDirectLinkSnapshots'
+      | 'getDistinctLinksByAddresses'
+      | 'getUtxoOutputs'
+      | 'hasAppliedBlock'
+      | 'listAddressUtxos'
+      | 'listAppliedBlockSet'
+      | 'listDirectLinksFromAddresses'
+      | 'listSourceSeedIdsReachingAddresses'
+    >,
+    private readonly mirror?: Pick<ProjectionWarehousePort, 'replaceSourceLinks'>,
+  ) {}
+
+  public applyProjectionWindow(batches: BlockProjectionBatch[]) {
+    return this.primary.applyProjectionWindow(batches);
+  }
+
+  public applyDirectLinkDeltasWindow(batches: ProjectionDirectLinkBatch[]) {
+    return this.primary.applyDirectLinkDeltasWindow(batches);
+  }
+
+  public async getCurrentAddressSummary(networkId: PrimaryId, address: string) {
+    const primary = await this.primary.getCurrentAddressSummary(networkId, address);
+    if (primary) {
+      return primary;
+    }
+
+    return this.fallback?.getCurrentAddressSummary(networkId, address) ?? null;
+  }
+
+  public getBalanceSnapshots(
+    networkId: PrimaryId,
+    keys: Array<{
+      address: string;
+      assetAddress: string;
+    }>,
+  ) {
+    return this.withFallbackMap(
+      this.primary.getBalanceSnapshots(networkId, keys),
+      keys,
+      (missingKeys) =>
+        this.fallback
+          ? this.fallback.getBalanceSnapshots(networkId, missingKeys)
+          : Promise.resolve(new Map()),
+      ({ address, assetAddress }) => balanceSnapshotKey(address, assetAddress),
+    );
+  }
+
+  public getDirectLinkSnapshots(
+    networkId: PrimaryId,
+    keys: Array<{
+      assetAddress: string;
+      fromAddress: string;
+      toAddress: string;
+    }>,
+  ) {
+    return this.withFallbackMap(
+      this.primary.getDirectLinkSnapshots(networkId, keys),
+      keys,
+      (missingKeys) =>
+        this.fallback
+          ? this.fallback.getDirectLinkSnapshots(networkId, missingKeys)
+          : Promise.resolve(new Map()),
+      ({ fromAddress, toAddress, assetAddress }) =>
+        directLinkSnapshotKey(fromAddress, toAddress, assetAddress),
+    );
+  }
+
+  public async getDistinctLinksByAddresses(addresses: string[]) {
+    const primaryRows = await this.primary.getDistinctLinksByAddresses(addresses);
+    const fallbackRows = this.fallback
+      ? await this.fallback.getDistinctLinksByAddresses(addresses)
+      : [];
+
+    return dedupeRecords(
+      [...fallbackRows, ...primaryRows],
+      (row) => `${row.networkId}:${row.fromAddress}:${row.toAddress}:${row.transferCount}`,
+    );
+  }
+
+  public async getBalancesByAddresses(addresses: string[]) {
+    const primaryRows = await this.primary.getBalancesByAddresses(addresses);
+    const fallbackRows = this.fallback ? await this.fallback.getBalancesByAddresses(addresses) : [];
+
+    return dedupeRecords(
+      [...fallbackRows, ...primaryRows],
+      (row) => `${row.networkId}:${row.assetAddress}:${row.balance}`,
+    );
+  }
+
+  public getProjectionBootstrapTail(networkId: PrimaryId) {
+    return this.primary.getProjectionBootstrapTail(networkId);
+  }
+
+  public getUtxoOutputs(networkId: PrimaryId, outputKeys: string[]) {
+    return this.withFallbackMap(
+      this.primary.getUtxoOutputs(networkId, outputKeys),
+      outputKeys,
+      (missingKeys) =>
+        this.fallback
+          ? this.fallback.getUtxoOutputs(networkId, missingKeys)
+          : Promise.resolve(new Map()),
+      (outputKey) => outputKey,
+    );
+  }
+
+  public async hasAppliedBlock(networkId: PrimaryId, blockHeight: number, blockHash: string) {
+    if (await this.primary.hasAppliedBlock(networkId, blockHeight, blockHash)) {
+      return true;
+    }
+
+    return this.fallback?.hasAppliedBlock(networkId, blockHeight, blockHash) ?? false;
+  }
+
+  public async listAppliedBlockSet(
+    networkId: PrimaryId,
+    blocks: Array<{
+      blockHash: string;
+      blockHeight: number;
+    }>,
+  ): Promise<Set<string>> {
+    const primaryRows = await this.primary.listAppliedBlockSet(networkId, blocks);
+    const fallbackRows = this.fallback
+      ? await this.fallback.listAppliedBlockSet(networkId, blocks)
+      : new Set<string>();
+
+    return new Set([...fallbackRows, ...primaryRows]);
+  }
+
+  public hasProjectionState(networkId: PrimaryId) {
+    return this.primary.hasProjectionState(networkId);
+  }
+
+  public importProjectionStateSnapshot(
+    networkId: PrimaryId,
+    snapshot: ProjectionStateBootstrapSnapshot,
+    processTail: number,
+  ) {
+    return this.primary.importProjectionStateSnapshot(networkId, snapshot, processTail);
+  }
+
+  public async listDirectLinksFromAddresses(networkId: PrimaryId, fromAddresses: string[]) {
+    const primaryRows = await this.primary.listDirectLinksFromAddresses(networkId, fromAddresses);
+    const fallbackRows = this.fallback
+      ? await this.fallback.listDirectLinksFromAddresses(networkId, fromAddresses)
+      : [];
+
+    return dedupeRecords([...fallbackRows, ...primaryRows], (row) =>
+      directLinkKey(row.networkId, row.fromAddress, row.toAddress, row.assetAddress),
+    );
+  }
+
+  public async listSourceSeedIdsReachingAddresses(networkId: PrimaryId, addresses: string[]) {
+    const primaryIds = await this.primary.listSourceSeedIdsReachingAddresses(networkId, addresses);
+    const fallbackIds = this.fallback
+      ? await this.fallback.listSourceSeedIdsReachingAddresses(networkId, addresses)
+      : [];
+
+    return [...new Set([...fallbackIds, ...primaryIds])];
+  }
+
+  public async replaceSourceLinks(
+    networkId: PrimaryId,
+    sourceAddressId: PrimaryId,
+    rows: SourceLinkRecord[],
+  ) {
+    await this.primary.replaceSourceLinks(networkId, sourceAddressId, rows);
+    if (this.mirror) {
+      await this.mirror.replaceSourceLinks(networkId, sourceAddressId, rows);
+    }
+  }
+
+  public async listAddressUtxos(
+    networkId: PrimaryId,
+    address: string,
+    offset?: number,
+    limit?: number,
+  ) {
+    const primaryRows = await this.primary.listAddressUtxos(networkId, address, offset, limit);
+    if (primaryRows.length > 0 || !this.fallback) {
+      return primaryRows;
+    }
+
+    return this.fallback.listAddressUtxos(networkId, address, offset, limit);
+  }
+
+  private async withFallbackMap<TKey, TValue>(
+    primaryPromise: Promise<Map<string, TValue>>,
+    keys: TKey[],
+    fallbackLoader: (missingKeys: TKey[]) => Promise<Map<string, TValue>>,
+    toKey: (key: TKey) => string,
+  ): Promise<Map<string, TValue>> {
+    const primaryRows = await primaryPromise;
+    if (!this.fallback || keys.length === 0) {
+      return primaryRows;
+    }
+
+    const missingKeys = keys.filter((key) => !primaryRows.has(toKey(key)));
+    if (missingKeys.length === 0) {
+      return primaryRows;
+    }
+
+    const fallbackRows = await fallbackLoader(missingKeys);
+    return new Map([...fallbackRows, ...primaryRows]);
+  }
+}
+
 function balanceKey(networkId: PrimaryId, address: string, assetAddress: string): string {
   return `${networkId}:${address}:${assetAddress}`;
+}
+
+function balanceSnapshotKey(address: string, assetAddress: string): string {
+  return `${address}:${assetAddress}`;
 }
 
 function blockIdentity(networkId: PrimaryId, blockHeight: number, blockHash: string): string {
@@ -1594,6 +2452,23 @@ function directLinkKey(
   assetAddress: string,
 ): string {
   return `${networkId}:${fromAddress}:${toAddress}:${assetAddress}`;
+}
+
+function directLinkSnapshotKey(
+  fromAddress: string,
+  toAddress: string,
+  assetAddress: string,
+): string {
+  return `${fromAddress}:${toAddress}:${assetAddress}`;
+}
+
+function dedupeRecords<T>(rows: T[], keyFor: (row: T) => string): T[] {
+  const deduped = new Map<string, T>();
+  for (const row of rows) {
+    deduped.set(keyFor(row), row);
+  }
+
+  return [...deduped.values()];
 }
 
 function chunkQueryValues<T>(

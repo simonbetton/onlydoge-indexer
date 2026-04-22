@@ -67,6 +67,7 @@ export async function createRuntime(input?: {
     metadata,
     rawBlockStorage,
     rpc,
+    metadata,
     stateStore,
     factWarehouse,
     settings.indexer,

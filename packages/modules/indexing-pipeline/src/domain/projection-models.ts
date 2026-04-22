@@ -84,6 +84,21 @@ export interface ProjectionBalanceSnapshot {
   networkId: PrimaryId;
 }
 
+export interface ProjectionBalanceCursor {
+  address: string;
+  assetAddress: string;
+}
+
+export interface ProjectionCurrentUtxoPage {
+  nextCursor: string | null;
+  rows: ProjectionUtxoOutput[];
+}
+
+export interface ProjectionCurrentBalancePage {
+  nextCursor: ProjectionBalanceCursor | null;
+  rows: ProjectionBalanceSnapshot[];
+}
+
 export interface ProjectionAppliedBlock {
   blockHash: string;
   blockHeight: number;

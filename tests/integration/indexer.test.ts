@@ -1,7 +1,16 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  configKeyIndexerProcessTail,
+  configKeyProjectionBootstrapCursorBalance,
+  configKeyProjectionBootstrapCursorUtxo,
+  configKeyProjectionBootstrapPhase,
+  configKeyProjectionBootstrapStartedAt,
+  configKeyProjectionBootstrapTail,
+  configKeyProjectionBootstrapTargetTail,
+} from '@onlydoge/indexing-pipeline';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { dogecoinFixture } from '../fixtures/dogecoin';
 import { createTestApp, installRpcMock } from '../helpers';
@@ -369,6 +378,78 @@ describe('indexer integration', () => {
     await expect(
       ctx.runtime.metadata.getJsonValue<number>(`indexer_fact_tail_n${internalNetwork?.networkId}`),
     ).resolves.toBe(2);
+
+    await ctx.cleanup();
+  });
+
+  it('bootstraps metadata state before resuming strict project-state', async () => {
+    const ctx = await createTestApp('indexer');
+
+    await ctx.runtime.networkCatalog.createNetwork({
+      name: 'Dogecoin Mainnet',
+      architecture: 'dogecoin',
+      chainId: 0,
+      blockTime: 60,
+      rpcEndpoint: 'https://doge.example/rpc',
+    });
+
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
+
+    const network = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
+    expect(network?.networkId).toBeDefined();
+    const networkId = network?.networkId ?? 0;
+
+    await ctx.runtime.metadata.clearProjectionBootstrapState(networkId);
+    await Promise.all([
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapTail(networkId)),
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapTargetTail(networkId)),
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapPhase(networkId)),
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapCursorUtxo(networkId)),
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapCursorBalance(networkId)),
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapStartedAt(networkId)),
+    ]);
+    await ctx.runtime.metadata.setJsonValue(configKeyIndexerProcessTail(networkId), 1);
+
+    const pipeline = ctx.runtime.indexingPipeline as unknown as {
+      factWarehouse: {
+        getUtxoOutputs: (networkId: number, outputKeys: string[]) => Promise<Map<string, unknown>>;
+        listCurrentUtxoOutputsPage: (
+          networkId: number,
+          cursorOutputKey: string | null,
+          limit: number,
+        ) => Promise<unknown>;
+      };
+    };
+    const fallbackSpy = vi.spyOn(pipeline.factWarehouse, 'getUtxoOutputs');
+    const bootstrapSpy = vi.spyOn(pipeline.factWarehouse, 'listCurrentUtxoOutputsPage');
+
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
+    await expect(
+      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail(networkId)),
+    ).resolves.toBe(1);
+    await expect(
+      ctx.runtime.metadata.getJsonValue<string>(configKeyProjectionBootstrapPhase(networkId)),
+    ).resolves.toBe('balances');
+    await expect(
+      ctx.runtime.metadata.getJsonValue<number>(configKeyProjectionBootstrapTail(networkId)),
+    ).resolves.toBeNull();
+    expect(bootstrapSpy).toHaveBeenCalled();
+    expect(fallbackSpy).not.toHaveBeenCalled();
+
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
+    await expect(
+      ctx.runtime.metadata.getJsonValue<number>(configKeyProjectionBootstrapTail(networkId)),
+    ).resolves.toSatisfy((value) => typeof value === 'number' && value >= 1);
+    await expect(
+      ctx.runtime.metadata.listAddressUtxos(networkId, dogecoinFixture.intermediaryAddress),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        txid: 'doge-tx-2',
+      }),
+    ]);
+    await expect(
+      ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail(networkId)),
+    ).resolves.toBe(1);
 
     await ctx.cleanup();
   });

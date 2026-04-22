@@ -44,6 +44,26 @@ export function configKeyProjectionBootstrapTail(networkId: PrimaryId): string {
   return `projection_bootstrap_tail_n${networkId}`;
 }
 
+export function configKeyProjectionBootstrapTargetTail(networkId: PrimaryId): string {
+  return `projection_bootstrap_target_tail_n${networkId}`;
+}
+
+export function configKeyProjectionBootstrapPhase(networkId: PrimaryId): string {
+  return `projection_bootstrap_phase_n${networkId}`;
+}
+
+export function configKeyProjectionBootstrapCursorUtxo(networkId: PrimaryId): string {
+  return `projection_bootstrap_cursor_utxo_n${networkId}`;
+}
+
+export function configKeyProjectionBootstrapCursorBalance(networkId: PrimaryId): string {
+  return `projection_bootstrap_cursor_balance_n${networkId}`;
+}
+
+export function configKeyProjectionBootstrapStartedAt(networkId: PrimaryId): string {
+  return `projection_bootstrap_started_at_n${networkId}`;
+}
+
 export function configKeyIndexerLink(networkId: PrimaryId, addressId: PrimaryId): string {
   return `indexer_link_n${networkId}_a${addressId}`;
 }

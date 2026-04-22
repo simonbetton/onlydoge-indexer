@@ -3,7 +3,10 @@ import type { PrimaryId } from '@onlydoge/shared-kernel';
 import type {
   BlockProjectionBatch,
   DirectLinkRecord,
+  ProjectionBalanceCursor,
   ProjectionBalanceSnapshot,
+  ProjectionCurrentBalancePage,
+  ProjectionCurrentUtxoPage,
   ProjectionDirectLinkBatch,
   ProjectionFactWindow,
   ProjectionStateBootstrapSnapshot,
@@ -94,6 +97,8 @@ export interface ProjectionWarehousePort {
 export interface ProjectionStateStorePort {
   applyDirectLinkDeltasWindow(batches: ProjectionDirectLinkBatch[]): Promise<void>;
   applyProjectionWindow(batches: BlockProjectionBatch[]): Promise<void>;
+  clearProjectionBootstrapState(networkId: PrimaryId): Promise<void>;
+  finalizeProjectionBootstrap(networkId: PrimaryId, processTail: number): Promise<void>;
   getCurrentAddressSummary(
     networkId: PrimaryId,
     address: string,
@@ -169,6 +174,8 @@ export interface ProjectionStateStorePort {
     sourceAddressId: PrimaryId,
     rows: SourceLinkRecord[],
   ): Promise<void>;
+  upsertProjectionBootstrapBalances(rows: ProjectionBalanceSnapshot[]): Promise<void>;
+  upsertProjectionBootstrapUtxoOutputs(rows: ProjectionUtxoOutput[]): Promise<void>;
 }
 
 export interface ProjectionFactWarehousePort {
@@ -176,6 +183,16 @@ export interface ProjectionFactWarehousePort {
   exportProjectionStateSnapshot(networkId: PrimaryId): Promise<ProjectionStateBootstrapSnapshot>;
   getAppliedBlockTail(networkId: PrimaryId): Promise<number | null>;
   hasAppliedBlock(networkId: PrimaryId, blockHeight: number, blockHash: string): Promise<boolean>;
+  listCurrentBalancesPage(
+    networkId: PrimaryId,
+    cursor: ProjectionBalanceCursor | null,
+    limit: number,
+  ): Promise<ProjectionCurrentBalancePage>;
+  listCurrentUtxoOutputsPage(
+    networkId: PrimaryId,
+    cursorOutputKey: string | null,
+    limit: number,
+  ): Promise<ProjectionCurrentUtxoPage>;
   listAppliedBlockSet(
     networkId: PrimaryId,
     blocks: Array<{

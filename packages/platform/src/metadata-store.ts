@@ -1471,6 +1471,55 @@ export class RelationalMetadataStore
     return Boolean(row);
   }
 
+  public async clearProjectionBootstrapState(networkId: PrimaryId): Promise<void> {
+    await this.withTransaction(async (executor) => {
+      await this.executeWithExecutor(
+        executor,
+        'DELETE FROM projection_utxo_outputs_current WHERE network_id = ?',
+        [networkId],
+      );
+      await this.executeWithExecutor(
+        executor,
+        'DELETE FROM projection_balances_current WHERE network_id = ?',
+        [networkId],
+      );
+      await this.executeWithExecutor(
+        executor,
+        'DELETE FROM projection_applied_blocks WHERE network_id = ?',
+        [networkId],
+      );
+    });
+  }
+
+  public async upsertProjectionBootstrapUtxoOutputs(rows: ProjectionUtxoOutput[]): Promise<void> {
+    if (rows.length === 0) {
+      return;
+    }
+
+    const timestamp = nowIsoString();
+    await this.withTransaction(async (executor) => {
+      await this.upsertProjectionUtxoOutputs(rows, timestamp, executor);
+    });
+  }
+
+  public async upsertProjectionBootstrapBalances(rows: ProjectionBalanceSnapshot[]): Promise<void> {
+    if (rows.length === 0) {
+      return;
+    }
+
+    const timestamp = nowIsoString();
+    await this.withTransaction(async (executor) => {
+      await this.upsertProjectionBalances(rows, timestamp, executor);
+    });
+  }
+
+  public async finalizeProjectionBootstrap(
+    networkId: PrimaryId,
+    processTail: number,
+  ): Promise<void> {
+    await this.setJsonValue(configKeyProjectionBootstrapTail(networkId), processTail);
+  }
+
   public async importProjectionStateSnapshot(
     networkId: PrimaryId,
     snapshot: ProjectionStateBootstrapSnapshot,

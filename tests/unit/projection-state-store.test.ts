@@ -17,6 +17,8 @@ function createStateStoreStub(
   return {
     applyDirectLinkDeltasWindow: vi.fn(async (_batches: ProjectionDirectLinkBatch[]) => {}),
     applyProjectionWindow: vi.fn(async (_batches: BlockProjectionBatch[]) => {}),
+    clearProjectionBootstrapState: vi.fn(async (_networkId: number) => {}),
+    finalizeProjectionBootstrap: vi.fn(async (_networkId: number, _processTail: number) => {}),
     getCurrentAddressSummary: vi.fn(async () => null),
     getBalanceSnapshots: vi.fn(
       async () => new Map<string, ProjectionBalanceSnapshot>(),
@@ -48,6 +50,8 @@ function createStateStoreStub(
     replaceSourceLinks: vi.fn(
       async (_networkId: number, _sourceAddressId: number, _rows: SourceLinkRecord[]) => {},
     ),
+    upsertProjectionBootstrapBalances: vi.fn(async (_rows: ProjectionBalanceSnapshot[]) => {}),
+    upsertProjectionBootstrapUtxoOutputs: vi.fn(async (_rows: ProjectionUtxoOutput[]) => {}),
     ...overrides,
   };
 }

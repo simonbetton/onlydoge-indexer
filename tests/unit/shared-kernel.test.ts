@@ -30,6 +30,7 @@ describe('shared kernel', () => {
     expect(settings.mode).toBe('both');
     expect(settings.database.driver).toBe('sqlite');
     expect(settings.indexer).toMatchObject({
+      bootstrapTimeoutMs: 60000,
       dogecoinTransferMaxEdges: 1024,
       dogecoinTransferMaxInputAddresses: 64,
       leaseHeartbeatIntervalMs: 5000,
@@ -58,6 +59,7 @@ describe('shared kernel', () => {
         ONLYDOGE_STORAGE: 'file:///tmp/storage',
         ONLYDOGE_WAREHOUSE: '/tmp/warehouse.json',
         ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS: '2500',
+        ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS: '35000',
         ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES: '12',
         ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES: '48',
         ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK: '128',
@@ -78,6 +80,7 @@ describe('shared kernel', () => {
     });
 
     expect(settings.indexer).toMatchObject({
+      bootstrapTimeoutMs: 35000,
       dogecoinTransferMaxInputAddresses: 12,
       dogecoinTransferMaxEdges: 48,
       leaseHeartbeatIntervalMs: 2500,
@@ -125,7 +128,25 @@ describe('shared kernel', () => {
       driver: 'clickhouse',
       location: 'http://clickhouse:8123/',
       database: 'onlydoge',
+      requestTimeoutMs: 30000,
       user: 'default',
+    });
+  });
+
+  it('loads warehouse request timeout from env', () => {
+    const settings = loadSettings({
+      env: {
+        ONLYDOGE_DATABASE: 'postgres://onlydoge:onlydoge@localhost:5432/onlydoge',
+        ONLYDOGE_STORAGE: 'http://localhost:9000/onlydoge-raw/storage',
+        ONLYDOGE_WAREHOUSE: 'http://clickhouse:8123?database=onlydoge',
+        ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS: '45000',
+      },
+      mode: parseMode('http'),
+    });
+
+    expect(settings.warehouse).toMatchObject({
+      driver: 'clickhouse',
+      requestTimeoutMs: 45000,
     });
   });
 

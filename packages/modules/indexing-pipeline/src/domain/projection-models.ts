@@ -89,6 +89,11 @@ export interface ProjectionBalanceCursor {
   assetAddress: string;
 }
 
+export interface ProjectionPageRequestContext {
+  abortSignal?: AbortSignal;
+  timeoutMs?: number;
+}
+
 export interface ProjectionCurrentUtxoPage {
   nextCursor: string | null;
   rows: ProjectionUtxoOutput[];

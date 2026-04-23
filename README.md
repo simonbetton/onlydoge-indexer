@@ -203,6 +203,7 @@ The app reads the following configuration surface:
 - `ONLYDOGE_INDEXER_SYNC_CONCURRENCY`
 - `ONLYDOGE_INDEXER_SYNC_TARGET_MS`
 - `ONLYDOGE_INDEXER_SYNC_TIMEOUT_MS`
+- `ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS`
 - `ONLYDOGE_INDEXER_FACT_WINDOW`
 - `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS`
 - `ONLYDOGE_INDEXER_PROJECT_WINDOW`
@@ -401,7 +402,9 @@ ghcr.io/simonbetton/onlydoge-indexer:latest
 - `ONLYDOGE_S3_SECRET_ACCESS_KEY`
 - `ONLYDOGE_WAREHOUSE_USER`
 - `ONLYDOGE_WAREHOUSE_PASSWORD`
+- `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS`
 - `ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS=5000`
+- `ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS=60000`
 - `ONLYDOGE_INDEXER_NETWORK_CONCURRENCY=2`
 - `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`
 - `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`
@@ -426,6 +429,7 @@ ghcr.io/simonbetton/onlydoge-indexer:latest
 - `ONLYDOGE_INDEXER_RELINK_CONCURRENCY=2`
 - `ONLYDOGE_INDEXER_RELINK_FRONTIER_BATCH=32`
 - `ONLYDOGE_INDEXER_RELINK_TIMEOUT_MS=120000`
+- `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`
 
 5. Leave the image command at its default unless you intentionally want to override the bundled `--mode=both --ip=0.0.0.0 --port=80`.
 
@@ -533,6 +537,7 @@ For the bundled Compose production stack, ClickHouse and the indexer tuning are 
 - `docker/clickhouse/config.d/onlydoge-memory.xml`
 - `docker/clickhouse/users.d/onlydoge-memory.xml`
 - `ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS=5000`
+- `ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS=60000`
 - `ONLYDOGE_INDEXER_NETWORK_CONCURRENCY=2`
 - `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`
 - `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`
@@ -557,6 +562,7 @@ For the bundled Compose production stack, ClickHouse and the indexer tuning are 
 - `ONLYDOGE_INDEXER_RELINK_CONCURRENCY=2`
 - `ONLYDOGE_INDEXER_RELINK_FRONTIER_BATCH=32`
 - `ONLYDOGE_INDEXER_RELINK_TIMEOUT_MS=120000`
+- `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`
 
 ### Reverse Proxy Example Concerns
 
@@ -626,4 +632,4 @@ Vitest covers:
 - The local and production Compose stacks assume the warehouse database name is `onlydoge`.
 - Raw block storage is written to S3-compatible object storage in Dockerized environments.
 - The current checked-in ClickHouse memory profile assumes a warehouse node in roughly the `16 GB RAM` class. If you run a materially smaller box, lower the profile values before deployment.
-- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_INDEXER_FACT_WINDOW=64`, `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`, `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK=2048`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK=512`, and relink deferral near the values in `.env.production.example`.
+- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS=60000`, `ONLYDOGE_INDEXER_FACT_WINDOW=64`, `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`, `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK=2048`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK=512`, `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`, and relink deferral near the values in `.env.production.example`.

@@ -43,6 +43,68 @@ describe('clickhouse warehouse adapter', () => {
     );
   });
 
+  it('passes abort signals and bounded execution settings to bootstrap page queries', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+      requestTimeoutMs: 30000,
+    });
+    const parentController = new AbortController();
+    const query = vi.fn(
+      async (parameters: {
+        abort_signal?: AbortSignal;
+        clickhouse_settings?: { max_execution_time?: number };
+      }) => {
+        expect(parameters.abort_signal).toBeDefined();
+        expect(parameters.clickhouse_settings?.max_execution_time).toBe(1);
+        return { json: async () => [] };
+      },
+    );
+
+    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+
+    await expect(
+      adapter.listCurrentBalancesPage(7, null, 5000, {
+        abortSignal: parentController.signal,
+        timeoutMs: 1000,
+      }),
+    ).resolves.toEqual({
+      rows: [],
+      nextCursor: null,
+    });
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it('surfaces bootstrap page query aborts as request timeouts', async () => {
+    const adapter = new ClickHouseWarehouseAdapter({
+      driver: 'clickhouse',
+      location: 'http://clickhouse:8123',
+      requestTimeoutMs: 30000,
+    });
+    const query = vi.fn(
+      async ({ abort_signal }: { abort_signal?: AbortSignal }) =>
+        await new Promise<never>((_, reject) => {
+          abort_signal?.addEventListener(
+            'abort',
+            () => reject(new Error('The operation was aborted')),
+            { once: true },
+          );
+        }),
+    );
+
+    (adapter as unknown as { client: { query: typeof query } }).client = { query };
+
+    await expect(
+      adapter.listCurrentBalancesPage(7, null, 5000, {
+        timeoutMs: 10,
+      }),
+    ).rejects.toEqual(
+      new InfrastructureError('warehouse request timed out after 10ms', {
+        cause: expect.any(Error),
+      }),
+    );
+  });
+
   it('chunks oversized output-key queries instead of sending one huge request', async () => {
     const adapter = new ClickHouseWarehouseAdapter({
       driver: 'clickhouse',

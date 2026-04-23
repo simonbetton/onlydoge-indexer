@@ -281,11 +281,11 @@ describe('indexer integration', () => {
     pipeline.warehouse.applyProjectionWindow = originalApplyProjectionWindow;
 
     const secondStartedAt = Date.now();
-    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(false);
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
     expect(Date.now() - secondStartedAt).toBeLessThan(1000);
     await expect(
       ctx.runtime.metadata.getJsonValue<number>(`indexer_process_tail_n${network?.networkId}`),
-    ).resolves.toBeNull();
+    ).resolves.toBe(2);
 
     await ctx.cleanup();
   });
@@ -417,6 +417,10 @@ describe('indexer integration', () => {
           networkId: number,
           cursorOutputKey: string | null,
           limit: number,
+          context?: {
+            abortSignal?: AbortSignal;
+            timeoutMs?: number;
+          },
         ) => Promise<unknown>;
       };
     };
@@ -451,6 +455,144 @@ describe('indexer integration', () => {
       ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail(networkId)),
     ).resolves.toBe(1);
 
+    await ctx.cleanup();
+  });
+
+  it('retries timed-out bootstrap exports and ignores late completions from stale attempts', async () => {
+    const ctx = await createTestApp('indexer');
+
+    await ctx.runtime.networkCatalog.createNetwork({
+      name: 'Dogecoin Mainnet',
+      architecture: 'dogecoin',
+      chainId: 0,
+      blockTime: 60,
+      rpcEndpoint: 'https://doge.example/rpc',
+    });
+
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
+
+    const network = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
+    expect(network?.networkId).toBeDefined();
+    const networkId = network?.networkId ?? 0;
+
+    await ctx.runtime.metadata.clearProjectionBootstrapState(networkId);
+    await Promise.all([
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapTail(networkId)),
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapTargetTail(networkId)),
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapPhase(networkId)),
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapCursorUtxo(networkId)),
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapCursorBalance(networkId)),
+      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapStartedAt(networkId)),
+    ]);
+    await ctx.runtime.metadata.setJsonValue(configKeyIndexerProcessTail(networkId), 1);
+
+    const pipeline = ctx.runtime.indexingPipeline as unknown as {
+      factWarehouse: {
+        listCurrentUtxoOutputsPage: (
+          networkId: number,
+          cursorOutputKey: string | null,
+          limit: number,
+          context?: {
+            abortSignal?: AbortSignal;
+            timeoutMs?: number;
+          },
+        ) => Promise<{
+          nextCursor: string | null;
+          rows: Array<Record<string, unknown>>;
+        }>;
+      };
+      settings: {
+        bootstrapTimeoutMs: number;
+      };
+    };
+    pipeline.settings.bootstrapTimeoutMs = 25;
+
+    const originalListCurrentUtxoOutputsPage =
+      pipeline.factWarehouse.listCurrentUtxoOutputsPage.bind(pipeline.factWarehouse);
+
+    const firstAttempt = {
+      resolve: null as
+        | ((value: { nextCursor: string | null; rows: Array<Record<string, unknown>> }) => void)
+        | null,
+    };
+    let firstAttemptPending = true;
+    const listCurrentUtxoOutputsPage = vi.fn(
+      (
+        currentNetworkId: number,
+        cursorOutputKey: string | null,
+        limit: number,
+        context?: {
+          abortSignal?: AbortSignal;
+          timeoutMs?: number;
+        },
+      ) => {
+        if (firstAttemptPending) {
+          firstAttemptPending = false;
+          return new Promise<{ nextCursor: string | null; rows: Array<Record<string, unknown>> }>(
+            (resolve) => {
+              firstAttempt.resolve = resolve;
+            },
+          );
+        }
+
+        return originalListCurrentUtxoOutputsPage(
+          currentNetworkId,
+          cursorOutputKey,
+          limit,
+          context,
+        );
+      },
+    );
+    pipeline.factWarehouse.listCurrentUtxoOutputsPage = listCurrentUtxoOutputsPage;
+
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(false);
+    expect(listCurrentUtxoOutputsPage).toHaveBeenCalledTimes(1);
+
+    await expect(
+      ctx.runtime.metadata.getJsonValue<string>(configKeyProjectionBootstrapCursorUtxo(networkId)),
+    ).resolves.toBeNull();
+
+    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
+    expect(listCurrentUtxoOutputsPage).toHaveBeenCalledTimes(2);
+    await expect(
+      ctx.runtime.metadata.getJsonValue<string>(configKeyProjectionBootstrapPhase(networkId)),
+    ).resolves.toBe('balances');
+
+    if (firstAttempt.resolve) {
+      firstAttempt.resolve({
+        nextCursor: 'stale-cursor',
+        rows: [
+          {
+            networkId,
+            blockHeight: 2,
+            blockHash: 'block-2',
+            blockTime: 1_700_000_002,
+            txid: 'stale-tx',
+            txIndex: 0,
+            vout: 0,
+            outputKey: 'stale-tx:0',
+            address: 'DStaleAddress123',
+            scriptType: 'pubkeyhash',
+            valueBase: '123',
+            isCoinbase: false,
+            isSpendable: true,
+            spentByTxid: null,
+            spentInBlock: null,
+            spentInputIndex: null,
+          },
+        ],
+      });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await expect(
+      ctx.runtime.metadata.getJsonValue<string>(configKeyProjectionBootstrapCursorUtxo(networkId)),
+    ).resolves.toBeNull();
+    await expect(ctx.runtime.metadata.getUtxoOutputs(networkId, ['stale-tx:0'])).resolves.toEqual(
+      new Map(),
+    );
+
+    pipeline.factWarehouse.listCurrentUtxoOutputsPage = originalListCurrentUtxoOutputsPage;
     await ctx.cleanup();
   });
 });

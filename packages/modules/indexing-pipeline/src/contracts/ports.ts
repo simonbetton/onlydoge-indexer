@@ -9,6 +9,7 @@ import type {
   ProjectionCurrentUtxoPage,
   ProjectionDirectLinkBatch,
   ProjectionFactWindow,
+  ProjectionPageRequestContext,
   ProjectionStateBootstrapSnapshot,
   ProjectionUtxoOutput,
   SourceLinkRecord,
@@ -187,11 +188,13 @@ export interface ProjectionFactWarehousePort {
     networkId: PrimaryId,
     cursor: ProjectionBalanceCursor | null,
     limit: number,
+    context?: ProjectionPageRequestContext,
   ): Promise<ProjectionCurrentBalancePage>;
   listCurrentUtxoOutputsPage(
     networkId: PrimaryId,
     cursorOutputKey: string | null,
     limit: number,
+    context?: ProjectionPageRequestContext,
   ): Promise<ProjectionCurrentUtxoPage>;
   listAppliedBlockSet(
     networkId: PrimaryId,

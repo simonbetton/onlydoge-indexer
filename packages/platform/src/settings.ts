@@ -28,11 +28,13 @@ export interface WarehouseSettings {
   driver: 'duckdb' | 'clickhouse';
   location: string;
   database?: string;
+  requestTimeoutMs?: number;
   user?: string;
   password?: string;
 }
 
 export interface IndexerSettings {
+  bootstrapTimeoutMs: number;
   dogecoinTransferMaxEdges: number;
   dogecoinTransferMaxInputAddresses: number;
   factTimeoutMs: number;
@@ -241,6 +243,7 @@ function parseWarehouseSettings(location: string, env: NodeJS.ProcessEnv): Wareh
       driver: 'clickhouse',
       location: url.toString(),
       ...(database ? { database } : {}),
+      requestTimeoutMs: parsePositiveInteger(env.ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS, 30_000),
       ...(env.ONLYDOGE_WAREHOUSE_USER ? { user: env.ONLYDOGE_WAREHOUSE_USER } : {}),
       ...(env.ONLYDOGE_WAREHOUSE_PASSWORD ? { password: env.ONLYDOGE_WAREHOUSE_PASSWORD } : {}),
     };
@@ -254,6 +257,7 @@ function parseWarehouseSettings(location: string, env: NodeJS.ProcessEnv): Wareh
 
 function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
   return {
+    bootstrapTimeoutMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS, 60_000),
     dogecoinTransferMaxInputAddresses: parsePositiveInteger(
       env.ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES,
       64,

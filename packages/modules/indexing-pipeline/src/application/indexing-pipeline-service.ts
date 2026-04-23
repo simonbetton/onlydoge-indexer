@@ -42,6 +42,7 @@ import { EvmBlockProjector } from './evm-block-projector';
 import { SourceLinkProjector } from './source-link-projector';
 
 interface IndexingPipelineSettings {
+  bootstrapTimeoutMs: number;
   dogecoinTransferMaxEdges: number;
   dogecoinTransferMaxInputAddresses: number;
   factTimeoutMs: number;
@@ -102,10 +103,20 @@ interface BacklogState {
 
 interface BootstrapStatus {
   bootstrapTail: number | null;
+  cursorBalance: ProjectionBalanceCursor | null;
+  cursorUtxo: string | null;
   phase: BootstrapPhase | null;
   required: boolean;
   startedAtMs: number | null;
   targetTail: number | null;
+}
+
+interface PhaseAttempt {
+  attemptId: string;
+  controller: AbortController;
+  promise: Promise<void>;
+  startedAtMs: number;
+  timedOut: boolean;
 }
 
 type IndexedNetwork = Awaited<ReturnType<IndexedNetworkPort['listActiveNetworks']>>[number];
@@ -117,6 +128,7 @@ const bootstrapUtxoChunkSize = 1_000;
 const bootstrapBalanceChunkSize = 5_000;
 
 const defaultSettings: IndexingPipelineSettings = {
+  bootstrapTimeoutMs: 60_000,
   dogecoinTransferMaxInputAddresses: 64,
   dogecoinTransferMaxEdges: 1024,
   factWindow: 64,
@@ -152,15 +164,16 @@ export class IndexingPipelineService {
   private readonly evmProjector = new EvmBlockProjector();
   private readonly sourceLinkProjector: SourceLinkProjector;
   private readonly latestHeights = new Map<number, number>();
+  private readonly bootstrapRetryMarkers = new Map<number, string>();
   private readonly phaseSkipReasons = new Map<string, string>();
   private readonly projectTuning = new Map<number, PhaseTuningState>();
   private readonly syncTuning = new Map<number, PhaseTuningState>();
   private readonly syncPausedNetworks = new Set<number>();
-  private readonly bootstrapInFlight = new Map<number, Promise<void>>();
-  private readonly syncInFlight = new Map<number, Promise<void>>();
-  private readonly factInFlight = new Map<number, Promise<void>>();
-  private readonly projectInFlight = new Map<number, Promise<void>>();
-  private readonly relinkInFlight = new Map<number, Promise<void>>();
+  private readonly bootstrapInFlight = new Map<number, PhaseAttempt>();
+  private readonly syncInFlight = new Map<number, PhaseAttempt>();
+  private readonly factInFlight = new Map<number, PhaseAttempt>();
+  private readonly projectInFlight = new Map<number, PhaseAttempt>();
+  private readonly relinkInFlight = new Map<number, PhaseAttempt>();
   private lastIdleReason: string | null = null;
   private readonly leaseTimeoutMs = 15_000;
   private readonly latestHeightRefreshMs = 5_000;
@@ -499,7 +512,7 @@ export class IndexingPipelineService {
       backlog,
       tuning.window,
       this.syncInFlight,
-      () => this.syncNetworkWindow(network, latestBlockHeight, tuning.window),
+      (signal) => this.syncNetworkWindow(network, latestBlockHeight, tuning.window, signal),
     );
     this.recordWindowOutcome(network, 'sync', result);
     return result.didWork;
@@ -512,18 +525,38 @@ export class IndexingPipelineService {
     const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
     const status = await this.getBootstrapStatus(network.networkId, backlog.processTail);
     if (!status.required) {
+      this.bootstrapRetryMarkers.delete(network.networkId);
       this.clearPhaseSkipReason(network.networkId, 'project-state');
       return false;
+    }
+
+    const retryMarker = `${status.phase ?? 'utxos'}:${status.targetTail ?? backlog.processTail}`;
+    if (
+      !this.bootstrapInFlight.has(network.networkId) &&
+      status.startedAtMs !== null &&
+      Date.now() - status.startedAtMs >= this.settings.bootstrapTimeoutMs &&
+      this.bootstrapRetryMarkers.get(network.networkId) !== retryMarker
+    ) {
+      const cursor =
+        status.phase === 'balances'
+          ? status.cursorBalance
+            ? `${status.cursorBalance.address}:${status.cursorBalance.assetAddress}`
+            : 'start'
+          : (status.cursorUtxo ?? 'start');
+      console.log(
+        `[onlydoge] phase=bootstrap network=${network.id} retrying table_phase=${status.phase ?? 'utxos'} cursor=${cursor} target_tail=${status.targetTail ?? backlog.processTail}`,
+      );
+      this.bootstrapRetryMarkers.set(network.networkId, retryMarker);
     }
 
     const result = await this.runNetworkPhase(
       network,
       'bootstrap',
-      this.settings.projectTimeoutMs,
+      this.settings.bootstrapTimeoutMs,
       backlog,
       null,
       this.bootstrapInFlight,
-      () => this.bootstrapNetworkWindow(network.networkId, backlog.processTail),
+      (signal) => this.bootstrapNetworkWindow(network.networkId, backlog.processTail, signal),
     );
     return result.didWork;
   }
@@ -538,6 +571,12 @@ export class IndexingPipelineService {
       this.logPhaseSkipOnce(network, 'project-state', 'bootstrap-pending', {
         bootstrap_tail: bootstrapStatus.bootstrapTail ?? -1,
         bootstrap_phase: bootstrapStatus.phase ?? 'pending',
+        bootstrap_cursor:
+          bootstrapStatus.phase === 'balances'
+            ? bootstrapStatus.cursorBalance
+              ? `${bootstrapStatus.cursorBalance.address}:${bootstrapStatus.cursorBalance.assetAddress}`
+              : 'start'
+            : (bootstrapStatus.cursorUtxo ?? 'start'),
         target_tail: bootstrapStatus.targetTail ?? backlog.processTail,
       });
       return false;
@@ -552,7 +591,7 @@ export class IndexingPipelineService {
       backlog,
       tuning.window,
       this.projectInFlight,
-      () => this.projectNetworkWindow(network, latestBlockHeight, tuning.window),
+      (signal) => this.projectNetworkWindow(network, latestBlockHeight, tuning.window, signal),
     );
     this.recordWindowOutcome(network, 'project-state', result);
     return result.didWork;
@@ -570,7 +609,8 @@ export class IndexingPipelineService {
       backlog,
       this.settings.factWindow,
       this.factInFlight,
-      () => this.factNetworkWindow(network, latestBlockHeight, this.settings.factWindow),
+      (signal) =>
+        this.factNetworkWindow(network, latestBlockHeight, this.settings.factWindow, signal),
     );
     return result.didWork;
   }
@@ -587,7 +627,7 @@ export class IndexingPipelineService {
       backlog,
       null,
       this.relinkInFlight,
-      () => this.processPendingRelinkSeeds(network.networkId),
+      (signal) => this.processPendingRelinkSeeds(network.networkId, signal),
     );
     return result.didWork;
   }
@@ -702,8 +742,8 @@ export class IndexingPipelineService {
     timeoutMs: number,
     backlog: BacklogState,
     window: number | null,
-    inFlight: Map<number, Promise<void>>,
-    work: () => Promise<PhaseWorkResult>,
+    inFlight: Map<number, PhaseAttempt>,
+    work: (signal: AbortSignal) => Promise<PhaseWorkResult>,
   ): Promise<PhaseExecutionResult> {
     if (inFlight.has(network.networkId)) {
       return {
@@ -714,29 +754,38 @@ export class IndexingPipelineService {
     }
 
     const startedAt = Date.now();
-    let timedOut = false;
-    const workPromise = work();
+    const attemptId = randomUUID();
+    const controller = new AbortController();
+    const attempt: PhaseAttempt = {
+      attemptId,
+      controller,
+      startedAtMs: startedAt,
+      timedOut: false,
+      promise: Promise.resolve(),
+    };
+    const workPromise = work(controller.signal);
     const trackedPromise = workPromise
       .then((result) => {
-        if (timedOut) {
+        if (attempt.timedOut) {
           console.log(
-            `[onlydoge] phase=${phase} network=${network.id} completed-after-timeout durationMs=${Date.now() - startedAt} didWork=${result.didWork} workItems=${result.workItems}`,
+            `[onlydoge] phase=${phase} network=${network.id} completed-after-timeout ignored=true attemptId=${attemptId} durationMs=${Date.now() - startedAt} didWork=${result.didWork} workItems=${result.workItems}`,
           );
         }
       })
       .catch((error) => {
-        if (timedOut) {
+        if (attempt.timedOut) {
           console.error(
-            `[onlydoge] phase=${phase} network=${network.id} failed-after-timeout error=${formatError(error)}`,
+            `[onlydoge] phase=${phase} network=${network.id} failed-after-timeout ignored=true attemptId=${attemptId} error=${formatError(error)}`,
           );
         }
       })
       .finally(() => {
-        if (inFlight.get(network.networkId) === trackedPromise) {
+        if (inFlight.get(network.networkId)?.attemptId === attemptId) {
           inFlight.delete(network.networkId);
         }
       });
-    inFlight.set(network.networkId, trackedPromise);
+    attempt.promise = trackedPromise;
+    inFlight.set(network.networkId, attempt);
 
     try {
       const result = await withTimeout(
@@ -754,7 +803,16 @@ export class IndexingPipelineService {
       }
       return execution;
     } catch (error) {
-      timedOut = isTimeoutError(error);
+      if (isTimeoutError(error)) {
+        attempt.timedOut = true;
+        controller.abort(error);
+        if (inFlight.get(network.networkId)?.attemptId === attemptId) {
+          inFlight.delete(network.networkId);
+        }
+        console.error(
+          `[onlydoge] phase=${phase} network=${network.id} aborting attemptId=${attemptId} durationMs=${Date.now() - startedAt} error=${formatError(error)}`,
+        );
+      }
       const execution = {
         didWork: false,
         workItems: 0,
@@ -770,6 +828,7 @@ export class IndexingPipelineService {
     network: IndexedNetwork,
     latestBlockHeight: number,
     window: number,
+    _signal: AbortSignal,
   ): Promise<PhaseWorkResult> {
     const currentSyncTail =
       (await this.configs.getJsonValue<number>(configKeyIndexerSyncTail(network.networkId))) ?? -1;
@@ -829,6 +888,7 @@ export class IndexingPipelineService {
     network: IndexedNetwork,
     latestBlockHeight: number,
     window: number,
+    _signal: AbortSignal,
   ): Promise<PhaseWorkResult> {
     const currentSyncTail =
       (await this.configs.getJsonValue<number>(configKeyIndexerSyncTail(network.networkId))) ?? -1;
@@ -948,6 +1008,7 @@ export class IndexingPipelineService {
     network: IndexedNetwork,
     latestBlockHeight: number,
     window: number,
+    _signal: AbortSignal,
   ): Promise<PhaseWorkResult> {
     const currentProcessTail =
       (await this.configs.getJsonValue<number>(configKeyIndexerProcessTail(network.networkId))) ??
@@ -1342,7 +1403,10 @@ export class IndexingPipelineService {
     );
   }
 
-  private async processPendingRelinkSeeds(networkId: number): Promise<PhaseWorkResult> {
+  private async processPendingRelinkSeeds(
+    networkId: number,
+    _signal: AbortSignal,
+  ): Promise<PhaseWorkResult> {
     const pendingSeeds = await this.seeds.listPendingRelinkSeeds(networkId);
     if (pendingSeeds.length === 0) {
       return { didWork: false, workItems: 0, pendingCount: 0 };
@@ -1419,15 +1483,22 @@ export class IndexingPipelineService {
     networkId: number,
     processTail: number,
   ): Promise<BootstrapStatus> {
-    const [bootstrapTail, targetTail, phase, startedAtMs] = await Promise.all([
-      this.projectStateStore.getProjectionBootstrapTail(networkId),
-      this.configs.getJsonValue<number>(configKeyProjectionBootstrapTargetTail(networkId)),
-      this.configs.getJsonValue<string>(configKeyProjectionBootstrapPhase(networkId)),
-      this.configs.getJsonValue<number>(configKeyProjectionBootstrapStartedAt(networkId)),
-    ]);
+    const [bootstrapTail, targetTail, phase, startedAtMs, cursorUtxo, cursorBalance] =
+      await Promise.all([
+        this.projectStateStore.getProjectionBootstrapTail(networkId),
+        this.configs.getJsonValue<number>(configKeyProjectionBootstrapTargetTail(networkId)),
+        this.configs.getJsonValue<string>(configKeyProjectionBootstrapPhase(networkId)),
+        this.configs.getJsonValue<number>(configKeyProjectionBootstrapStartedAt(networkId)),
+        this.configs.getJsonValue<string>(configKeyProjectionBootstrapCursorUtxo(networkId)),
+        this.configs.getJsonValue<ProjectionBalanceCursor>(
+          configKeyProjectionBootstrapCursorBalance(networkId),
+        ),
+      ]);
 
     return {
       bootstrapTail,
+      cursorBalance,
+      cursorUtxo,
       targetTail,
       phase: isBootstrapPhase(phase) ? phase : null,
       startedAtMs,
@@ -1438,6 +1509,7 @@ export class IndexingPipelineService {
   private async bootstrapNetworkWindow(
     networkId: number,
     processTail: number,
+    signal: AbortSignal,
   ): Promise<PhaseWorkResult> {
     if (processTail < 0) {
       return { didWork: false, workItems: 0 };
@@ -1449,6 +1521,7 @@ export class IndexingPipelineService {
     }
 
     if (status.targetTail === null) {
+      throwIfAborted(signal);
       await this.initializeBootstrapState(networkId, processTail);
       status = await this.getBootstrapStatus(networkId, processTail);
     }
@@ -1456,11 +1529,11 @@ export class IndexingPipelineService {
     const targetTail = status.targetTail ?? processTail;
     switch (status.phase ?? 'utxos') {
       case 'utxos':
-        return this.bootstrapUtxoState(networkId, targetTail);
+        return this.bootstrapUtxoState(networkId, targetTail, signal);
       case 'balances':
-        return this.bootstrapBalanceState(networkId, targetTail, status.startedAtMs);
+        return this.bootstrapBalanceState(networkId, targetTail, status.startedAtMs, signal);
       case 'done':
-        return this.completeBootstrapState(networkId, targetTail, status.startedAtMs, 0);
+        return this.completeBootstrapState(networkId, targetTail, status.startedAtMs, 0, signal);
     }
   }
 
@@ -1482,6 +1555,7 @@ export class IndexingPipelineService {
   private async bootstrapUtxoState(
     networkId: number,
     targetTail: number,
+    signal: AbortSignal,
   ): Promise<PhaseWorkResult> {
     const cursor =
       (await this.configs.getJsonValue<string>(
@@ -1491,15 +1565,19 @@ export class IndexingPipelineService {
       networkId,
       cursor,
       bootstrapUtxoChunkSize,
+      { abortSignal: signal },
     );
+    throwIfAborted(signal);
     await this.projectStateStore.upsertProjectionBootstrapUtxoOutputs(page.rows);
 
     if (page.nextCursor) {
+      throwIfAborted(signal);
       await this.configs.setJsonValue(
         configKeyProjectionBootstrapCursorUtxo(networkId),
         page.nextCursor,
       );
     } else {
+      throwIfAborted(signal);
       await this.deleteConfigKeys(configKeyProjectionBootstrapCursorUtxo(networkId));
       await this.configs.setJsonValue(configKeyProjectionBootstrapPhase(networkId), 'balances');
     }
@@ -1520,6 +1598,7 @@ export class IndexingPipelineService {
     networkId: number,
     targetTail: number,
     startedAtMs: number | null,
+    signal: AbortSignal,
   ): Promise<PhaseWorkResult> {
     const cursor =
       (await this.configs.getJsonValue<ProjectionBalanceCursor>(
@@ -1529,10 +1608,13 @@ export class IndexingPipelineService {
       networkId,
       cursor,
       bootstrapBalanceChunkSize,
+      { abortSignal: signal },
     );
+    throwIfAborted(signal);
     await this.projectStateStore.upsertProjectionBootstrapBalances(page.rows);
 
     if (page.nextCursor) {
+      throwIfAborted(signal);
       await this.configs.setJsonValue(
         configKeyProjectionBootstrapCursorBalance(networkId),
         page.nextCursor,
@@ -1549,9 +1631,16 @@ export class IndexingPipelineService {
       };
     }
 
+    throwIfAborted(signal);
     await this.deleteConfigKeys(configKeyProjectionBootstrapCursorBalance(networkId));
     await this.configs.setJsonValue(configKeyProjectionBootstrapPhase(networkId), 'done');
-    return this.completeBootstrapState(networkId, targetTail, startedAtMs, page.rows.length);
+    return this.completeBootstrapState(
+      networkId,
+      targetTail,
+      startedAtMs,
+      page.rows.length,
+      signal,
+    );
   }
 
   private async completeBootstrapState(
@@ -1559,8 +1648,11 @@ export class IndexingPipelineService {
     targetTail: number,
     startedAtMs: number | null,
     importedRows: number,
+    signal: AbortSignal,
   ): Promise<PhaseWorkResult> {
+    throwIfAborted(signal);
     await this.projectStateStore.finalizeProjectionBootstrap(networkId, targetTail);
+    throwIfAborted(signal);
     await this.deleteConfigKeys(
       configKeyProjectionBootstrapTargetTail(networkId),
       configKeyProjectionBootstrapPhase(networkId),
@@ -1954,6 +2046,15 @@ function isBootstrapPhase(value: string | null): value is BootstrapPhase {
 }
 
 class BootstrapRequiredError extends Error {}
+
+function throwIfAborted(signal: AbortSignal): void {
+  if (!signal.aborted) {
+    return;
+  }
+
+  const reason = signal.reason;
+  throw reason instanceof Error ? reason : new Error(String(reason ?? 'operation aborted'));
+}
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;

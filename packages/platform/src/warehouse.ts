@@ -16,6 +16,7 @@ import {
   type ProjectionDirectLinkBatch,
   type ProjectionFactWarehousePort,
   type ProjectionFactWindow,
+  type ProjectionPageRequestContext,
   type ProjectionStateBootstrapSnapshot,
   type ProjectionStateStorePort,
   type ProjectionUtxoOutput,
@@ -208,6 +209,7 @@ export class InMemoryWarehouseAdapter
     networkId: PrimaryId,
     cursorOutputKey: string | null,
     limit: number,
+    _context?: ProjectionPageRequestContext,
   ): Promise<ProjectionCurrentUtxoPage> {
     const rows = this.state.utxoOutputs
       .filter(
@@ -229,6 +231,7 @@ export class InMemoryWarehouseAdapter
     networkId: PrimaryId,
     cursor: ProjectionBalanceCursor | null,
     limit: number,
+    _context?: ProjectionPageRequestContext,
   ): Promise<ProjectionCurrentBalancePage> {
     const rows = this.state.balances
       .filter((row) => {
@@ -914,10 +917,13 @@ export class ClickHouseWarehouseAdapter
     ExplorerWarehousePort
 {
   private readonly client: ReturnType<typeof createClient>;
+  private readonly requestTimeoutMs: number;
 
   public constructor(settings: WarehouseSettings) {
+    this.requestTimeoutMs = settings.requestTimeoutMs ?? 30_000;
     this.client = createClient({
       url: settings.location,
+      request_timeout: this.requestTimeoutMs,
       ...(settings.database ? { database: settings.database } : {}),
       ...(settings.user ? { username: settings.user } : {}),
       ...(settings.password ? { password: settings.password } : {}),
@@ -1865,9 +1871,12 @@ export class ClickHouseWarehouseAdapter
     networkId: PrimaryId,
     cursorOutputKey: string | null,
     limit: number,
+    context?: ProjectionPageRequestContext,
   ): Promise<ProjectionCurrentUtxoPage> {
-    const rows = await this.queryRows<ProjectionUtxoOutput>({
-      query: `
+    const timeoutMs = context?.timeoutMs ?? this.requestTimeoutMs;
+    const rows = await this.queryRowsWithDeadline<ProjectionUtxoOutput>(
+      {
+        query: `
           SELECT
             {networkId:UInt64} AS "networkId",
             block_height AS "blockHeight",
@@ -1913,13 +1922,18 @@ export class ClickHouseWarehouseAdapter
           ORDER BY output_key ASC
           LIMIT {limit:UInt64}
         `,
-      query_params: {
-        networkId,
-        limit,
-        ...(cursorOutputKey === null ? {} : { cursorOutputKey }),
+        query_params: {
+          networkId,
+          limit,
+          ...(cursorOutputKey === null ? {} : { cursorOutputKey }),
+        },
+        format: 'JSONEachRow',
+        clickhouse_settings: {
+          max_execution_time: toClickHouseMaxExecutionTimeSeconds(timeoutMs),
+        },
       },
-      format: 'JSONEachRow',
-    });
+      context,
+    );
 
     return {
       rows,
@@ -1931,9 +1945,12 @@ export class ClickHouseWarehouseAdapter
     networkId: PrimaryId,
     cursor: ProjectionBalanceCursor | null,
     limit: number,
+    context?: ProjectionPageRequestContext,
   ): Promise<ProjectionCurrentBalancePage> {
-    const rows = await this.queryRows<ProjectionBalanceSnapshot>({
-      query: `
+    const timeoutMs = context?.timeoutMs ?? this.requestTimeoutMs;
+    const rows = await this.queryRowsWithDeadline<ProjectionBalanceSnapshot>(
+      {
+        query: `
           SELECT
             network_id AS "networkId",
             address,
@@ -1965,18 +1982,23 @@ export class ClickHouseWarehouseAdapter
           ORDER BY address ASC, asset_address ASC
           LIMIT {limit:UInt64}
         `,
-      query_params: {
-        networkId,
-        limit,
-        ...(cursor === null
-          ? {}
-          : {
-              cursorAddress: cursor.address,
-              cursorAssetAddress: cursor.assetAddress,
-            }),
+        query_params: {
+          networkId,
+          limit,
+          ...(cursor === null
+            ? {}
+            : {
+                cursorAddress: cursor.address,
+                cursorAssetAddress: cursor.assetAddress,
+              }),
+        },
+        format: 'JSONEachRow',
+        clickhouse_settings: {
+          max_execution_time: toClickHouseMaxExecutionTimeSeconds(timeoutMs),
+        },
       },
-      format: 'JSONEachRow',
-    });
+      context,
+    );
 
     return {
       rows,
@@ -2282,6 +2304,32 @@ export class ClickHouseWarehouseAdapter
     }
   }
 
+  private async queryRowsWithDeadline<T>(
+    parameters: ClickHouseJsonQueryParameters,
+    context?: ProjectionPageRequestContext,
+  ): Promise<T[]> {
+    const timeoutMs = context?.timeoutMs ?? this.requestTimeoutMs;
+    const requestContext = createAbortableRequestContext(context?.abortSignal, timeoutMs);
+
+    try {
+      const result = await this.client.query({
+        ...parameters,
+        ...(requestContext.signal ? { abort_signal: requestContext.signal } : {}),
+      });
+      return (await result.json<T>()) as T[];
+    } catch (error) {
+      if (requestContext.didTimeout()) {
+        throw new InfrastructureError(`warehouse request timed out after ${timeoutMs}ms`, {
+          cause: error,
+        });
+      }
+
+      throw this.toInfrastructureError(error);
+    } finally {
+      requestContext.cleanup();
+    }
+  }
+
   private async executeCommand(parameters: ClickHouseCommandParameters): Promise<void> {
     try {
       await this.client.command(parameters);
@@ -2306,6 +2354,12 @@ export class ClickHouseWarehouseAdapter
     const message = describeWarehouseError(error);
     if (isWarehouseUnavailableMessage(message)) {
       return new InfrastructureError('warehouse unavailable', {
+        cause: error,
+      });
+    }
+
+    if (isWarehouseTimeoutMessage(message)) {
+      return new InfrastructureError('warehouse request timed out', {
         cause: error,
       });
     }
@@ -2780,8 +2834,46 @@ function describeWarehouseError(error: unknown): string {
   return String(error);
 }
 
+function createAbortableRequestContext(signal: AbortSignal | undefined, timeoutMs: number) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let listener: (() => void) | null = null;
+
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+    } else {
+      listener = () => controller.abort(signal.reason);
+      signal.addEventListener('abort', listener, { once: true });
+    }
+  }
+
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error(`warehouse request timed out after ${timeoutMs}ms`));
+  }, timeoutMs);
+  timer.unref?.();
+
+  return {
+    signal: controller.signal,
+    didTimeout: () => timedOut,
+    cleanup: () => {
+      clearTimeout(timer);
+      if (signal && listener) {
+        signal.removeEventListener('abort', listener);
+      }
+    },
+  };
+}
+
 function isWarehouseUnavailableMessage(message: string): boolean {
   return ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'socket hang up', 'EAI_AGAIN'].some((needle) =>
+    message.includes(needle),
+  );
+}
+
+function isWarehouseTimeoutMessage(message: string): boolean {
+  return ['request timed out', 'The operation was aborted', 'AbortError'].some((needle) =>
     message.includes(needle),
   );
 }
@@ -2790,6 +2882,10 @@ function isWarehouseMemoryLimitMessage(message: string): boolean {
   return (
     message.includes('MEMORY_LIMIT_EXCEEDED') || message.includes('User memory limit exceeded')
   );
+}
+
+function toClickHouseMaxExecutionTimeSeconds(timeoutMs: number): number {
+  return Math.max(1, Math.ceil(timeoutMs / 1000));
 }
 
 const clickHouseWarehouseBootstrapStatements = [

@@ -625,3 +625,53 @@ export interface TrackedAddress {
   address: string;
   addressId: PrimaryId;
 }
+
+export type CoreIndexerStage = 'sync_backfill' | 'process_backfill' | 'online';
+
+export interface CoreIndexerState {
+  lastError: string | null;
+  networkId: PrimaryId;
+  onlineTip: number;
+  processTail: number;
+  stage: CoreIndexerStage;
+  syncTail: number;
+  updatedAt: string;
+}
+
+export interface CoreBlockRecord {
+  blockHash: string;
+  blockHeight: number;
+  blockTime: number;
+  fetchedAt: string;
+  networkId: PrimaryId;
+  previousBlockHash: string | null;
+  processedAt: string | null;
+  rawStorageKey: string;
+  txCount: number;
+}
+
+export interface CoreDogecoinSpend {
+  address: string;
+  outputKey: string;
+  spentByTxid: string;
+  spentInBlock: number;
+  spentInputIndex: number;
+  valueBase: string;
+}
+
+export interface CoreDogecoinBlockApplication {
+  blockHash: string;
+  blockHeight: number;
+  blockTime: number;
+  networkId: PrimaryId;
+  previousBlockHash: string | null;
+  rawStorageKey: string;
+  txCount: number;
+  utxoCreates: ProjectionUtxoOutput[];
+  utxoSpends: CoreDogecoinSpend[];
+}
+
+export interface CoreDogecoinApplyResult {
+  applied: boolean;
+  processTail: number;
+}

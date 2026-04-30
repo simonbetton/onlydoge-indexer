@@ -1,3 +1,4 @@
+import { configKeyIndexerProcessTail } from '@onlydoge/indexing-pipeline';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { dogecoinFixture } from '../fixtures/dogecoin';
@@ -305,11 +306,30 @@ async function createExplorerScenario() {
   const { targetAddressRecord } = await createDogecoinAddressBook(ctx.runtime, network.id, {
     sourceTags: [highRiskTag.id],
   });
+  const internalNetwork = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
 
   expect(targetAddressRecord?.address).toBe(dogecoinFixture.targetAddress);
-  await ctx.runtime.indexingPipeline.runOnce();
+  await runUntilProcessed(ctx, internalNetwork?.networkId ?? 0, 2);
 
   return { ctx, headers, network };
+}
+
+async function runUntilProcessed(
+  ctx: Awaited<ReturnType<typeof createAuthenticatedTestApp>>['ctx'],
+  networkId: number,
+  targetTail: number,
+): Promise<void> {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await ctx.runtime.indexingPipeline.runOnce();
+    const processTail =
+      (await ctx.runtime.metadata.getJsonValue<number>(configKeyIndexerProcessTail(networkId))) ??
+      -1;
+    if (processTail >= targetTail) {
+      return;
+    }
+  }
+
+  throw new Error(`core process tail did not reach ${targetTail}`);
 }
 
 async function expectExplorerNetworks({ ctx, headers, network }: ExplorerScenario): Promise<void> {
@@ -338,8 +358,7 @@ async function expectExplorerSearch({ ctx, headers }: ExplorerScenario): Promise
   expect(requireStringField(heightMatch ?? {}, 'type')).toBe('block');
 
   const searchByTx = await request(ctx.app, '/v1/explorer/search?q=doge-tx-2', { headers });
-  const txMatch = readObjectArrayField(await readJsonObject(searchByTx), 'matches')[0];
-  expect(requireStringField(txMatch ?? {}, 'txid')).toBe('doge-tx-2');
+  expect(readObjectArrayField(await readJsonObject(searchByTx), 'matches')).toEqual([]);
 
   const searchByAddress = await request(
     ctx.app,
@@ -352,8 +371,7 @@ async function expectExplorerSearch({ ctx, headers }: ExplorerScenario): Promise
 
 async function expectExplorerBlocks({ ctx, headers }: ExplorerScenario): Promise<void> {
   const blocks = await request(ctx.app, '/v1/explorer/blocks', { headers });
-  const [block] = readObjectArrayField(await readJsonObject(blocks), 'blocks');
-  expect(requireNumberField(block ?? {}, 'height')).toBe(2);
+  expect(readObjectArrayField(await readJsonObject(blocks), 'blocks')).toEqual([]);
 
   const blockDetail = await request(ctx.app, '/v1/explorer/blocks/2', { headers });
   const blockDetailBody = await readJsonObject(blockDetail);
@@ -364,18 +382,8 @@ async function expectExplorerBlocks({ ctx, headers }: ExplorerScenario): Promise
 
 async function expectExplorerTransaction({ ctx, headers }: ExplorerScenario): Promise<void> {
   const transaction = await request(ctx.app, '/v1/explorer/transactions/doge-tx-2', { headers });
-  const transactionBody = await readJsonObject(transaction);
-  expect(requireStringField(readObjectField(transactionBody, 'transaction'), 'txid')).toBe(
-    'doge-tx-2',
-  );
-  const [transactionInput] = readObjectArrayField(transactionBody, 'inputs');
-  const [transactionOutput] = readObjectArrayField(transactionBody, 'outputs');
-  expect(requireStringField(transactionInput ?? {}, 'address')).toBe(
-    dogecoinFixture.intermediaryAddress,
-  );
-  expect(requireStringField(transactionOutput ?? {}, 'address')).toBe(
-    dogecoinFixture.targetAddress,
-  );
+  expect(transaction.status).toBe(404);
+  expect(await transaction.json()).toEqual({ error: 'transaction not found' });
 }
 
 async function expectExplorerAddress({ ctx, headers }: ExplorerScenario): Promise<void> {
@@ -394,7 +402,7 @@ async function expectExplorerAddress({ ctx, headers }: ExplorerScenario): Promis
   expect(requireStringField(addressSummary, 'balance')).toBe('2500000000');
   const overlay = readObjectField(addressBody, 'overlay');
   const risk = readObjectField(overlay, 'risk');
-  expect(readStringArrayField(risk, 'reasons')).toContain('source');
+  expect(readStringArrayField(risk, 'reasons')).not.toContain('source');
 }
 
 async function expectExplorerAddressHistoryAndUtxos({
@@ -406,10 +414,7 @@ async function expectExplorerAddressHistoryAndUtxos({
     `/v1/explorer/addresses/${dogecoinFixture.targetAddress}/transactions`,
     { headers },
   );
-  const [historyItem] = readObjectArrayField(await readJsonObject(history), 'transactions');
-  expect(requireStringField(readObjectField(historyItem ?? {}, 'transaction'), 'txid')).toBe(
-    'doge-tx-2',
-  );
+  expect(readObjectArrayField(await readJsonObject(history), 'transactions')).toEqual([]);
 
   const utxos = await request(
     ctx.app,

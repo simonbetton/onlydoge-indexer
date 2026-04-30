@@ -31,6 +31,9 @@ describe('shared kernel', () => {
     expect(settings.database.driver).toBe('sqlite');
     expect(settings.indexer).toMatchObject({
       bootstrapTimeoutMs: 60000,
+      coreOnlineTipDistance: 6,
+      coreProcessWindow: 128,
+      coreSyncCompleteDistance: 6,
       dogecoinTransferMaxEdges: 1024,
       dogecoinTransferMaxInputAddresses: 64,
       leaseHeartbeatIntervalMs: 5000,
@@ -60,6 +63,9 @@ describe('shared kernel', () => {
         ONLYDOGE_WAREHOUSE: '/tmp/warehouse.json',
         ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS: '2500',
         ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS: '35000',
+        ONLYDOGE_CORE_ONLINE_TIP_DISTANCE: '3',
+        ONLYDOGE_CORE_PROCESS_WINDOW: '24',
+        ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE: '2',
         ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES: '12',
         ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES: '48',
         ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK: '128',
@@ -81,6 +87,9 @@ describe('shared kernel', () => {
 
     expect(settings.indexer).toMatchObject({
       bootstrapTimeoutMs: 35000,
+      coreOnlineTipDistance: 3,
+      coreProcessWindow: 24,
+      coreSyncCompleteDistance: 2,
       dogecoinTransferMaxInputAddresses: 12,
       dogecoinTransferMaxEdges: 48,
       leaseHeartbeatIntervalMs: 2500,

@@ -18,11 +18,18 @@ import {
   type BlockProjectionBatch,
   buildProjectionStateChanges,
   type CoordinatorConfigPort,
+  type CoreBlockRecord,
+  type CoreDogecoinApplyResult,
+  type CoreDogecoinBlockApplication,
+  type CoreDogecoinStateStorePort,
+  type CoreIndexerStage,
+  type CoreIndexerState,
   collectProjectionDirectLinkSnapshotKeys,
   configKeyNewlyAddedAddress,
   configKeyProjectionBootstrapTail,
   type DirectLinkDelta,
   type DirectLinkRecord,
+  formatAmountBase,
   type IndexedNetworkPort,
   type ProjectionAppliedBlock,
   type ProjectionBalanceSnapshot,
@@ -31,6 +38,7 @@ import {
   type ProjectionStateBootstrapSnapshot,
   type ProjectionStateStorePort,
   type ProjectionUtxoOutput,
+  parseAmountBase,
   parseProjectionDirectLinkSnapshotKey,
   projectionBalanceSnapshotKey,
   projectionBlockIdentity,
@@ -106,6 +114,7 @@ export class RelationalMetadataStore
     InvestigationMetadataPort,
     InvestigationWarehousePort,
     IndexedNetworkPort,
+    CoreDogecoinStateStorePort,
     ProjectionStateStorePort,
     ProjectionLinkSeedPort,
     NetworkReader
@@ -228,8 +237,8 @@ export class RelationalMetadataStore
   public async createNetwork(record: NetworkRecord) {
     await this.execute(
       `
-        INSERT INTO networks (id, name, architecture, chain_id, block_time, rpc_endpoint, rps, is_deleted, updated_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO networks (id, name, architecture, chain_id, block_time, rpc_endpoint, rps, zmq_block_endpoint, is_deleted, updated_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         record.id,
@@ -239,6 +248,7 @@ export class RelationalMetadataStore
         record.blockTime,
         record.rpcEndpoint,
         record.rps,
+        record.zmqBlockEndpoint,
         record.isDeleted ? 1 : 0,
         record.updatedAt,
         record.createdAt,
@@ -289,7 +299,7 @@ export class RelationalMetadataStore
     await this.execute(
       `
         UPDATE networks
-        SET name = ?, architecture = ?, chain_id = ?, block_time = ?, rpc_endpoint = ?, rps = ?, is_deleted = ?, updated_at = ?
+        SET name = ?, architecture = ?, chain_id = ?, block_time = ?, rpc_endpoint = ?, rps = ?, zmq_block_endpoint = ?, is_deleted = ?, updated_at = ?
         WHERE id = ?
       `,
       [
@@ -299,6 +309,7 @@ export class RelationalMetadataStore
         record.blockTime,
         record.rpcEndpoint,
         record.rps,
+        record.zmqBlockEndpoint,
         this.booleanValue(record.isDeleted),
         record.updatedAt ?? nowIsoString(),
         record.id,
@@ -812,7 +823,22 @@ export class RelationalMetadataStore
   }
 
   public async getBalancesByAddresses(addresses: string[]) {
-    return this.queryByAddresses(
+    const coreRows = await this.queryByAddresses(
+      addresses,
+      (count) => `
+        SELECT network_id, address, asset_address, balance
+        FROM core_balances
+        WHERE address IN (${placeholders(count)})
+        ORDER BY network_id ASC, address ASC, asset_address ASC
+      `,
+      (row) => ({
+        networkId: Number(row.network_id),
+        address: String(row.address),
+        assetAddress: String(row.asset_address),
+        balance: String(row.balance),
+      }),
+    );
+    const projectionRows = await this.queryByAddresses(
       addresses,
       (count) => `
         SELECT network_id, address, asset_address, balance, as_of_block_height
@@ -822,9 +848,14 @@ export class RelationalMetadataStore
       `,
       (row) => ({
         networkId: Number(row.network_id),
+        address: String(row.address),
         assetAddress: String(row.asset_address),
         balance: String(row.balance),
       }),
+    );
+    return dedupeRecords(
+      [...coreRows, ...projectionRows],
+      (row) => `${row.networkId}:${row.address}:${row.assetAddress}`,
     );
   }
 
@@ -982,6 +1013,19 @@ export class RelationalMetadataStore
   }
 
   private async getCurrentNativeBalance(networkId: PrimaryId, address: string): Promise<string> {
+    const coreRow = await this.one<DatabaseRow>(
+      `
+        SELECT balance
+        FROM core_balances
+        WHERE network_id = ? AND address = ? AND asset_address = ''
+        LIMIT 1
+      `,
+      [networkId, address],
+    );
+    if (coreRow?.balance) {
+      return String(coreRow.balance);
+    }
+
     const row = await this.one<DatabaseRow>(
       `
         SELECT balance
@@ -996,6 +1040,19 @@ export class RelationalMetadataStore
   }
 
   private async countCurrentSpendableUtxos(networkId: PrimaryId, address: string): Promise<number> {
+    const coreRow = await this.one<DatabaseRow>(
+      `
+        SELECT utxo_count
+        FROM core_balances
+        WHERE network_id = ? AND address = ? AND asset_address = ''
+        LIMIT 1
+      `,
+      [networkId, address],
+    );
+    if (coreRow?.utxo_count !== undefined) {
+      return Number(coreRow.utxo_count);
+    }
+
     const row = await this.one<DatabaseRow>(
       `
         SELECT COUNT(*) AS utxo_count
@@ -1020,6 +1077,80 @@ export class RelationalMetadataStore
       return new Map();
     }
 
+    const coreOutputs = await this.getCoreUtxoOutputs(networkId, outputKeys);
+    const missingOutputKeys = outputKeys.filter((outputKey) => !coreOutputs.has(outputKey));
+    if (missingOutputKeys.length === 0) {
+      return coreOutputs;
+    }
+
+    const projectionOutputs = await this.listProjectionUtxoOutputs(networkId, missingOutputKeys);
+
+    return new Map([...coreOutputs, ...projectionOutputs]);
+  }
+
+  public async listAddressUtxos(
+    networkId: PrimaryId,
+    address: string,
+    offset = 0,
+    limit?: number,
+  ): Promise<ProjectionUtxoOutput[]> {
+    if (await this.hasCoreProcessingStarted(networkId)) {
+      const rows = await this.listCoreSpendableUtxoRows(networkId, address, offset, limit);
+      return rows.map((row) => this.mapProjectionUtxoOutput(row));
+    }
+
+    const rows = await this.listSpendableUtxoRows(networkId, address, offset, limit);
+    return rows.map((row) => this.mapProjectionUtxoOutput(row));
+  }
+
+  private async listCoreSpendableUtxoRows(
+    networkId: PrimaryId,
+    address: string,
+    offset: number,
+    limit?: number,
+  ): Promise<DatabaseRow[]> {
+    return this.query<DatabaseRow>(
+      `
+        SELECT
+          network_id,
+          block_height,
+          block_hash,
+          block_time,
+          txid,
+          tx_index,
+          vout,
+          output_key,
+          address,
+          script_type,
+          value_base,
+          is_coinbase,
+          is_spendable,
+          spent_by_txid,
+          spent_in_block,
+          spent_input_index
+        FROM core_utxos
+        WHERE
+          network_id = ?
+          AND address = ?
+          AND ${this.booleanCondition('is_spendable', true)}
+          AND spent_by_txid IS NULL
+        ORDER BY block_height DESC, tx_index DESC, vout ASC
+        ${sqlLimitClause(limit)}
+        ${sqlOffsetClause(offset)}
+      `,
+      [networkId, address, ...sqlPaginationParams(offset, limit)],
+    );
+  }
+
+  private async hasCoreProcessingStarted(networkId: PrimaryId): Promise<boolean> {
+    const state = await this.getCoreIndexerState(networkId);
+    return Boolean(state && state.processTail >= 0);
+  }
+
+  private async listProjectionUtxoOutputs(
+    networkId: PrimaryId,
+    outputKeys: string[],
+  ): Promise<Map<string, ProjectionUtxoOutput>> {
     const rows = (
       await Promise.all(
         chunkArray(outputKeys, 1_000).map((chunk) =>
@@ -1057,16 +1188,6 @@ export class RelationalMetadataStore
         return [output.outputKey, output];
       }),
     );
-  }
-
-  public async listAddressUtxos(
-    networkId: PrimaryId,
-    address: string,
-    offset = 0,
-    limit?: number,
-  ): Promise<ProjectionUtxoOutput[]> {
-    const rows = await this.listSpendableUtxoRows(networkId, address, offset, limit);
-    return rows.map((row) => this.mapProjectionUtxoOutput(row));
   }
 
   private async listSpendableUtxoRows(
@@ -1497,6 +1618,256 @@ export class RelationalMetadataStore
     return rows.map((row) => this.mapActiveNetwork(row));
   }
 
+  public async getCoreIndexerState(networkId: PrimaryId): Promise<CoreIndexerState | null> {
+    const row = await this.one<DatabaseRow>(
+      'SELECT * FROM core_indexer_state WHERE network_id = ? LIMIT 1',
+      [networkId],
+    );
+    return row ? this.mapCoreIndexerState(row) : null;
+  }
+
+  public async upsertCoreIndexerState(input: {
+    lastError?: string | null;
+    networkId: PrimaryId;
+    onlineTip?: number;
+    processTail?: number;
+    stage?: CoreIndexerStage;
+    syncTail?: number;
+  }): Promise<CoreIndexerState> {
+    const current = await this.getCoreIndexerState(input.networkId);
+    const timestamp = nowIsoString();
+    const row = {
+      networkId: input.networkId,
+      stage: input.stage ?? current?.stage ?? 'sync_backfill',
+      syncTail: input.syncTail ?? current?.syncTail ?? -1,
+      processTail: input.processTail ?? current?.processTail ?? -1,
+      onlineTip: input.onlineTip ?? current?.onlineTip ?? -1,
+      lastError: input.lastError === undefined ? (current?.lastError ?? null) : input.lastError,
+      updatedAt: timestamp,
+    } satisfies CoreIndexerState;
+
+    if (this.client.kind === 'mysql') {
+      await this.execute(
+        `
+          INSERT INTO core_indexer_state (
+            network_id, stage, sync_tail, process_tail, online_tip, last_error, updated_at, created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            stage = VALUES(stage),
+            sync_tail = VALUES(sync_tail),
+            process_tail = VALUES(process_tail),
+            online_tip = VALUES(online_tip),
+            last_error = VALUES(last_error),
+            updated_at = VALUES(updated_at)
+        `,
+        [
+          row.networkId,
+          row.stage,
+          row.syncTail,
+          row.processTail,
+          row.onlineTip,
+          row.lastError,
+          timestamp,
+          timestamp,
+        ],
+      );
+      return row;
+    }
+
+    await this.execute(
+      `
+        INSERT INTO core_indexer_state (
+          network_id, stage, sync_tail, process_tail, online_tip, last_error, updated_at, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (network_id) DO UPDATE SET
+          stage = excluded.stage,
+          sync_tail = excluded.sync_tail,
+          process_tail = excluded.process_tail,
+          online_tip = excluded.online_tip,
+          last_error = excluded.last_error,
+          updated_at = excluded.updated_at
+      `,
+      [
+        row.networkId,
+        row.stage,
+        row.syncTail,
+        row.processTail,
+        row.onlineTip,
+        row.lastError,
+        timestamp,
+        timestamp,
+      ],
+    );
+    return row;
+  }
+
+  public async setCoreIndexerStage(networkId: PrimaryId, stage: CoreIndexerStage): Promise<void> {
+    await this.upsertCoreIndexerState({ networkId, stage });
+  }
+
+  public async setCoreIndexerError(networkId: PrimaryId, error: string | null): Promise<void> {
+    await this.upsertCoreIndexerState({ networkId, lastError: error });
+  }
+
+  public async upsertCoreBlock(record: CoreBlockRecord): Promise<void> {
+    const timestamp = nowIsoString();
+    if (this.client.kind === 'mysql') {
+      await this.execute(
+        `
+          INSERT INTO core_blocks (
+            network_id, block_height, block_hash, previous_block_hash, block_time, tx_count,
+            raw_storage_key, fetched_at, processed_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            block_hash = VALUES(block_hash),
+            previous_block_hash = VALUES(previous_block_hash),
+            block_time = VALUES(block_time),
+            tx_count = VALUES(tx_count),
+            raw_storage_key = VALUES(raw_storage_key),
+            fetched_at = VALUES(fetched_at),
+            processed_at = COALESCE(core_blocks.processed_at, VALUES(processed_at)),
+            updated_at = VALUES(updated_at)
+        `,
+        [
+          record.networkId,
+          record.blockHeight,
+          record.blockHash,
+          record.previousBlockHash,
+          record.blockTime,
+          record.txCount,
+          record.rawStorageKey,
+          record.fetchedAt,
+          record.processedAt,
+          timestamp,
+        ],
+      );
+      return;
+    }
+
+    await this.execute(
+      `
+        INSERT INTO core_blocks (
+          network_id, block_height, block_hash, previous_block_hash, block_time, tx_count,
+          raw_storage_key, fetched_at, processed_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (network_id, block_height) DO UPDATE SET
+          block_hash = excluded.block_hash,
+          previous_block_hash = excluded.previous_block_hash,
+          block_time = excluded.block_time,
+          tx_count = excluded.tx_count,
+          raw_storage_key = excluded.raw_storage_key,
+          fetched_at = excluded.fetched_at,
+          processed_at = COALESCE(core_blocks.processed_at, excluded.processed_at),
+          updated_at = excluded.updated_at
+      `,
+      [
+        record.networkId,
+        record.blockHeight,
+        record.blockHash,
+        record.previousBlockHash,
+        record.blockTime,
+        record.txCount,
+        record.rawStorageKey,
+        record.fetchedAt,
+        record.processedAt,
+        timestamp,
+      ],
+    );
+  }
+
+  public async getCoreUtxoOutputs(
+    networkId: PrimaryId,
+    outputKeys: string[],
+  ): Promise<Map<string, ProjectionUtxoOutput>> {
+    return this.getCoreUtxoOutputsWithExecutor(this.client, networkId, outputKeys);
+  }
+
+  public async applyCoreDogecoinBlock(
+    input: CoreDogecoinBlockApplication,
+  ): Promise<CoreDogecoinApplyResult> {
+    return this.withTransaction(async (executor) => {
+      const existing = await this.oneWithExecutor<DatabaseRow>(
+        executor,
+        'SELECT block_hash FROM core_processed_blocks WHERE network_id = ? AND block_height = ? LIMIT 1',
+        [input.networkId, input.blockHeight],
+      );
+      if (existing) {
+        const existingHash = String(existing.block_hash);
+        if (existingHash !== input.blockHash) {
+          throw new Error(
+            `core block hash mismatch network=${input.networkId} height=${input.blockHeight} existing=${existingHash} next=${input.blockHash}`,
+          );
+        }
+        return { applied: false, processTail: input.blockHeight };
+      }
+
+      await this.upsertCoreBlockWithExecutor(input, executor);
+      const currentOutputs = await this.getCoreUtxoOutputsWithExecutor(
+        executor,
+        input.networkId,
+        input.utxoSpends.map((spend) => spend.outputKey),
+      );
+      const nextOutputs = new Map<string, ProjectionUtxoOutput>();
+      const affectedAddresses = new Set<string>();
+
+      for (const output of input.utxoCreates) {
+        nextOutputs.set(output.outputKey, { ...output });
+        if (output.isSpendable && output.address) {
+          affectedAddresses.add(output.address);
+        }
+      }
+
+      for (const spend of input.utxoSpends) {
+        const current = nextOutputs.get(spend.outputKey) ?? currentOutputs.get(spend.outputKey);
+        if (!current) {
+          throw new Error(`missing core utxo output: ${spend.outputKey}`);
+        }
+        if (current.spentByTxid) {
+          const sameSpend =
+            current.spentByTxid === spend.spentByTxid &&
+            current.spentInBlock === spend.spentInBlock &&
+            current.spentInputIndex === spend.spentInputIndex;
+          if (!sameSpend) {
+            throw new Error(
+              `core utxo output already spent: ${spend.outputKey} by ${current.spentByTxid}`,
+            );
+          }
+        }
+        nextOutputs.set(spend.outputKey, {
+          ...current,
+          spentByTxid: spend.spentByTxid,
+          spentInBlock: spend.spentInBlock,
+          spentInputIndex: spend.spentInputIndex,
+        });
+        if (current.isSpendable && current.address) {
+          affectedAddresses.add(current.address);
+        }
+      }
+
+      const timestamp = nowIsoString();
+      await this.upsertCoreUtxoOutputs([...nextOutputs.values()], timestamp, executor);
+      await this.recomputeCoreBalances(
+        input.networkId,
+        [...affectedAddresses],
+        input.blockHeight,
+        timestamp,
+        executor,
+      );
+      await this.insertCoreBlockUndo(input, timestamp, executor);
+      await this.insertCoreProcessedBlock(input, timestamp, executor);
+      await this.executeWithExecutor(
+        executor,
+        'UPDATE core_blocks SET processed_at = ?, updated_at = ? WHERE network_id = ? AND block_height = ?',
+        [timestamp, timestamp, input.networkId, input.blockHeight],
+      );
+      return { applied: true, processTail: input.blockHeight };
+    });
+  }
+
   private mapProjectionUtxoOutput(row: DatabaseRow): ProjectionUtxoOutput {
     return {
       networkId: Number(row.network_id),
@@ -1846,6 +2217,312 @@ export class RelationalMetadataStore
     }
   }
 
+  private async upsertCoreBlockWithExecutor(
+    input: CoreDogecoinBlockApplication,
+    executor: SupportedExecutor,
+  ): Promise<void> {
+    const timestamp = nowIsoString();
+    const params = [
+      input.networkId,
+      input.blockHeight,
+      input.blockHash,
+      input.previousBlockHash,
+      input.blockTime,
+      input.txCount,
+      input.rawStorageKey,
+      timestamp,
+      null,
+      timestamp,
+    ];
+
+    if (executor.kind === 'mysql') {
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO core_blocks (
+            network_id, block_height, block_hash, previous_block_hash, block_time, tx_count,
+            raw_storage_key, fetched_at, processed_at, updated_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON DUPLICATE KEY UPDATE
+            block_hash = VALUES(block_hash),
+            previous_block_hash = VALUES(previous_block_hash),
+            block_time = VALUES(block_time),
+            tx_count = VALUES(tx_count),
+            raw_storage_key = VALUES(raw_storage_key),
+            updated_at = VALUES(updated_at)
+        `,
+        params,
+      );
+      return;
+    }
+
+    await this.executeWithExecutor(
+      executor,
+      `
+        INSERT INTO core_blocks (
+          network_id, block_height, block_hash, previous_block_hash, block_time, tx_count,
+          raw_storage_key, fetched_at, processed_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (network_id, block_height) DO UPDATE SET
+          block_hash = excluded.block_hash,
+          previous_block_hash = excluded.previous_block_hash,
+          block_time = excluded.block_time,
+          tx_count = excluded.tx_count,
+          raw_storage_key = excluded.raw_storage_key,
+          updated_at = excluded.updated_at
+      `,
+      params,
+    );
+  }
+
+  private async upsertCoreUtxoOutputs(
+    outputs: ProjectionUtxoOutput[],
+    timestamp: string,
+    executor: SupportedExecutor,
+  ): Promise<void> {
+    if (outputs.length === 0) {
+      return;
+    }
+
+    for (const chunk of chunkArray(outputs, this.bulkChunkSize(executor.kind))) {
+      const params = chunk.flatMap((output) => [
+        output.networkId,
+        output.outputKey,
+        output.blockHeight,
+        output.blockHash,
+        output.blockTime,
+        output.txid,
+        output.txIndex,
+        output.vout,
+        output.address,
+        output.scriptType,
+        output.valueBase,
+        this.booleanValue(output.isCoinbase),
+        this.booleanValue(output.isSpendable),
+        output.spentByTxid,
+        output.spentInBlock,
+        output.spentInputIndex,
+        timestamp,
+      ]);
+      const values = multiRowPlaceholders(chunk.length, 17);
+
+      if (executor.kind === 'mysql') {
+        await this.executeWithExecutor(
+          executor,
+          `
+            INSERT INTO core_utxos (
+              network_id, output_key, block_height, block_hash, block_time, txid, tx_index, vout,
+              address, script_type, value_base, is_coinbase, is_spendable, spent_by_txid,
+              spent_in_block, spent_input_index, updated_at
+            )
+            VALUES ${values}
+            ON DUPLICATE KEY UPDATE
+              spent_by_txid = VALUES(spent_by_txid),
+              spent_in_block = VALUES(spent_in_block),
+              spent_input_index = VALUES(spent_input_index),
+              updated_at = VALUES(updated_at)
+          `,
+          params,
+        );
+        continue;
+      }
+
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO core_utxos (
+            network_id, output_key, block_height, block_hash, block_time, txid, tx_index, vout,
+            address, script_type, value_base, is_coinbase, is_spendable, spent_by_txid,
+            spent_in_block, spent_input_index, updated_at
+          )
+          VALUES ${values}
+          ON CONFLICT (network_id, output_key) DO UPDATE SET
+            spent_by_txid = excluded.spent_by_txid,
+            spent_in_block = excluded.spent_in_block,
+            spent_input_index = excluded.spent_input_index,
+            updated_at = excluded.updated_at
+        `,
+        params,
+      );
+    }
+  }
+
+  private async recomputeCoreBalances(
+    networkId: PrimaryId,
+    addresses: string[],
+    asOfBlockHeight: number,
+    timestamp: string,
+    executor: SupportedExecutor,
+  ): Promise<void> {
+    if (addresses.length === 0) {
+      return;
+    }
+
+    const balances = new Map<string, { balance: bigint; utxoCount: number }>();
+    for (const address of addresses) {
+      balances.set(address, { balance: 0n, utxoCount: 0 });
+    }
+
+    for (const chunk of chunkArray(addresses, 500)) {
+      const rows = await this.queryWithExecutor<DatabaseRow>(
+        executor,
+        `
+          SELECT address, value_base
+          FROM core_utxos
+          WHERE
+            network_id = ?
+            AND address IN (${placeholders(chunk.length)})
+            AND ${this.booleanCondition('is_spendable', true)}
+            AND spent_by_txid IS NULL
+        `,
+        [networkId, ...chunk],
+      );
+      for (const row of rows) {
+        const address = String(row.address);
+        const current = balances.get(address) ?? { balance: 0n, utxoCount: 0 };
+        current.balance += parseAmountBase(String(row.value_base));
+        current.utxoCount += 1;
+        balances.set(address, current);
+      }
+    }
+
+    const rows = [...balances.entries()].map(([address, balance]) => ({
+      networkId,
+      address,
+      assetAddress: '',
+      balance: formatAmountBase(balance.balance),
+      utxoCount: balance.utxoCount,
+      asOfBlockHeight,
+    }));
+    for (const chunk of chunkArray(rows, this.bulkChunkSize(executor.kind))) {
+      const params = chunk.flatMap((row) => [
+        row.networkId,
+        row.address,
+        row.assetAddress,
+        row.balance,
+        row.utxoCount,
+        row.asOfBlockHeight,
+        timestamp,
+      ]);
+      const values = multiRowPlaceholders(chunk.length, 7);
+      if (executor.kind === 'mysql') {
+        await this.executeWithExecutor(
+          executor,
+          `
+            INSERT INTO core_balances (
+              network_id, address, asset_address, balance, utxo_count, as_of_block_height, updated_at
+            )
+            VALUES ${values}
+            ON DUPLICATE KEY UPDATE
+              balance = VALUES(balance),
+              utxo_count = VALUES(utxo_count),
+              as_of_block_height = VALUES(as_of_block_height),
+              updated_at = VALUES(updated_at)
+          `,
+          params,
+        );
+        continue;
+      }
+
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO core_balances (
+            network_id, address, asset_address, balance, utxo_count, as_of_block_height, updated_at
+          )
+          VALUES ${values}
+          ON CONFLICT (network_id, address, asset_address) DO UPDATE SET
+            balance = excluded.balance,
+            utxo_count = excluded.utxo_count,
+            as_of_block_height = excluded.as_of_block_height,
+            updated_at = excluded.updated_at
+        `,
+        params,
+      );
+    }
+  }
+
+  private async insertCoreProcessedBlock(
+    input: CoreDogecoinBlockApplication,
+    timestamp: string,
+    executor: SupportedExecutor,
+  ): Promise<void> {
+    await this.executeWithExecutor(
+      executor,
+      `
+        INSERT INTO core_processed_blocks (
+          network_id, block_height, block_hash, processed_at, created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+      `,
+      [input.networkId, input.blockHeight, input.blockHash, timestamp, timestamp],
+    );
+  }
+
+  private async insertCoreBlockUndo(
+    input: CoreDogecoinBlockApplication,
+    timestamp: string,
+    executor: SupportedExecutor,
+  ): Promise<void> {
+    const payload = JSON.stringify({
+      createdOutputKeys: input.utxoCreates.map((output) => output.outputKey),
+      spentOutputs: input.utxoSpends.map((spend) => ({
+        outputKey: spend.outputKey,
+        spentByTxid: spend.spentByTxid,
+        spentInBlock: spend.spentInBlock,
+        spentInputIndex: spend.spentInputIndex,
+      })),
+    });
+    await this.executeWithExecutor(
+      executor,
+      `
+        INSERT INTO core_block_undo (
+          network_id, block_height, block_hash, undo_json, created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+      `,
+      [input.networkId, input.blockHeight, input.blockHash, payload, timestamp],
+    );
+  }
+
+  private async getCoreUtxoOutputsWithExecutor(
+    executor: SupportedExecutor,
+    networkId: PrimaryId,
+    outputKeys: string[],
+  ): Promise<Map<string, ProjectionUtxoOutput>> {
+    if (outputKeys.length === 0) {
+      return new Map();
+    }
+
+    const rows = (
+      await Promise.all(
+        chunkArray(outputKeys, 1_000).map((chunk) =>
+          this.queryWithExecutor<DatabaseRow>(
+            executor,
+            `
+              SELECT
+                network_id, block_height, block_hash, block_time, txid, tx_index, vout,
+                output_key, address, script_type, value_base, is_coinbase, is_spendable,
+                spent_by_txid, spent_in_block, spent_input_index
+              FROM core_utxos
+              WHERE network_id = ? AND output_key IN (${placeholders(chunk.length)})
+            `,
+            [networkId, ...chunk],
+          ),
+        ),
+      )
+    ).flat();
+
+    return new Map(
+      rows.map((row) => {
+        const output = this.mapProjectionUtxoOutput(row);
+        return [output.outputKey, output];
+      }),
+    );
+  }
+
   private async query<T extends DatabaseRow>(
     statement: string,
     params: SqlValue[] = [],
@@ -1978,6 +2655,15 @@ export class RelationalMetadataStore
     params: SqlValue[] = [],
   ): Promise<T | null> {
     const rows = await this.queryWithExecutor<T>(this.client, statement, params);
+    return rows[0] ?? null;
+  }
+
+  private async oneWithExecutor<T extends DatabaseRow>(
+    executor: SupportedExecutor,
+    statement: string,
+    params: SqlValue[] = [],
+  ): Promise<T | null> {
+    const rows = await this.queryWithExecutor<T>(executor, statement, params);
     return rows[0] ?? null;
   }
 
@@ -2125,6 +2811,36 @@ export class RelationalMetadataStore
     for (const statement of statements) {
       await this.execute(statement);
     }
+
+    await this.ensureNetworksZmqColumn();
+  }
+
+  private async ensureNetworksZmqColumn(): Promise<void> {
+    if (this.client.kind === 'sqlite') {
+      const columns = await this.query<DatabaseRow>('PRAGMA table_info(networks)');
+      if (!columns.some((column) => String(column.name) === 'zmq_block_endpoint')) {
+        await this.execute('ALTER TABLE networks ADD COLUMN zmq_block_endpoint TEXT NULL');
+      }
+      return;
+    }
+
+    if (this.client.kind === 'postgres') {
+      await this.execute(
+        'ALTER TABLE networks ADD COLUMN IF NOT EXISTS zmq_block_endpoint TEXT NULL',
+      );
+      return;
+    }
+
+    const columns = await this.query<DatabaseRow>(
+      `
+        SELECT COLUMN_NAME AS column_name
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'networks'
+      `,
+    );
+    if (!columns.some((column) => String(column.column_name) === 'zmq_block_endpoint')) {
+      await this.execute('ALTER TABLE networks ADD COLUMN zmq_block_endpoint TEXT NULL');
+    }
   }
 
   private mapApiKey(row: DatabaseRow): ApiKeyRecord {
@@ -2149,6 +2865,7 @@ export class RelationalMetadataStore
       blockTime: Number(row.block_time),
       rpcEndpoint: String(row.rpc_endpoint),
       rps: Number(row.rps),
+      zmqBlockEndpoint: nullableString(row.zmq_block_endpoint),
       isDeleted: toBoolean(row.is_deleted),
       updatedAt: row.updated_at ? String(row.updated_at) : null,
       createdAt: String(row.created_at),
@@ -2166,6 +2883,19 @@ export class RelationalMetadataStore
       blockTime: network.blockTime,
       rpcEndpoint: network.rpcEndpoint,
       rps: network.rps,
+      zmqBlockEndpoint: network.zmqBlockEndpoint,
+    };
+  }
+
+  private mapCoreIndexerState(row: DatabaseRow): CoreIndexerState {
+    return {
+      networkId: Number(row.network_id),
+      stage: String(row.stage) as CoreIndexerStage,
+      syncTail: Number(row.sync_tail),
+      processTail: Number(row.process_tail),
+      onlineTip: Number(row.online_tip),
+      lastError: nullableString(row.last_error),
+      updatedAt: String(row.updated_at),
     };
   }
 
@@ -2267,6 +2997,20 @@ function chunkArray<T>(values: T[], size: number): T[][] {
   return chunks;
 }
 
+function dedupeRecords<T>(rows: T[], keyFor: (row: T) => string): T[] {
+  const seen = new Set<string>();
+  const deduped: T[] = [];
+  for (const row of rows) {
+    const key = keyFor(row);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(row);
+  }
+  return deduped;
+}
+
 function parsePendingRelinkAddressId(key: string, networkId: PrimaryId): PrimaryId | null {
   const match = key.match(new RegExp(`^newly_added_address_n${networkId}_a(\\d+)$`, 'u'));
   if (!match?.[1]) {
@@ -2301,6 +3045,7 @@ const sqliteMigrations = [
       block_time INTEGER NOT NULL,
       rpc_endpoint TEXT NOT NULL,
       rps INTEGER NOT NULL,
+      zmq_block_endpoint TEXT NULL,
       is_deleted INTEGER NOT NULL,
       updated_at TEXT NULL,
       created_at TEXT NOT NULL
@@ -2426,6 +3171,77 @@ const sqliteMigrations = [
       created_at TEXT NOT NULL,
       PRIMARY KEY (network_id, source_address_id, to_address)
     )`,
+  `CREATE TABLE IF NOT EXISTS core_blocks (
+      network_id INTEGER NOT NULL,
+      block_height INTEGER NOT NULL,
+      block_hash TEXT NOT NULL,
+      previous_block_hash TEXT NULL,
+      block_time INTEGER NOT NULL,
+      tx_count INTEGER NOT NULL,
+      raw_storage_key TEXT NOT NULL,
+      fetched_at TEXT NOT NULL,
+      processed_at TEXT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_utxos (
+      network_id INTEGER NOT NULL,
+      output_key TEXT NOT NULL,
+      block_height INTEGER NOT NULL,
+      block_hash TEXT NOT NULL,
+      block_time INTEGER NOT NULL,
+      txid TEXT NOT NULL,
+      tx_index INTEGER NOT NULL,
+      vout INTEGER NOT NULL,
+      address TEXT NOT NULL,
+      script_type TEXT NOT NULL,
+      value_base TEXT NOT NULL,
+      is_coinbase INTEGER NOT NULL,
+      is_spendable INTEGER NOT NULL,
+      spent_by_txid TEXT NULL,
+      spent_in_block INTEGER NULL,
+      spent_input_index INTEGER NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, output_key)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_balances (
+      network_id INTEGER NOT NULL,
+      address TEXT NOT NULL,
+      asset_address TEXT NOT NULL,
+      balance TEXT NOT NULL,
+      utxo_count INTEGER NOT NULL,
+      as_of_block_height INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, address, asset_address)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_processed_blocks (
+      network_id INTEGER NOT NULL,
+      block_height INTEGER NOT NULL,
+      block_hash TEXT NOT NULL,
+      processed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_block_undo (
+      network_id INTEGER NOT NULL,
+      block_height INTEGER NOT NULL,
+      block_hash TEXT NOT NULL,
+      undo_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_indexer_state (
+      network_id INTEGER PRIMARY KEY,
+      stage TEXT NOT NULL,
+      sync_tail INTEGER NOT NULL,
+      process_tail INTEGER NOT NULL,
+      online_tip INTEGER NOT NULL,
+      last_error TEXT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`,
+  `CREATE INDEX IF NOT EXISTS idx_core_utxos_address_spend
+    ON core_utxos (network_id, address, is_spendable, spent_by_txid)`,
   `CREATE INDEX IF NOT EXISTS idx_projection_balances_current_address
     ON projection_balances_current (address)`,
   `CREATE INDEX IF NOT EXISTS idx_projection_direct_links_current_from
@@ -2460,6 +3276,7 @@ const postgresMigrations = [
       block_time BIGINT NOT NULL,
       rpc_endpoint TEXT NOT NULL,
       rps INTEGER NOT NULL,
+      zmq_block_endpoint TEXT NULL,
       is_deleted BOOLEAN NOT NULL,
       updated_at TEXT NULL,
       created_at TEXT NOT NULL
@@ -2585,6 +3402,77 @@ const postgresMigrations = [
       created_at TEXT NOT NULL,
       PRIMARY KEY (network_id, source_address_id, to_address)
     )`,
+  `CREATE TABLE IF NOT EXISTS core_blocks (
+      network_id BIGINT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash TEXT NOT NULL,
+      previous_block_hash TEXT NULL,
+      block_time BIGINT NOT NULL,
+      tx_count BIGINT NOT NULL,
+      raw_storage_key TEXT NOT NULL,
+      fetched_at TEXT NOT NULL,
+      processed_at TEXT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_utxos (
+      network_id BIGINT NOT NULL,
+      output_key TEXT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash TEXT NOT NULL,
+      block_time BIGINT NOT NULL,
+      txid TEXT NOT NULL,
+      tx_index BIGINT NOT NULL,
+      vout BIGINT NOT NULL,
+      address TEXT NOT NULL,
+      script_type TEXT NOT NULL,
+      value_base TEXT NOT NULL,
+      is_coinbase BOOLEAN NOT NULL,
+      is_spendable BOOLEAN NOT NULL,
+      spent_by_txid TEXT NULL,
+      spent_in_block BIGINT NULL,
+      spent_input_index BIGINT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, output_key)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_balances (
+      network_id BIGINT NOT NULL,
+      address TEXT NOT NULL,
+      asset_address TEXT NOT NULL,
+      balance TEXT NOT NULL,
+      utxo_count BIGINT NOT NULL,
+      as_of_block_height BIGINT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, address, asset_address)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_processed_blocks (
+      network_id BIGINT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash TEXT NOT NULL,
+      processed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_block_undo (
+      network_id BIGINT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash TEXT NOT NULL,
+      undo_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_indexer_state (
+      network_id BIGINT PRIMARY KEY,
+      stage TEXT NOT NULL,
+      sync_tail BIGINT NOT NULL,
+      process_tail BIGINT NOT NULL,
+      online_tip BIGINT NOT NULL,
+      last_error TEXT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`,
+  `CREATE INDEX IF NOT EXISTS idx_core_utxos_address_spend
+    ON core_utxos (network_id, address, is_spendable, spent_by_txid)`,
   `CREATE INDEX IF NOT EXISTS idx_projection_balances_current_address
     ON projection_balances_current (address)`,
   `CREATE INDEX IF NOT EXISTS idx_projection_direct_links_current_from
@@ -2620,6 +3508,7 @@ const mysqlMigrations = [
       block_time BIGINT NOT NULL,
       rpc_endpoint TEXT NOT NULL,
       rps INTEGER NOT NULL,
+      zmq_block_endpoint TEXT NULL,
       is_deleted BOOLEAN NOT NULL,
       updated_at TEXT NULL,
       created_at TEXT NOT NULL
@@ -2744,5 +3633,75 @@ const mysqlMigrations = [
       updated_at TEXT NOT NULL,
       created_at TEXT NOT NULL,
       PRIMARY KEY (network_id, source_address_id, to_address)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_blocks (
+      network_id BIGINT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash VARCHAR(255) NOT NULL,
+      previous_block_hash VARCHAR(255) NULL,
+      block_time BIGINT NOT NULL,
+      tx_count BIGINT NOT NULL,
+      raw_storage_key TEXT NOT NULL,
+      fetched_at TEXT NOT NULL,
+      processed_at TEXT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_utxos (
+      network_id BIGINT NOT NULL,
+      output_key VARCHAR(255) NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash VARCHAR(255) NOT NULL,
+      block_time BIGINT NOT NULL,
+      txid VARCHAR(255) NOT NULL,
+      tx_index BIGINT NOT NULL,
+      vout BIGINT NOT NULL,
+      address VARCHAR(255) NOT NULL,
+      script_type TEXT NOT NULL,
+      value_base TEXT NOT NULL,
+      is_coinbase BOOLEAN NOT NULL,
+      is_spendable BOOLEAN NOT NULL,
+      spent_by_txid VARCHAR(255) NULL,
+      spent_in_block BIGINT NULL,
+      spent_input_index BIGINT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, output_key),
+      KEY idx_core_utxos_address_spend (network_id, address, is_spendable, spent_by_txid)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_balances (
+      network_id BIGINT NOT NULL,
+      address VARCHAR(255) NOT NULL,
+      asset_address VARCHAR(255) NOT NULL,
+      balance TEXT NOT NULL,
+      utxo_count BIGINT NOT NULL,
+      as_of_block_height BIGINT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, address, asset_address)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_processed_blocks (
+      network_id BIGINT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash VARCHAR(255) NOT NULL,
+      processed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_block_undo (
+      network_id BIGINT NOT NULL,
+      block_height BIGINT NOT NULL,
+      block_hash VARCHAR(255) NOT NULL,
+      undo_json JSON NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (network_id, block_height)
+    )`,
+  `CREATE TABLE IF NOT EXISTS core_indexer_state (
+      network_id BIGINT PRIMARY KEY,
+      stage VARCHAR(32) NOT NULL,
+      sync_tail BIGINT NOT NULL,
+      process_tail BIGINT NOT NULL,
+      online_tip BIGINT NOT NULL,
+      last_error TEXT NULL,
+      updated_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
     )`,
 ];

@@ -1,3 +1,4 @@
+export * from './application/core-dogecoin-indexer-service';
 export * from './application/dogecoin-block-projector';
 export * from './application/evm-block-projector';
 export * from './application/indexing-pipeline-service';

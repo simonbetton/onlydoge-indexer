@@ -17,6 +17,7 @@ export interface NetworkRecord {
   blockTime: number;
   rpcEndpoint: string;
   rps: number;
+  zmqBlockEndpoint: string | null;
   isDeleted: boolean;
   updatedAt: string | null;
   createdAt: string;
@@ -30,6 +31,7 @@ export interface CreateNetworkInput {
   blockTime: number;
   rpcEndpoint: string;
   rps?: number;
+  zmqBlockEndpoint?: string | null;
 }
 
 export interface NetworkResponse {
@@ -41,10 +43,14 @@ export interface NetworkResponse {
   name: string;
   rpcEndpoint: string;
   rps: number;
+  zmqBlockEndpoint: string | null;
 }
 
 export type UpdateNetworkInput = Partial<
-  Pick<NetworkRecord, 'architecture' | 'blockTime' | 'chainId' | 'name' | 'rpcEndpoint' | 'rps'>
+  Pick<
+    NetworkRecord,
+    'architecture' | 'blockTime' | 'chainId' | 'name' | 'rpcEndpoint' | 'rps' | 'zmqBlockEndpoint'
+  >
 >;
 
 export class Network {
@@ -66,6 +72,7 @@ export class Network {
       blockTime: input.blockTime,
       rpcEndpoint: input.rpcEndpoint.trim(),
       rps: input.rps ?? 100,
+      zmqBlockEndpoint: normalizeOptionalText(input.zmqBlockEndpoint),
       isDeleted: false,
       updatedAt: null,
       createdAt: new Date().toISOString(),
@@ -111,6 +118,10 @@ export function updateNetworkRecord(
     blockTime: updatedValue(input.blockTime, record.blockTime),
     rpcEndpoint: updatedText(input.rpcEndpoint, record.rpcEndpoint),
     rps: updatedValue(input.rps, record.rps),
+    zmqBlockEndpoint:
+      input.zmqBlockEndpoint === undefined
+        ? record.zmqBlockEndpoint
+        : normalizeOptionalText(input.zmqBlockEndpoint),
     updatedAt: new Date().toISOString(),
   };
 }
@@ -141,6 +152,12 @@ export function networkToResponse(record: NetworkRecord): NetworkResponse {
     blockTime: record.blockTime,
     rpcEndpoint: maskRpcEndpointAuth(RpcEndpoint.parse(record.rpcEndpoint)),
     rps: record.rps,
+    zmqBlockEndpoint: record.zmqBlockEndpoint,
     createdAt: record.createdAt,
   };
+}
+
+function normalizeOptionalText(value: string | null | undefined): string | null {
+  const trimmed = value?.trim() ?? '';
+  return trimmed ? trimmed : null;
 }

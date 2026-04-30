@@ -24,6 +24,10 @@ export function configKeyIndexerSyncProgress(networkId: PrimaryId): string {
   return `indexer_sync_progress_n${networkId}`;
 }
 
+export function configKeyIndexerStage(networkId: PrimaryId): string {
+  return `indexer_stage_n${networkId}`;
+}
+
 export function configKeyIndexerProcessTail(networkId: PrimaryId): string {
   return `indexer_process_tail_n${networkId}`;
 }

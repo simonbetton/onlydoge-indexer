@@ -1,5 +1,6 @@
 import type {
   BlockProjectionBatch,
+  CoreDogecoinStateStorePort,
   ProjectionDirectLinkBatch,
   ProjectionStateStorePort,
 } from '@onlydoge/indexing-pipeline';
@@ -218,6 +219,122 @@ describe('relational metadata store', () => {
     await expect(store.getProjectionBootstrapTail(7)).resolves.toBe(25);
     await expect(store.hasAppliedBlock(7, 20, 'block-20')).resolves.toBe(true);
     await expect(store.hasAppliedBlock(7, 30, 'block-30')).resolves.toBe(false);
+
+    await ctx.cleanup();
+  });
+
+  it('applies core dogecoin blocks idempotently from UTXO state', async () => {
+    const ctx = await createTestApp('indexer');
+    const store = ctx.runtime.metadata as unknown as CoreDogecoinStateStorePort;
+
+    const coinbase = {
+      networkId: 7,
+      blockHeight: 0,
+      blockHash: 'block-0',
+      previousBlockHash: null,
+      blockTime: 1_700_000_000,
+      txCount: 1,
+      rawStorageKey: 'block',
+      utxoSpends: [],
+      utxoCreates: [
+        {
+          networkId: 7,
+          blockHeight: 0,
+          blockHash: 'block-0',
+          blockTime: 1_700_000_000,
+          txid: 'tx-0',
+          txIndex: 0,
+          vout: 0,
+          outputKey: 'tx-0:0',
+          address: 'DSource',
+          scriptType: 'pubkeyhash',
+          valueBase: '10000000000',
+          isCoinbase: true,
+          isSpendable: true,
+          spentByTxid: null,
+          spentInBlock: null,
+          spentInputIndex: null,
+        },
+      ],
+    };
+
+    await expect(store.applyCoreDogecoinBlock(coinbase)).resolves.toEqual({
+      applied: true,
+      processTail: 0,
+    });
+    await expect(store.applyCoreDogecoinBlock(coinbase)).resolves.toEqual({
+      applied: false,
+      processTail: 0,
+    });
+
+    await expect(
+      store.applyCoreDogecoinBlock({
+        networkId: 7,
+        blockHeight: 1,
+        blockHash: 'block-1',
+        previousBlockHash: 'block-0',
+        blockTime: 1_700_000_060,
+        txCount: 1,
+        rawStorageKey: 'block',
+        utxoSpends: [
+          {
+            outputKey: 'tx-0:0',
+            spentByTxid: 'tx-1',
+            spentInBlock: 1,
+            spentInputIndex: 0,
+            address: 'DSource',
+            valueBase: '10000000000',
+          },
+        ],
+        utxoCreates: [
+          {
+            networkId: 7,
+            blockHeight: 1,
+            blockHash: 'block-1',
+            blockTime: 1_700_000_060,
+            txid: 'tx-1',
+            txIndex: 0,
+            vout: 0,
+            outputKey: 'tx-1:0',
+            address: 'DTarget',
+            scriptType: 'pubkeyhash',
+            valueBase: '4000000000',
+            isCoinbase: false,
+            isSpendable: true,
+            spentByTxid: null,
+            spentInBlock: null,
+            spentInputIndex: null,
+          },
+          {
+            networkId: 7,
+            blockHeight: 1,
+            blockHash: 'block-1',
+            blockTime: 1_700_000_060,
+            txid: 'tx-1',
+            txIndex: 0,
+            vout: 1,
+            outputKey: 'tx-1:1',
+            address: 'DSource',
+            scriptType: 'pubkeyhash',
+            valueBase: '5900000000',
+            isCoinbase: false,
+            isSpendable: true,
+            spentByTxid: null,
+            spentInBlock: null,
+            spentInputIndex: null,
+          },
+        ],
+      }),
+    ).resolves.toEqual({ applied: true, processTail: 1 });
+
+    await expect(ctx.runtime.metadata.getCurrentAddressSummary(7, 'DSource')).resolves.toEqual({
+      balance: '5900000000',
+      utxoCount: 1,
+    });
+    await expect(ctx.runtime.metadata.getCurrentAddressSummary(7, 'DTarget')).resolves.toEqual({
+      balance: '4000000000',
+      utxoCount: 1,
+    });
 
     await ctx.cleanup();
   });

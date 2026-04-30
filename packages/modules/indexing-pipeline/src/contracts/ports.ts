@@ -2,6 +2,11 @@ import type { PrimaryId } from '@onlydoge/shared-kernel';
 
 import type {
   BlockProjectionBatch,
+  CoreBlockRecord,
+  CoreDogecoinApplyResult,
+  CoreDogecoinBlockApplication,
+  CoreIndexerStage,
+  CoreIndexerState,
   DirectLinkRecord,
   ProjectionBalanceCursor,
   ProjectionBalanceSnapshot,
@@ -32,6 +37,7 @@ export interface IndexedNetworkPort {
       networkId: PrimaryId;
       rpcEndpoint: string;
       rps: number;
+      zmqBlockEndpoint?: string | null;
     }>
   >;
 }
@@ -48,6 +54,26 @@ export interface RawBlockStoragePort {
     part: string,
     payload: Record<string, unknown>,
   ): Promise<void>;
+}
+
+export interface CoreDogecoinStateStorePort {
+  applyCoreDogecoinBlock(input: CoreDogecoinBlockApplication): Promise<CoreDogecoinApplyResult>;
+  getCoreIndexerState(networkId: PrimaryId): Promise<CoreIndexerState | null>;
+  getCoreUtxoOutputs(
+    networkId: PrimaryId,
+    outputKeys: string[],
+  ): Promise<Map<string, ProjectionUtxoOutput>>;
+  setCoreIndexerError(networkId: PrimaryId, error: string | null): Promise<void>;
+  setCoreIndexerStage(networkId: PrimaryId, stage: CoreIndexerStage): Promise<void>;
+  upsertCoreBlock(record: CoreBlockRecord): Promise<void>;
+  upsertCoreIndexerState(input: {
+    lastError?: string | null;
+    networkId: PrimaryId;
+    onlineTip?: number;
+    processTail?: number;
+    stage?: CoreIndexerStage;
+    syncTail?: number;
+  }): Promise<CoreIndexerState>;
 }
 
 export interface BlockchainRpcPort {

@@ -18,6 +18,7 @@ export function buildNetworkCatalogHttp(service: NetworkCatalogService) {
             rpcEndpoint: t.String(),
             chainId: t.Optional(t.Number()),
             rps: t.Optional(t.Number()),
+            zmqBlockEndpoint: t.Optional(t.Nullable(t.String())),
           }),
         })
         .get(
@@ -49,6 +50,7 @@ export function buildNetworkCatalogHttp(service: NetworkCatalogService) {
               rpcEndpoint: t.Optional(t.String()),
               chainId: t.Optional(t.Number()),
               rps: t.Optional(t.Number()),
+              zmqBlockEndpoint: t.Optional(t.Nullable(t.String())),
             }),
           },
         )

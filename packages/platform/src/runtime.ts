@@ -2,7 +2,7 @@ import { AccessControlService } from '@onlydoge/access-control';
 import { EntityLabelingService } from '@onlydoge/entity-labeling';
 import { ExplorerQueryService } from '@onlydoge/explorer-query';
 import {
-  createIndexingPipelineService,
+  CoreDogecoinIndexerService,
   type IndexingPipelineService,
 } from '@onlydoge/indexing-pipeline';
 import { InvestigationQueryService } from '@onlydoge/investigation-query';
@@ -22,7 +22,7 @@ export interface Runtime {
   accessControl: AccessControlService;
   entityLabeling: EntityLabelingService;
   explorerQuery: ExplorerQueryService;
-  indexingPipeline: IndexingPipelineService;
+  indexingPipeline: Pick<IndexingPipelineService, 'runOnce' | 'start'>;
   investigationQuery: InvestigationQueryService;
   metadata: RelationalMetadataStore;
   networkCatalog: NetworkCatalogService;
@@ -64,15 +64,12 @@ export async function createRuntime(input?: {
     rawBlockStorage,
     metadata,
   );
-  const indexingPipeline = createIndexingPipelineService(
-    metadata,
+  const indexingPipeline = new CoreDogecoinIndexerService(
     metadata,
     metadata,
     rawBlockStorage,
     rpc,
     metadata,
-    stateStore,
-    factWarehouse,
     settings.indexer,
   );
 

@@ -18,8 +18,12 @@ export class InvestigationQueryService {
   public async stats(): Promise<{
     networks: Array<{
       blockHeight: number;
+      factTail: number | null;
       name: string;
+      processTail: number;
       processed: number;
+      stage: string | null;
+      syncTail: number;
       synced: number;
     }>;
   }> {
@@ -29,6 +33,17 @@ export class InvestigationQueryService {
         name: network.name,
         blockHeight:
           (await this.configs.getJsonValue<number>(`block_height_n${network.networkId}`)) ?? 0,
+        stage:
+          (await this.configs.getJsonValue<string>(`indexer_stage_n${network.networkId}`)) ?? null,
+        syncTail:
+          (await this.configs.getJsonValue<number>(`indexer_sync_tail_n${network.networkId}`)) ??
+          -1,
+        processTail:
+          (await this.configs.getJsonValue<number>(`indexer_process_tail_n${network.networkId}`)) ??
+          -1,
+        factTail:
+          (await this.configs.getJsonValue<number>(`indexer_fact_tail_n${network.networkId}`)) ??
+          null,
         synced:
           (await this.configs.getJsonValue<number>(
             `indexer_sync_progress_n${network.networkId}`,

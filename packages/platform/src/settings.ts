@@ -35,6 +35,9 @@ export interface WarehouseSettings {
 
 export interface IndexerSettings {
   bootstrapTimeoutMs: number;
+  coreOnlineTipDistance: number;
+  coreProcessWindow: number;
+  coreSyncCompleteDistance: number;
   dogecoinTransferMaxEdges: number;
   dogecoinTransferMaxInputAddresses: number;
   factTimeoutMs: number;
@@ -364,6 +367,9 @@ function applyClickHouseCredentials(settings: WarehouseSettings, env: NodeJS.Pro
 function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
   return {
     bootstrapTimeoutMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS, 60_000),
+    coreOnlineTipDistance: parsePositiveInteger(env.ONLYDOGE_CORE_ONLINE_TIP_DISTANCE, 6),
+    coreProcessWindow: parsePositiveInteger(env.ONLYDOGE_CORE_PROCESS_WINDOW, 128),
+    coreSyncCompleteDistance: parsePositiveInteger(env.ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE, 6),
     dogecoinTransferMaxInputAddresses: parsePositiveInteger(
       env.ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES,
       64,
@@ -430,4 +436,5 @@ export interface RpcBackedNetwork {
   networkId: PrimaryId;
   rpcEndpoint: string;
   rps: number;
+  zmqBlockEndpoint?: string | null;
 }

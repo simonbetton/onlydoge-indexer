@@ -92,6 +92,9 @@ import { SourceLinkProjector } from './source-link-projector';
 
 export interface IndexingPipelineSettings {
   bootstrapTimeoutMs: number;
+  coreOnlineTipDistance: number;
+  coreProcessWindow: number;
+  coreSyncCompleteDistance: number;
   dogecoinTransferMaxEdges: number;
   dogecoinTransferMaxInputAddresses: number;
   factTimeoutMs: number;
@@ -189,6 +192,9 @@ const bootstrapBalanceChunkSize = 5_000;
 
 const defaultSettings: IndexingPipelineSettings = {
   bootstrapTimeoutMs: 60_000,
+  coreOnlineTipDistance: 6,
+  coreProcessWindow: 128,
+  coreSyncCompleteDistance: 6,
   dogecoinTransferMaxInputAddresses: 64,
   dogecoinTransferMaxEdges: 1024,
   factWindow: 64,

@@ -13,6 +13,7 @@ export interface ExplorerActiveNetworkPort {
       networkId: PrimaryId;
       rpcEndpoint: string;
       rps: number;
+      zmqBlockEndpoint?: string | null;
     }>
   >;
 }

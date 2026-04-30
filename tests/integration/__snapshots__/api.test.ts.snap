@@ -1245,6 +1245,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                   "rps": {
                     "type": "number",
                   },
+                  "zmqBlockEndpoint": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
+                  },
                 },
                 "required": [
                   "name",
@@ -1283,6 +1294,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                   "rps": {
                     "type": "number",
                   },
+                  "zmqBlockEndpoint": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
+                  },
                 },
                 "required": [
                   "name",
@@ -1320,6 +1342,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                   },
                   "rps": {
                     "type": "number",
+                  },
+                  "zmqBlockEndpoint": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
                   },
                 },
                 "required": [
@@ -1399,6 +1432,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                   "rps": {
                     "type": "number",
                   },
+                  "zmqBlockEndpoint": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
+                  },
                 },
                 "type": "object",
               },
@@ -1428,6 +1472,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                   "rps": {
                     "type": "number",
                   },
+                  "zmqBlockEndpoint": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
+                  },
                 },
                 "type": "object",
               },
@@ -1456,6 +1511,17 @@ exports[`api integration > serves heartbeat and openapi 1`] = `
                   },
                   "rps": {
                     "type": "number",
+                  },
+                  "zmqBlockEndpoint": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                      },
+                      {
+                        "type": "null",
+                      },
+                    ],
+                    "nullable": true,
                   },
                 },
                 "type": "object",

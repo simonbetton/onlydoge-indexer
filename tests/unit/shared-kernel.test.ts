@@ -1,19 +1,19 @@
 import { loadSettings } from '@onlydoge/platform';
 
-import { ExternalId, parseMode, RpcEndpoint } from '@onlydoge/shared-kernel';
+import { ExternalId, maskRpcEndpointAuth, parseMode, RpcEndpoint } from '@onlydoge/shared-kernel';
 import { describe, expect, it } from 'vitest';
 
 describe('shared kernel', () => {
   it('creates and validates external ids', () => {
     const id = ExternalId.create('net');
-    expect(id.toString()).toMatch(/^net_[A-Za-z0-9]+$/u);
+    expect(id.value).toMatch(/^net_[A-Za-z0-9]+$/u);
     expect(() => ExternalId.parse('key_bad!', 'key')).toThrow();
   });
 
   it('masks RPC credentials', () => {
     const endpoint = RpcEndpoint.parse('https://user:pass@example.com/rpc');
-    expect(endpoint.maskAuth()).toContain('***');
-    expect(endpoint.maskAuth()).not.toContain('pass');
+    expect(maskRpcEndpointAuth(endpoint)).toContain('***');
+    expect(maskRpcEndpointAuth(endpoint)).not.toContain('pass');
   });
 
   it('loads default runtime settings', () => {

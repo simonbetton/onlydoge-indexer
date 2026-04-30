@@ -1,15 +1,28 @@
 import { protectedOperationDetail } from '@onlydoge/access-control';
+import { parseNonNegativeInteger } from '@onlydoge/shared-kernel';
 import { Elysia, t } from 'elysia';
 
 import type { ExplorerQueryService } from '../application/explorer-query-service';
 
-function parsePagination(value: string | undefined): number | undefined {
-  if (!value) {
-    return undefined;
-  }
+const networkQuerySchema = t.Object({
+  network: t.Optional(t.String()),
+});
 
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+const paginatedNetworkQuerySchema = t.Object({
+  network: t.Optional(t.String()),
+  offset: t.Optional(t.String()),
+  limit: t.Optional(t.String()),
+});
+
+const addressParamsSchema = t.Object({
+  address: t.String(),
+});
+
+function readPagination(query: { limit?: string; offset?: string }) {
+  return {
+    offset: parseNonNegativeInteger(query.offset),
+    limit: parseNonNegativeInteger(query.limit),
+  };
 }
 
 export function buildExplorerQueryHttp(service: ExplorerQueryService) {
@@ -36,16 +49,12 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
       ({ query }) =>
         service.listBlocks(
           query.network,
-          parsePagination(query.offset),
-          parsePagination(query.limit),
+          parseNonNegativeInteger(query.offset),
+          parseNonNegativeInteger(query.limit),
         ),
       {
         detail: describeProtected('Lists recent indexed Dogecoin blocks.'),
-        query: t.Object({
-          network: t.Optional(t.String()),
-          offset: t.Optional(t.String()),
-          limit: t.Optional(t.String()),
-        }),
+        query: paginatedNetworkQuerySchema,
       },
     )
     .get('/blocks/:ref', ({ params, query }) => service.getBlock(params.ref, query.network), {
@@ -53,9 +62,7 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
       params: t.Object({
         ref: t.String(),
       }),
-      query: t.Object({
-        network: t.Optional(t.String()),
-      }),
+      query: networkQuerySchema,
     })
     .get(
       '/transactions/:txid',
@@ -67,9 +74,7 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
         params: t.Object({
           txid: t.String(),
         }),
-        query: t.Object({
-          network: t.Optional(t.String()),
-        }),
+        query: networkQuerySchema,
       },
     )
     .get(
@@ -77,56 +82,34 @@ export function buildExplorerQueryHttp(service: ExplorerQueryService) {
       ({ params, query }) => service.getAddress(params.address, query.network),
       {
         detail: describeProtected('Returns an address summary with investigation overlay data.'),
-        params: t.Object({
-          address: t.String(),
-        }),
-        query: t.Object({
-          network: t.Optional(t.String()),
-        }),
+        params: addressParamsSchema,
+        query: networkQuerySchema,
       },
     )
     .get(
       '/addresses/:address/transactions',
-      ({ params, query }) =>
-        service.listAddressTransactions(
-          params.address,
-          query.network,
-          parsePagination(query.offset),
-          parsePagination(query.limit),
-        ),
+      ({ params, query }) => {
+        const { limit, offset } = readPagination(query);
+        return service.listAddressTransactions(params.address, query.network, offset, limit);
+      },
       {
         detail: describeProtected(
           'Returns reverse-chronological transaction history for a Dogecoin address.',
         ),
-        params: t.Object({
-          address: t.String(),
-        }),
-        query: t.Object({
-          network: t.Optional(t.String()),
-          offset: t.Optional(t.String()),
-          limit: t.Optional(t.String()),
-        }),
+        params: addressParamsSchema,
+        query: paginatedNetworkQuerySchema,
       },
     )
     .get(
       '/addresses/:address/utxos',
-      ({ params, query }) =>
-        service.listAddressUtxos(
-          params.address,
-          query.network,
-          parsePagination(query.offset),
-          parsePagination(query.limit),
-        ),
+      ({ params, query }) => {
+        const { limit, offset } = readPagination(query);
+        return service.listAddressUtxos(params.address, query.network, offset, limit);
+      },
       {
         detail: describeProtected('Returns current spendable UTXOs for a Dogecoin address.'),
-        params: t.Object({
-          address: t.String(),
-        }),
-        query: t.Object({
-          network: t.Optional(t.String()),
-          offset: t.Optional(t.String()),
-          limit: t.Optional(t.String()),
-        }),
+        params: addressParamsSchema,
+        query: paginatedNetworkQuerySchema,
       },
     );
 }

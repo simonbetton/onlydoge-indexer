@@ -1,16 +1,8 @@
 import { protectedOperationDetail } from '@onlydoge/access-control';
+import { parseNonNegativeInteger } from '@onlydoge/shared-kernel';
 import { Elysia, t } from 'elysia';
 
 import type { NetworkCatalogService } from '../application/network-catalog-service';
-
-function parsePagination(value: string | undefined): number | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
-}
 
 export function buildNetworkCatalogHttp(service: NetworkCatalogService) {
   return new Elysia()
@@ -31,7 +23,10 @@ export function buildNetworkCatalogHttp(service: NetworkCatalogService) {
         .get(
           '/',
           async ({ query }) =>
-            service.listNetworks(parsePagination(query.offset), parsePagination(query.limit)),
+            service.listNetworks(
+              parseNonNegativeInteger(query.offset),
+              parseNonNegativeInteger(query.limit),
+            ),
           {
             detail: protectedOperationDetail,
           },
@@ -87,7 +82,10 @@ export function buildNetworkCatalogHttp(service: NetworkCatalogService) {
         .get(
           '/',
           async ({ query }) =>
-            service.listTokens(parsePagination(query.offset), parsePagination(query.limit)),
+            service.listTokens(
+              parseNonNegativeInteger(query.offset),
+              parseNonNegativeInteger(query.limit),
+            ),
           {
             detail: protectedOperationDetail,
           },

@@ -1,6 +1,6 @@
 import type { ProjectionUtxoOutput } from '@onlydoge/indexing-pipeline';
 import type { InvestigationMetadataPort } from '@onlydoge/investigation-query';
-import type { PrimaryId, RiskLevel } from '@onlydoge/shared-kernel';
+import type { PrimaryId } from '@onlydoge/shared-kernel';
 
 export interface ExplorerActiveNetworkPort {
   listActiveNetworks(): Promise<
@@ -90,11 +90,4 @@ export interface ExplorerWarehousePort {
       blockHeight: number;
     }>
   >;
-}
-
-export interface ExplorerLabelRef {
-  entity: string;
-  name: string | null;
-  riskLevel: RiskLevel;
-  tags: string[];
 }

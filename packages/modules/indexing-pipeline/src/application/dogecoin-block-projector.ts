@@ -2,48 +2,27 @@ import { InfrastructureError } from '@onlydoge/shared-kernel';
 
 import type { ProjectionStateStorePort } from '../contracts/ports';
 import {
-  addAmountBase,
+  allocateProRataAmount,
   formatAmountBase,
   fromDecimalUnits,
   parseAmountBase,
 } from '../domain/amounts';
+import {
+  type DogecoinTransaction,
+  type DogecoinVout,
+  extractDogecoinOutputAddress,
+  isDogecoinTransaction,
+  type ParsedDogecoinBlock,
+} from '../domain/dogecoin-block';
 import type {
   BlockProjectionBatch,
-  DirectLinkDelta,
   ProjectionUtxoOutput,
   TransferFact,
 } from '../domain/projection-models';
+import { buildDirectLinkDeltas } from '../domain/projection-models';
+import { readSnapshotItems, readSnapshotString, requireSnapshotRecord } from './block-snapshot';
 
-interface DogecoinVin {
-  coinbase?: string;
-  txid?: string;
-  vout?: number;
-}
-
-interface DogecoinVout {
-  n?: number;
-  value?: number | string;
-  scriptPubKey?: {
-    address?: string;
-    addresses?: string[];
-    type?: string;
-  };
-}
-
-interface DogecoinTransaction {
-  txid?: string;
-  vin?: DogecoinVin[];
-  vout?: DogecoinVout[];
-}
-
-interface ParsedDogecoinBlock {
-  hash: string;
-  height: number;
-  time: number;
-  tx: DogecoinTransaction[];
-}
-
-interface ProjectionState {
+export interface ProjectionState {
   localOutputs?: Map<string, ProjectionUtxoOutput>;
   persistedOutputs?: Map<string, ProjectionUtxoOutput>;
 }
@@ -55,12 +34,153 @@ export interface DogecoinProjectOptions {
   maxTransferInputAddresses?: number;
 }
 
+type ResolvedDogecoinInput = {
+  address: string;
+  amountBase: string;
+  outputKey: string;
+};
+
+type ProjectedDogecoinOutput = {
+  address: string;
+  amountBase: string;
+  isSpendable: boolean;
+};
+
+type DogecoinProjectionAccumulator = Pick<
+  BlockProjectionBatch,
+  'addressMovements' | 'utxoCreates' | 'utxoSpends'
+> & {
+  transfers: TransferFact[];
+};
+
+type DogecoinTransactionContext = {
+  accumulator: DogecoinProjectionAccumulator;
+  block: ParsedDogecoinBlock;
+  localOutputs: Map<string, ProjectionUtxoOutput>;
+  networkId: number;
+  options: Required<DogecoinProjectOptions>;
+  persistedOutputs: Map<string, ProjectionUtxoOutput> | undefined;
+  transaction: DogecoinTransaction;
+  txIndex: number;
+  txid: string;
+};
+
+type DogecoinVin = NonNullable<DogecoinTransaction['vin']>[number];
+
+type DogecoinTransferInput = {
+  blockHash: string;
+  blockHeight: number;
+  blockTime: number;
+  inputs: ResolvedDogecoinInput[];
+  maxTransferEdges: number;
+  maxTransferInputAddresses: number;
+  networkId: number;
+  outputs: ProjectedDogecoinOutput[];
+  txIndex: number;
+  txid: string;
+};
+
+type DogecoinAddressMovementBase = Omit<
+  BlockProjectionBatch['addressMovements'][number],
+  'derivationMethod' | 'direction' | 'movementId' | 'outputKey'
+>;
+
+type DogecoinTransferBasis = {
+  confidence: number;
+  inputAddresses: string[];
+  inputTotals: Map<string, bigint>;
+  totalInput: bigint;
+  uniqueOutputs: number;
+};
+
 const defaultProjectOptions: Required<DogecoinProjectOptions> = {
   includeDirectLinkDeltas: true,
   includeTransfers: true,
   maxTransferEdges: 1024,
   maxTransferInputAddresses: 64,
 };
+
+function resolveDogecoinProjectOptions(
+  options: DogecoinProjectOptions | undefined,
+): Required<DogecoinProjectOptions> {
+  return {
+    ...defaultProjectOptions,
+    ...(options ?? {}),
+  };
+}
+
+function resolveProjectionState(state: ProjectionState | undefined): Required<ProjectionState> {
+  return {
+    localOutputs: projectionLocalOutputs(state),
+    persistedOutputs: projectionPersistedOutputs(state),
+  };
+}
+
+function projectionLocalOutputs(
+  state: ProjectionState | undefined,
+): Map<string, ProjectionUtxoOutput> {
+  return state?.localOutputs ?? new Map<string, ProjectionUtxoOutput>();
+}
+
+function projectionPersistedOutputs(
+  state: ProjectionState | undefined,
+): Map<string, ProjectionUtxoOutput> {
+  return state?.persistedOutputs ?? new Map<string, ProjectionUtxoOutput>();
+}
+
+function dogecoinDirectLinkDeltas(
+  networkId: number,
+  blockHeight: number,
+  transfers: TransferFact[],
+  options: Required<DogecoinProjectOptions>,
+): BlockProjectionBatch['directLinkDeltas'] {
+  if (!options.includeDirectLinkDeltas) {
+    return [];
+  }
+
+  return buildDirectLinkDeltas(networkId, blockHeight, transfers, { includeChange: false });
+}
+
+function hasTransferEndpoints(input: DogecoinTransferInput): boolean {
+  return input.inputs.length > 0 && input.outputs.length > 0;
+}
+
+function dogecoinInputTotals(inputs: ResolvedDogecoinInput[]): Map<string, bigint> {
+  const inputTotals = new Map<string, bigint>();
+  for (const item of inputs) {
+    const current = inputTotals.get(item.address) ?? 0n;
+    inputTotals.set(item.address, current + parseAmountBase(item.amountBase));
+  }
+
+  return inputTotals;
+}
+
+function exceedsTransferGuardrail(
+  input: DogecoinTransferInput,
+  inputAddresses: string[],
+  estimatedEdges: number,
+): boolean {
+  return (
+    inputAddresses.length > input.maxTransferInputAddresses ||
+    estimatedEdges > input.maxTransferEdges
+  );
+}
+
+function dogecoinTransferGuardrailMessage(
+  input: DogecoinTransferInput,
+  inputAddresses: string[],
+  estimatedEdges: number,
+): string {
+  return `[onlydoge] dogecoin transfer derivation skipped tx=${input.txid} inputAddresses=${inputAddresses.length} outputs=${input.outputs.length} estimatedEdges=${estimatedEdges} reason=guardrail`;
+}
+
+function dogecoinInputs(transaction: DogecoinTransaction): DogecoinVin[] {
+  return transaction.vin ?? [];
+}
+
+function dogecoinOutputs(transaction: DogecoinTransaction): DogecoinVout[] {
+  return transaction.vout ?? [];
+}
 
 export class DogecoinBlockProjector {
   public constructor(private readonly warehouse: ProjectionStateStorePort) {}
@@ -71,158 +191,29 @@ export class DogecoinBlockProjector {
     state?: ProjectionState,
     options?: DogecoinProjectOptions,
   ): Promise<BlockProjectionBatch> {
-    const resolvedOptions = {
-      ...defaultProjectOptions,
-      ...(options ?? {}),
-    };
+    const resolvedOptions = resolveDogecoinProjectOptions(options);
     const block = this.parseBlock(snapshot);
-    const utxoCreates: ProjectionUtxoOutput[] = [];
-    const utxoSpends: BlockProjectionBatch['utxoSpends'] = [];
-    const addressMovements: BlockProjectionBatch['addressMovements'] = [];
-    const transfers: TransferFact[] = [];
-    const localOutputs = state?.localOutputs ?? new Map<string, ProjectionUtxoOutput>();
-    const persistedOutputs = state?.persistedOutputs;
+    const accumulator: DogecoinProjectionAccumulator = {
+      utxoCreates: [],
+      utxoSpends: [],
+      addressMovements: [],
+      transfers: [],
+    };
+    const projectionState = resolveProjectionState(state);
 
     for (const [txIndex, transaction] of block.tx.entries()) {
       const txid = this.requireString(transaction.txid, 'tx.txid');
-      const inputs = transaction.vin ?? [];
-      const outputs = transaction.vout ?? [];
-      const isCoinbase = inputs.some((input) => Boolean(input.coinbase));
-      const resolvedInputs: Array<{
-        address: string;
-        amountBase: string;
-        outputKey: string;
-      }> = [];
-      const projectedOutputs: Array<{
-        address: string;
-        amountBase: string;
-        isSpendable: boolean;
-      }> = [];
-
-      for (const [entryIndex, input] of inputs.entries()) {
-        if (input.coinbase) {
-          continue;
-        }
-
-        const prevTxid = this.requireString(input.txid, 'vin.txid');
-        const prevVout = this.requireNumber(input.vout, 'vin.vout');
-        const outputKey = `${prevTxid}:${prevVout}`;
-        const resolved = await this.resolveOutput(
-          networkId,
-          block.height,
-          txid,
-          entryIndex,
-          outputKey,
-          localOutputs,
-          persistedOutputs,
-        );
-        const resolvedOutput = resolved.output;
-        if (resolved.isLocal) {
-          resolvedOutput.spentByTxid = txid;
-          resolvedOutput.spentInBlock = block.height;
-          resolvedOutput.spentInputIndex = entryIndex;
-        } else {
-          utxoSpends.push({
-            outputKey,
-            spentByTxid: txid,
-            spentInBlock: block.height,
-            spentInputIndex: entryIndex,
-          });
-        }
-        resolvedInputs.push({
-          address: resolvedOutput.address,
-          amountBase: resolvedOutput.valueBase,
-          outputKey,
-        });
-        addressMovements.push({
-          movementId: `${txid}:vin:${entryIndex}`,
-          networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-          txid,
-          txIndex,
-          entryIndex,
-          address: resolvedOutput.address,
-          assetAddress: '',
-          direction: 'debit',
-          amountBase: resolvedOutput.valueBase,
-          outputKey,
-          derivationMethod: 'dogecoin_utxo_input_v1',
-        });
-      }
-
-      for (const [entryIndex, output] of outputs.entries()) {
-        const amountBase = fromDecimalUnits(this.requireAmount(output.value), 8);
-        const outputKey = `${txid}:${entryIndex}`;
-        const scriptType = output.scriptPubKey?.type?.trim() ?? '';
-        const address = this.extractOutputAddress(output);
-        const isSpendable = Boolean(address);
-        const createdOutput: ProjectionUtxoOutput = {
-          networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-          txid,
-          txIndex,
-          vout: this.requireNumber(output.n ?? entryIndex, 'vout.n'),
-          outputKey,
-          address,
-          scriptType,
-          valueBase: amountBase,
-          isCoinbase,
-          isSpendable,
-          spentByTxid: null,
-          spentInBlock: null,
-          spentInputIndex: null,
-        };
-
-        utxoCreates.push(createdOutput);
-        localOutputs.set(outputKey, createdOutput);
-
-        if (!isSpendable) {
-          continue;
-        }
-
-        projectedOutputs.push({
-          address,
-          amountBase,
-          isSpendable,
-        });
-        addressMovements.push({
-          movementId: `${txid}:vout:${entryIndex}`,
-          networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-          txid,
-          txIndex,
-          entryIndex,
-          address,
-          assetAddress: '',
-          direction: 'credit',
-          amountBase,
-          outputKey,
-          derivationMethod: 'dogecoin_utxo_output_v1',
-        });
-      }
-
-      if (resolvedOptions.includeTransfers) {
-        transfers.push(
-          ...this.projectTransfers({
-            txid,
-            txIndex,
-            networkId,
-            blockHeight: block.height,
-            blockHash: block.hash,
-            blockTime: block.time,
-            inputs: resolvedInputs,
-            outputs: projectedOutputs,
-            maxTransferEdges: resolvedOptions.maxTransferEdges,
-            maxTransferInputAddresses: resolvedOptions.maxTransferInputAddresses,
-          }),
-        );
-      }
+      await this.projectTransaction({
+        accumulator,
+        block,
+        localOutputs: projectionState.localOutputs,
+        networkId,
+        options: resolvedOptions,
+        persistedOutputs: projectionState.persistedOutputs,
+        transaction,
+        txIndex,
+        txid,
+      });
     }
 
     return {
@@ -230,13 +221,16 @@ export class DogecoinBlockProjector {
       blockHeight: block.height,
       blockHash: block.hash,
       blockTime: block.time,
-      utxoCreates,
-      utxoSpends,
-      addressMovements,
-      transfers,
-      directLinkDeltas: resolvedOptions.includeDirectLinkDeltas
-        ? this.buildDirectLinkDeltas(networkId, block.height, transfers)
-        : [],
+      utxoCreates: accumulator.utxoCreates,
+      utxoSpends: accumulator.utxoSpends,
+      addressMovements: accumulator.addressMovements,
+      transfers: accumulator.transfers,
+      directLinkDeltas: dogecoinDirectLinkDeltas(
+        networkId,
+        block.height,
+        accumulator.transfers,
+        resolvedOptions,
+      ),
     };
   }
 
@@ -248,155 +242,323 @@ export class DogecoinBlockProjector {
     const externalOutputKeys = new Set<string>();
 
     for (const transaction of block.tx) {
-      const txid = this.requireString(transaction.txid, 'tx.txid');
-      for (const input of transaction.vin ?? []) {
-        if (input.coinbase) {
-          continue;
-        }
-
-        const prevTxid = this.requireString(input.txid, 'vin.txid');
-        const prevVout = this.requireNumber(input.vout, 'vin.vout');
-        const outputKey = `${prevTxid}:${prevVout}`;
-        if (!knownOutputKeys.has(outputKey)) {
-          externalOutputKeys.add(outputKey);
-        }
-      }
-
-      for (const [entryIndex] of (transaction.vout ?? []).entries()) {
-        knownOutputKeys.add(`${txid}:${entryIndex}`);
-      }
+      this.collectTransactionExternalOutputKeys(transaction, knownOutputKeys, externalOutputKeys);
     }
 
     return [...externalOutputKeys];
   }
 
-  private buildDirectLinkDeltas(
-    networkId: number,
-    blockHeight: number,
-    transfers: TransferFact[],
-  ): DirectLinkDelta[] {
-    const result = new Map<string, DirectLinkDelta>();
-    for (const transfer of transfers) {
-      if (transfer.isChange) {
-        continue;
-      }
-
-      const key = [transfer.fromAddress, transfer.toAddress, transfer.assetAddress].join(':');
-      const current = result.get(key);
-      if (current) {
-        current.transferCount += 1;
-        current.totalAmountBase = addAmountBase(current.totalAmountBase, transfer.amountBase);
-        current.lastSeenBlockHeight = blockHeight;
-        continue;
-      }
-
-      result.set(key, {
-        networkId,
-        fromAddress: transfer.fromAddress,
-        toAddress: transfer.toAddress,
-        assetAddress: transfer.assetAddress,
-        transferCount: 1,
-        totalAmountBase: transfer.amountBase,
-        firstSeenBlockHeight: blockHeight,
-        lastSeenBlockHeight: blockHeight,
-      });
+  private collectTransactionExternalOutputKeys(
+    transaction: DogecoinTransaction,
+    knownOutputKeys: Set<string>,
+    externalOutputKeys: Set<string>,
+  ): void {
+    const txid = this.requireString(transaction.txid, 'tx.txid');
+    for (const input of dogecoinInputs(transaction)) {
+      this.collectInputExternalOutputKey(input, knownOutputKeys, externalOutputKeys);
     }
 
-    return [...result.values()];
+    for (const [entryIndex] of dogecoinOutputs(transaction).entries()) {
+      knownOutputKeys.add(`${txid}:${entryIndex}`);
+    }
+  }
+
+  private collectInputExternalOutputKey(
+    input: DogecoinVin,
+    knownOutputKeys: Set<string>,
+    externalOutputKeys: Set<string>,
+  ): void {
+    if (input.coinbase) {
+      return;
+    }
+
+    const outputKey = `${this.requireString(input.txid, 'vin.txid')}:${this.requireNumber(input.vout, 'vin.vout')}`;
+    if (!knownOutputKeys.has(outputKey)) {
+      externalOutputKeys.add(outputKey);
+    }
   }
 
   private parseBlock(snapshot: Record<string, unknown>): ParsedDogecoinBlock {
-    const candidate = this.requireRecord(snapshot.block, 'block');
+    const candidate = requireSnapshotRecord(snapshot.block, 'block', 'dogecoin');
     return {
-      hash: this.requireString(this.readString(candidate, 'hash'), 'block.hash'),
+      hash: this.requireString(readSnapshotString(candidate, 'hash'), 'block.hash'),
       height: this.requireNumber(this.readNumber(candidate, 'height'), 'block.height'),
       time: this.requireNumber(this.readNumber(candidate, 'time'), 'block.time'),
-      tx: this.readTransactions(candidate.tx),
+      tx: readSnapshotItems(candidate.tx, isDogecoinTransaction),
     };
   }
 
-  private extractOutputAddress(output: DogecoinVout): string {
-    const direct = output.scriptPubKey?.address?.trim();
-    if (direct) {
-      return direct;
+  private async projectTransaction(context: DogecoinTransactionContext): Promise<void> {
+    const inputs = context.transaction.vin ?? [];
+    const outputs = context.transaction.vout ?? [];
+    const isCoinbase = inputs.some((input) => Boolean(input.coinbase));
+    const resolvedInputs = await this.projectTransactionInputs(context, inputs);
+    const projectedOutputs = this.projectTransactionOutputs(context, outputs, isCoinbase);
+
+    if (!context.options.includeTransfers) {
+      return;
     }
 
-    const first = output.scriptPubKey?.addresses?.find((value) => value.trim());
-    return first?.trim() ?? '';
+    context.accumulator.transfers.push(
+      ...this.projectTransfers({
+        txid: context.txid,
+        txIndex: context.txIndex,
+        networkId: context.networkId,
+        blockHeight: context.block.height,
+        blockHash: context.block.hash,
+        blockTime: context.block.time,
+        inputs: resolvedInputs,
+        outputs: projectedOutputs,
+        maxTransferEdges: context.options.maxTransferEdges,
+        maxTransferInputAddresses: context.options.maxTransferInputAddresses,
+      }),
+    );
   }
 
-  private projectTransfers(input: {
-    blockHash: string;
-    blockHeight: number;
-    blockTime: number;
-    inputs: Array<{ address: string; amountBase: string; outputKey: string }>;
-    maxTransferEdges: number;
-    maxTransferInputAddresses: number;
-    networkId: number;
-    outputs: Array<{ address: string; amountBase: string; isSpendable: boolean }>;
-    txIndex: number;
-    txid: string;
-  }): TransferFact[] {
-    if (input.inputs.length === 0 || input.outputs.length === 0) {
+  private async projectTransactionInputs(
+    context: DogecoinTransactionContext,
+    inputs: DogecoinVin[],
+  ): Promise<ResolvedDogecoinInput[]> {
+    const resolvedInputs: ResolvedDogecoinInput[] = [];
+    for (const [entryIndex, input] of inputs.entries()) {
+      if (input.coinbase) {
+        continue;
+      }
+
+      resolvedInputs.push(await this.projectTransactionInput(context, input, entryIndex));
+    }
+
+    return resolvedInputs;
+  }
+
+  private async projectTransactionInput(
+    context: DogecoinTransactionContext,
+    input: DogecoinVin,
+    entryIndex: number,
+  ): Promise<ResolvedDogecoinInput> {
+    const prevTxid = this.requireString(input.txid, 'vin.txid');
+    const prevVout = this.requireNumber(input.vout, 'vin.vout');
+    const outputKey = `${prevTxid}:${prevVout}`;
+    const resolved = await this.resolveOutput(
+      context.networkId,
+      context.block.height,
+      context.txid,
+      entryIndex,
+      outputKey,
+      context.localOutputs,
+      context.persistedOutputs,
+    );
+
+    this.recordInputSpend(context, resolved, outputKey, entryIndex);
+    context.accumulator.addressMovements.push(
+      this.inputAddressMovement(context, resolved.output, outputKey, entryIndex),
+    );
+
+    return {
+      address: resolved.output.address,
+      amountBase: resolved.output.valueBase,
+      outputKey,
+    };
+  }
+
+  private recordInputSpend(
+    context: DogecoinTransactionContext,
+    resolved: { isLocal: boolean; output: ProjectionUtxoOutput },
+    outputKey: string,
+    entryIndex: number,
+  ): void {
+    if (resolved.isLocal) {
+      this.markLocalSpend(resolved.output, context.block.height, context.txid, entryIndex);
+      return;
+    }
+
+    context.accumulator.utxoSpends.push({
+      outputKey,
+      spentByTxid: context.txid,
+      spentInBlock: context.block.height,
+      spentInputIndex: entryIndex,
+    });
+  }
+
+  private markLocalSpend(
+    output: ProjectionUtxoOutput,
+    blockHeight: number,
+    txid: string,
+    inputIndex: number,
+  ): void {
+    output.spentByTxid = txid;
+    output.spentInBlock = blockHeight;
+    output.spentInputIndex = inputIndex;
+  }
+
+  private inputAddressMovement(
+    context: DogecoinTransactionContext,
+    output: ProjectionUtxoOutput,
+    outputKey: string,
+    entryIndex: number,
+  ): BlockProjectionBatch['addressMovements'][number] {
+    return {
+      ...this.addressMovementBase(context, output, entryIndex),
+      movementId: `${context.txid}:vin:${entryIndex}`,
+      direction: 'debit',
+      outputKey,
+      derivationMethod: 'dogecoin_utxo_input_v1',
+    };
+  }
+
+  private projectTransactionOutputs(
+    context: DogecoinTransactionContext,
+    outputs: DogecoinVout[],
+    isCoinbase: boolean,
+  ): ProjectedDogecoinOutput[] {
+    const projectedOutputs: ProjectedDogecoinOutput[] = [];
+    for (const [entryIndex, output] of outputs.entries()) {
+      const createdOutput = this.createUtxoOutput(context, output, entryIndex, isCoinbase);
+      context.accumulator.utxoCreates.push(createdOutput);
+      context.localOutputs.set(createdOutput.outputKey, createdOutput);
+      this.projectSpendableOutput(context, createdOutput, entryIndex, projectedOutputs);
+    }
+
+    return projectedOutputs;
+  }
+
+  private createUtxoOutput(
+    context: DogecoinTransactionContext,
+    output: DogecoinVout,
+    entryIndex: number,
+    isCoinbase: boolean,
+  ): ProjectionUtxoOutput {
+    const amountBase = fromDecimalUnits(this.requireAmount(output.value), 8);
+    const address = extractDogecoinOutputAddress(output);
+
+    return {
+      networkId: context.networkId,
+      blockHeight: context.block.height,
+      blockHash: context.block.hash,
+      blockTime: context.block.time,
+      txid: context.txid,
+      txIndex: context.txIndex,
+      vout: this.requireNumber(output.n ?? entryIndex, 'vout.n'),
+      outputKey: `${context.txid}:${entryIndex}`,
+      address,
+      scriptType: output.scriptPubKey?.type?.trim() ?? '',
+      valueBase: amountBase,
+      isCoinbase,
+      isSpendable: Boolean(address),
+      spentByTxid: null,
+      spentInBlock: null,
+      spentInputIndex: null,
+    };
+  }
+
+  private projectSpendableOutput(
+    context: DogecoinTransactionContext,
+    output: ProjectionUtxoOutput,
+    entryIndex: number,
+    projectedOutputs: ProjectedDogecoinOutput[],
+  ): void {
+    if (!output.isSpendable) {
+      return;
+    }
+
+    projectedOutputs.push({
+      address: output.address,
+      amountBase: output.valueBase,
+      isSpendable: output.isSpendable,
+    });
+    context.accumulator.addressMovements.push(
+      this.outputAddressMovement(context, output, entryIndex),
+    );
+  }
+
+  private outputAddressMovement(
+    context: DogecoinTransactionContext,
+    output: ProjectionUtxoOutput,
+    entryIndex: number,
+  ): BlockProjectionBatch['addressMovements'][number] {
+    return {
+      ...this.addressMovementBase(context, output, entryIndex),
+      movementId: `${context.txid}:vout:${entryIndex}`,
+      direction: 'credit',
+      outputKey: output.outputKey,
+      derivationMethod: 'dogecoin_utxo_output_v1',
+    };
+  }
+
+  private addressMovementBase(
+    context: DogecoinTransactionContext,
+    output: ProjectionUtxoOutput,
+    entryIndex: number,
+  ): DogecoinAddressMovementBase {
+    return {
+      networkId: context.networkId,
+      blockHeight: context.block.height,
+      blockHash: context.block.hash,
+      blockTime: context.block.time,
+      txid: context.txid,
+      txIndex: context.txIndex,
+      entryIndex,
+      address: output.address,
+      assetAddress: '',
+      amountBase: output.valueBase,
+    };
+  }
+
+  private projectTransfers(input: DogecoinTransferInput): TransferFact[] {
+    const basis = this.buildTransferBasis(input);
+    if (!basis) {
       return [];
     }
 
-    const inputTotals = new Map<string, bigint>();
-    for (const item of input.inputs) {
-      const current = inputTotals.get(item.address) ?? 0n;
-      inputTotals.set(item.address, current + parseAmountBase(item.amountBase));
+    return this.buildProRataTransfers(input, basis);
+  }
+
+  private buildTransferBasis(input: DogecoinTransferInput): DogecoinTransferBasis | null {
+    if (!hasTransferEndpoints(input)) {
+      return null;
     }
 
+    const inputTotals = dogecoinInputTotals(input.inputs);
     const totalInput = [...inputTotals.values()].reduce((sum, value) => sum + value, 0n);
     const inputAddresses = [...inputTotals.keys()].sort((left, right) => left.localeCompare(right));
     const estimatedEdges = inputAddresses.length * input.outputs.length;
-    if (
-      inputAddresses.length > input.maxTransferInputAddresses ||
-      estimatedEdges > input.maxTransferEdges
-    ) {
-      console.warn(
-        `[onlydoge] dogecoin transfer derivation skipped tx=${input.txid} inputAddresses=${inputAddresses.length} outputs=${input.outputs.length} estimatedEdges=${estimatedEdges} reason=guardrail`,
-      );
-      return [];
+    if (exceedsTransferGuardrail(input, inputAddresses, estimatedEdges)) {
+      console.warn(dogecoinTransferGuardrailMessage(input, inputAddresses, estimatedEdges));
+      return null;
     }
 
     const uniqueOutputs = [...new Set(input.outputs.map((output) => output.address))].length;
     const confidence = inputAddresses.length <= 1 ? 1 : 0.5;
+
+    return {
+      confidence,
+      inputAddresses,
+      inputTotals,
+      totalInput,
+      uniqueOutputs,
+    };
+  }
+
+  private buildProRataTransfers(
+    input: DogecoinTransferInput,
+    basis: DogecoinTransferBasis,
+  ): TransferFact[] {
     const transfers: TransferFact[] = [];
     let transferIndex = 0;
 
     for (const output of input.outputs) {
-      const allocations = this.allocateOutputAmount(
-        output.amountBase,
-        inputAddresses,
-        inputTotals,
-        totalInput,
+      const allocations = allocateProRataAmount(
+        parseAmountBase(output.amountBase),
+        basis.inputAddresses,
+        basis.inputTotals,
+        basis.totalInput,
       );
-      const isChange = inputTotals.has(output.address);
       for (const allocation of allocations) {
         if (allocation.amount <= 0n) {
           continue;
         }
 
-        transfers.push({
-          transferId: `${input.txid}:${transferIndex}`,
-          networkId: input.networkId,
-          blockHeight: input.blockHeight,
-          blockHash: input.blockHash,
-          blockTime: input.blockTime,
-          txid: input.txid,
-          txIndex: input.txIndex,
-          transferIndex,
-          assetAddress: '',
-          fromAddress: allocation.address,
-          toAddress: output.address,
-          amountBase: formatAmountBase(allocation.amount),
-          derivationMethod: 'dogecoin_pro_rata_v1',
-          confidence,
-          isChange,
-          inputAddressCount: inputAddresses.length,
-          outputAddressCount: uniqueOutputs,
-        });
+        transfers.push(this.transferFact(input, basis, output.address, allocation, transferIndex));
         transferIndex += 1;
       }
     }
@@ -404,35 +566,32 @@ export class DogecoinBlockProjector {
     return transfers;
   }
 
-  private allocateOutputAmount(
-    amountBase: string,
-    inputAddresses: string[],
-    inputTotals: Map<string, bigint>,
-    totalInput: bigint,
-  ): Array<{ address: string; amount: bigint }> {
-    const target = parseAmountBase(amountBase);
-    if (totalInput <= 0n) {
-      return [];
-    }
-
-    const allocations: Array<{ address: string; amount: bigint }> = [];
-    let allocated = 0n;
-    for (const [index, address] of inputAddresses.entries()) {
-      if (index === inputAddresses.length - 1) {
-        allocations.push({
-          address,
-          amount: target - allocated,
-        });
-        continue;
-      }
-
-      const contribution = inputTotals.get(address) ?? 0n;
-      const amount = (target * contribution) / totalInput;
-      allocations.push({ address, amount });
-      allocated += amount;
-    }
-
-    return allocations;
+  private transferFact(
+    input: DogecoinTransferInput,
+    basis: DogecoinTransferBasis,
+    toAddress: string,
+    allocation: { address: string; amount: bigint },
+    transferIndex: number,
+  ): TransferFact {
+    return {
+      transferId: `${input.txid}:${transferIndex}`,
+      networkId: input.networkId,
+      blockHeight: input.blockHeight,
+      blockHash: input.blockHash,
+      blockTime: input.blockTime,
+      txid: input.txid,
+      txIndex: input.txIndex,
+      transferIndex,
+      assetAddress: '',
+      fromAddress: allocation.address,
+      toAddress,
+      amountBase: formatAmountBase(allocation.amount),
+      derivationMethod: 'dogecoin_pro_rata_v1',
+      confidence: basis.confidence,
+      isChange: basis.inputTotals.has(toAddress),
+      inputAddressCount: basis.inputAddresses.length,
+      outputAddressCount: basis.uniqueOutputs,
+    };
   }
 
   private async resolveOutput(
@@ -444,34 +603,24 @@ export class DogecoinBlockProjector {
     localOutputs: Map<string, ProjectionUtxoOutput>,
     persistedOutputs?: Map<string, ProjectionUtxoOutput>,
   ): Promise<{ isLocal: boolean; output: ProjectionUtxoOutput }> {
-    const localOutput = localOutputs.get(outputKey);
+    const localOutput = this.resolveLocalOutput(
+      outputKey,
+      localOutputs,
+      spendingBlockHeight,
+      spendingTxid,
+      spendingInputIndex,
+    );
     if (localOutput) {
-      if (
-        localOutput.spentByTxid &&
-        !this.isReplayOfSameSpend(
-          localOutput,
-          spendingBlockHeight,
-          spendingTxid,
-          spendingInputIndex,
-        )
-      ) {
-        throw new InfrastructureError(`dogecoin output already spent in block: ${outputKey}`);
-      }
-
       return { isLocal: true, output: localOutput };
     }
 
-    const persistedOutput =
-      persistedOutputs?.get(outputKey) ??
-      (await this.warehouse.getUtxoOutputs(networkId, [outputKey])).get(outputKey);
+    const persistedOutput = await this.loadPersistedOutput(networkId, outputKey, persistedOutputs);
     if (!persistedOutput) {
       throw new InfrastructureError(`dogecoin output not found: ${outputKey}`);
     }
+
     if (
-      persistedOutput.spentByTxid &&
-      persistedOutput.spentInBlock !== null &&
-      persistedOutput.spentInBlock <= spendingBlockHeight &&
-      !this.isReplayOfSameSpend(
+      this.isConflictingPersistedSpend(
         persistedOutput,
         spendingBlockHeight,
         spendingTxid,
@@ -482,6 +631,74 @@ export class DogecoinBlockProjector {
     }
 
     return { isLocal: false, output: persistedOutput };
+  }
+
+  private resolveLocalOutput(
+    outputKey: string,
+    localOutputs: Map<string, ProjectionUtxoOutput>,
+    spendingBlockHeight: number,
+    spendingTxid: string,
+    spendingInputIndex: number,
+  ): ProjectionUtxoOutput | null {
+    const localOutput = localOutputs.get(outputKey);
+    if (!localOutput) {
+      return null;
+    }
+
+    if (
+      this.isConflictingLocalSpend(
+        localOutput,
+        spendingBlockHeight,
+        spendingTxid,
+        spendingInputIndex,
+      )
+    ) {
+      throw new InfrastructureError(`dogecoin output already spent in block: ${outputKey}`);
+    }
+
+    return localOutput;
+  }
+
+  private async loadPersistedOutput(
+    networkId: number,
+    outputKey: string,
+    persistedOutputs?: Map<string, ProjectionUtxoOutput>,
+  ): Promise<ProjectionUtxoOutput | undefined> {
+    const preloadedOutput = persistedOutputs?.get(outputKey);
+    if (preloadedOutput) {
+      return preloadedOutput;
+    }
+
+    return (await this.warehouse.getUtxoOutputs(networkId, [outputKey])).get(outputKey);
+  }
+
+  private isConflictingLocalSpend(
+    output: ProjectionUtxoOutput,
+    spendingBlockHeight: number,
+    spendingTxid: string,
+    spendingInputIndex: number,
+  ): boolean {
+    return (
+      Boolean(output.spentByTxid) &&
+      !this.isReplayOfSameSpend(output, spendingBlockHeight, spendingTxid, spendingInputIndex)
+    );
+  }
+
+  private isConflictingPersistedSpend(
+    output: ProjectionUtxoOutput,
+    spendingBlockHeight: number,
+    spendingTxid: string,
+    spendingInputIndex: number,
+  ): boolean {
+    if (!output.spentByTxid || output.spentInBlock === null) {
+      return false;
+    }
+
+    if (output.spentInBlock > spendingBlockHeight) {
+      return false;
+    }
+
+    return !this.isReplayOfSameSpend(output, spendingBlockHeight, spendingTxid, spendingInputIndex);
   }
 
   private isReplayOfSameSpend(
@@ -526,25 +743,4 @@ export class DogecoinBlockProjector {
     const value = record[key];
     return typeof value === 'number' ? value : undefined;
   }
-
-  private readString(record: Record<string, unknown>, key: string): string | undefined {
-    const value = record[key];
-    return typeof value === 'string' ? value : undefined;
-  }
-
-  private readTransactions(value: unknown): DogecoinTransaction[] {
-    return Array.isArray(value) ? value.filter(isDogecoinTransaction) : [];
-  }
-
-  private requireRecord(value: unknown, field: string): Record<string, unknown> {
-    if (!value || typeof value !== 'object') {
-      throw new InfrastructureError(`invalid dogecoin field: ${field}`);
-    }
-
-    return Object.fromEntries(Object.entries(value));
-  }
-}
-
-function isDogecoinTransaction(value: unknown): value is DogecoinTransaction {
-  return typeof value === 'object' && value !== null;
 }

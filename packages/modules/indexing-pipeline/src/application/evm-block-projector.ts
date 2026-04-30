@@ -1,11 +1,9 @@
 import { InfrastructureError } from '@onlydoge/shared-kernel';
 
 import { fromHexUnits } from '../domain/amounts';
-import type {
-  BlockProjectionBatch,
-  DirectLinkDelta,
-  TransferFact,
-} from '../domain/projection-models';
+import type { BlockProjectionBatch, TransferFact } from '../domain/projection-models';
+import { buildDirectLinkDeltas } from '../domain/projection-models';
+import { readSnapshotItems, readSnapshotString, requireSnapshotRecord } from './block-snapshot';
 
 const erc20TransferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a9df523b3ef';
 
@@ -34,6 +32,36 @@ interface ParsedEvmBlock {
   transactions: EvmTransaction[];
 }
 
+type EvmProjectedTransfer = {
+  amountBase: string;
+  assetAddress: string;
+  derivationMethod: 'evm_erc20_transfer_v1' | 'evm_native_transfer_v1';
+  fromAddress: string;
+  toAddress: string;
+};
+
+type EvmProjectionAccumulator = {
+  addressMovements: BlockProjectionBatch['addressMovements'];
+  nextTransferIndex: number;
+  transfers: TransferFact[];
+};
+
+type EvmTransactionContext = {
+  accumulator: EvmProjectionAccumulator;
+  block: ParsedEvmBlock;
+  networkId: number;
+  options: Required<EvmProjectOptions>;
+  txIndex: number;
+  txid: string;
+};
+
+type EvmMovementSpec = {
+  creditEntryIndex: number;
+  creditMovementId: string;
+  debitEntryIndex: number;
+  debitMovementId: string;
+};
+
 export interface EvmProjectOptions {
   includeDirectLinkDeltas?: boolean;
   includeTransfers?: boolean;
@@ -44,148 +72,108 @@ const defaultProjectOptions: Required<EvmProjectOptions> = {
   includeTransfers: true,
 };
 
+function resolveEvmProjectOptions(
+  options: EvmProjectOptions | undefined,
+): Required<EvmProjectOptions> {
+  return {
+    ...defaultProjectOptions,
+    ...(options ?? {}),
+  };
+}
+
+function receiptLogs(
+  receiptByHash: Map<string, EvmReceipt & { transactionHash: string }>,
+  txid: string,
+): EvmLog[] {
+  return receiptByHash.get(txid)?.logs ?? [];
+}
+
+function evmDirectLinkDeltas(
+  networkId: number,
+  blockHeight: number,
+  transfers: TransferFact[],
+  options: Required<EvmProjectOptions>,
+): BlockProjectionBatch['directLinkDeltas'] {
+  if (!options.includeDirectLinkDeltas) {
+    return [];
+  }
+
+  return buildDirectLinkDeltas(networkId, blockHeight, transfers);
+}
+
+function normalizeEvmAddress(value: string | null | undefined): string {
+  return value?.trim().toLowerCase() ?? '';
+}
+
+function evmHexValue(value: string | undefined): string {
+  return value?.trim() ?? '0x0';
+}
+
+function hasEvmTransferValue(toAddress: string, amountBase: string): boolean {
+  return Boolean(toAddress) && amountBase !== '0';
+}
+
+function erc20TransferTopics(log: EvmLog): { from: string; to: string } | null {
+  const topics = evmLogTopics(log);
+  if (!isErc20TransferTopic(topics[0]?.toLowerCase())) {
+    return null;
+  }
+
+  return erc20TransferTopicPair(topics[1], topics[2]);
+}
+
+function erc20TransferTopicPair(
+  topic1: string | undefined,
+  topic2: string | undefined,
+): { from: string; to: string } | null {
+  if (!topic1) {
+    return null;
+  }
+  if (!topic2) {
+    return null;
+  }
+
+  return { from: topic1, to: topic2 };
+}
+
+function evmLogTopics(log: EvmLog): string[] {
+  return log.topics ?? [];
+}
+
+function isErc20TransferTopic(topic: string | undefined): boolean {
+  return topic === erc20TransferTopic;
+}
+
 export class EvmBlockProjector {
   public project(
     networkId: number,
     snapshot: Record<string, unknown>,
     options?: EvmProjectOptions,
   ): BlockProjectionBatch {
-    const resolvedOptions = {
-      ...defaultProjectOptions,
-      ...(options ?? {}),
-    };
+    const resolvedOptions = resolveEvmProjectOptions(options);
     const block = this.parseBlock(snapshot);
     const receipts = this.parseReceipts(snapshot);
     const receiptByHash = new Map(receipts.map((receipt) => [receipt.transactionHash, receipt]));
-    const addressMovements: BlockProjectionBatch['addressMovements'] = [];
-    const transfers: TransferFact[] = [];
-    let transferIndex = 0;
+    const accumulator: EvmProjectionAccumulator = {
+      addressMovements: [],
+      transfers: [],
+      nextTransferIndex: 0,
+    };
 
     for (const [txIndex, transaction] of block.transactions.entries()) {
       const txid = this.requireString(transaction.hash, 'tx.hash').toLowerCase();
-      const fromAddress = this.requireString(transaction.from, 'tx.from').toLowerCase();
-      const toAddress = transaction.to?.trim().toLowerCase() ?? '';
-      const valueBase = fromHexUnits(transaction.value?.trim() ?? '0x0');
-
-      if (toAddress && valueBase !== '0') {
-        addressMovements.push({
-          movementId: `${txid}:native:debit`,
+      this.projectTransaction(
+        {
+          accumulator,
+          block,
           networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-          txid,
+          options: resolvedOptions,
           txIndex,
-          entryIndex: 0,
-          address: fromAddress,
-          assetAddress: '',
-          direction: 'debit',
-          amountBase: valueBase,
-          outputKey: null,
-          derivationMethod: 'evm_native_transfer_v1',
-        });
-        addressMovements.push({
-          movementId: `${txid}:native:credit`,
-          networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
           txid,
-          txIndex,
-          entryIndex: 1,
-          address: toAddress,
-          assetAddress: '',
-          direction: 'credit',
-          amountBase: valueBase,
-          outputKey: null,
-          derivationMethod: 'evm_native_transfer_v1',
-        });
-        if (resolvedOptions.includeTransfers) {
-          transfers.push({
-            transferId: `${txid}:${transferIndex}`,
-            networkId,
-            blockHeight: block.height,
-            blockHash: block.hash,
-            blockTime: block.time,
-            txid,
-            txIndex,
-            transferIndex,
-            assetAddress: '',
-            fromAddress,
-            toAddress,
-            amountBase: valueBase,
-            derivationMethod: 'evm_native_transfer_v1',
-            confidence: 1,
-            isChange: false,
-            inputAddressCount: 1,
-            outputAddressCount: 1,
-          });
-          transferIndex += 1;
-        }
-      }
-
-      const receipt = receiptByHash.get(txid);
-      for (const [logIndex, log] of (receipt?.logs ?? []).entries()) {
-        const parsedTransfer = this.parseErc20Transfer(log);
-        if (!parsedTransfer) {
-          continue;
-        }
-
-        addressMovements.push({
-          movementId: `${txid}:erc20:debit:${logIndex}`,
-          networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-          txid,
-          txIndex,
-          entryIndex: logIndex * 2,
-          address: parsedTransfer.fromAddress,
-          assetAddress: parsedTransfer.assetAddress,
-          direction: 'debit',
-          amountBase: parsedTransfer.amountBase,
-          outputKey: null,
-          derivationMethod: 'evm_erc20_transfer_v1',
-        });
-        addressMovements.push({
-          movementId: `${txid}:erc20:credit:${logIndex}`,
-          networkId,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-          txid,
-          txIndex,
-          entryIndex: logIndex * 2 + 1,
-          address: parsedTransfer.toAddress,
-          assetAddress: parsedTransfer.assetAddress,
-          direction: 'credit',
-          amountBase: parsedTransfer.amountBase,
-          outputKey: null,
-          derivationMethod: 'evm_erc20_transfer_v1',
-        });
-        if (resolvedOptions.includeTransfers) {
-          transfers.push({
-            transferId: `${txid}:${transferIndex}`,
-            networkId,
-            blockHeight: block.height,
-            blockHash: block.hash,
-            blockTime: block.time,
-            txid,
-            txIndex,
-            transferIndex,
-            assetAddress: parsedTransfer.assetAddress,
-            fromAddress: parsedTransfer.fromAddress,
-            toAddress: parsedTransfer.toAddress,
-            amountBase: parsedTransfer.amountBase,
-            derivationMethod: 'evm_erc20_transfer_v1',
-            confidence: 1,
-            isChange: false,
-            inputAddressCount: 1,
-            outputAddressCount: 1,
-          });
-          transferIndex += 1;
-        }
-      }
+        },
+        transaction,
+        receiptLogs(receiptByHash, txid),
+      );
     }
 
     return {
@@ -195,78 +183,160 @@ export class EvmBlockProjector {
       blockTime: block.time,
       utxoCreates: [],
       utxoSpends: [],
-      addressMovements,
-      transfers,
-      directLinkDeltas: resolvedOptions.includeDirectLinkDeltas
-        ? this.buildDirectLinkDeltas(networkId, block.height, transfers)
-        : [],
+      addressMovements: accumulator.addressMovements,
+      transfers: accumulator.transfers,
+      directLinkDeltas: evmDirectLinkDeltas(
+        networkId,
+        block.height,
+        accumulator.transfers,
+        resolvedOptions,
+      ),
     };
   }
 
-  private buildDirectLinkDeltas(
-    networkId: number,
-    blockHeight: number,
-    transfers: TransferFact[],
-  ): DirectLinkDelta[] {
-    const result = new Map<string, DirectLinkDelta>();
-    for (const transfer of transfers) {
-      const key = [transfer.fromAddress, transfer.toAddress, transfer.assetAddress].join(':');
-      const current = result.get(key);
-      if (current) {
-        current.transferCount += 1;
-        current.totalAmountBase = (
-          BigInt(current.totalAmountBase) + BigInt(transfer.amountBase)
-        ).toString();
-        current.lastSeenBlockHeight = blockHeight;
-        continue;
-      }
-
-      result.set(key, {
-        networkId,
-        fromAddress: transfer.fromAddress,
-        toAddress: transfer.toAddress,
-        assetAddress: transfer.assetAddress,
-        transferCount: 1,
-        totalAmountBase: transfer.amountBase,
-        firstSeenBlockHeight: blockHeight,
-        lastSeenBlockHeight: blockHeight,
-      });
+  private projectTransaction(
+    context: EvmTransactionContext,
+    transaction: EvmTransaction,
+    logs: EvmLog[],
+  ): void {
+    const nativeTransfer = this.parseNativeTransfer(transaction);
+    if (nativeTransfer) {
+      this.projectTransfer(context, nativeTransfer, nativeMovementSpec(context.txid));
     }
 
-    return [...result.values()];
+    this.projectErc20Transfers(context, logs);
   }
 
-  private parseBlock(snapshot: Record<string, unknown>): ParsedEvmBlock {
-    const candidate = this.requireRecord(snapshot.block, 'block');
-    return {
-      hash: this.requireString(this.readString(candidate, 'hash'), 'block.hash').toLowerCase(),
-      height: Number(
-        BigInt(this.requireString(this.readString(candidate, 'number'), 'block.number')),
-      ),
-      time: Number(
-        BigInt(this.requireString(this.readString(candidate, 'timestamp'), 'block.timestamp')),
-      ),
-      transactions: this.readTransactions(candidate.transactions),
-    };
-  }
+  private parseNativeTransfer(transaction: EvmTransaction): EvmProjectedTransfer | null {
+    const fromAddress = this.requireString(transaction.from, 'tx.from').toLowerCase();
+    const toAddress = normalizeEvmAddress(transaction.to);
+    const amountBase = fromHexUnits(evmHexValue(transaction.value));
 
-  private parseErc20Transfer(log: EvmLog): {
-    amountBase: string;
-    assetAddress: string;
-    fromAddress: string;
-    toAddress: string;
-  } | null {
-    const topic0 = log.topics?.[0]?.toLowerCase();
-    const topic1 = log.topics?.[1];
-    const topic2 = log.topics?.[2];
-    if (topic0 !== erc20TransferTopic || !topic1 || !topic2) {
+    if (!hasEvmTransferValue(toAddress, amountBase)) {
       return null;
     }
 
-    const fromAddress = this.topicAddress(topic1);
-    const toAddress = this.topicAddress(topic2);
+    return {
+      amountBase,
+      assetAddress: '',
+      derivationMethod: 'evm_native_transfer_v1',
+      fromAddress,
+      toAddress,
+    };
+  }
+
+  private projectErc20Transfers(context: EvmTransactionContext, logs: EvmLog[]): void {
+    for (const [logIndex, log] of logs.entries()) {
+      const parsedTransfer = this.parseErc20Transfer(log);
+      if (!parsedTransfer) {
+        continue;
+      }
+
+      this.projectTransfer(context, parsedTransfer, erc20MovementSpec(context.txid, logIndex));
+    }
+  }
+
+  private projectTransfer(
+    context: EvmTransactionContext,
+    transfer: EvmProjectedTransfer,
+    movementSpec: EvmMovementSpec,
+  ): void {
+    context.accumulator.addressMovements.push(
+      this.transferMovement(
+        context,
+        transfer,
+        movementSpec.debitMovementId,
+        'debit',
+        movementSpec.debitEntryIndex,
+      ),
+      this.transferMovement(
+        context,
+        transfer,
+        movementSpec.creditMovementId,
+        'credit',
+        movementSpec.creditEntryIndex,
+      ),
+    );
+    this.appendTransferFact(context, transfer);
+  }
+
+  private transferMovement(
+    context: EvmTransactionContext,
+    transfer: EvmProjectedTransfer,
+    movementId: string,
+    direction: 'credit' | 'debit',
+    entryIndex: number,
+  ): BlockProjectionBatch['addressMovements'][number] {
+    return {
+      movementId,
+      networkId: context.networkId,
+      blockHeight: context.block.height,
+      blockHash: context.block.hash,
+      blockTime: context.block.time,
+      txid: context.txid,
+      txIndex: context.txIndex,
+      entryIndex,
+      address: direction === 'debit' ? transfer.fromAddress : transfer.toAddress,
+      assetAddress: transfer.assetAddress,
+      direction,
+      amountBase: transfer.amountBase,
+      outputKey: null,
+      derivationMethod: transfer.derivationMethod,
+    };
+  }
+
+  private appendTransferFact(context: EvmTransactionContext, transfer: EvmProjectedTransfer): void {
+    if (!context.options.includeTransfers) {
+      return;
+    }
+
+    const transferIndex = context.accumulator.nextTransferIndex;
+    context.accumulator.transfers.push({
+      transferId: `${context.txid}:${transferIndex}`,
+      networkId: context.networkId,
+      blockHeight: context.block.height,
+      blockHash: context.block.hash,
+      blockTime: context.block.time,
+      txid: context.txid,
+      txIndex: context.txIndex,
+      transferIndex,
+      assetAddress: transfer.assetAddress,
+      fromAddress: transfer.fromAddress,
+      toAddress: transfer.toAddress,
+      amountBase: transfer.amountBase,
+      derivationMethod: transfer.derivationMethod,
+      confidence: 1,
+      isChange: false,
+      inputAddressCount: 1,
+      outputAddressCount: 1,
+    });
+    context.accumulator.nextTransferIndex += 1;
+  }
+
+  private parseBlock(snapshot: Record<string, unknown>): ParsedEvmBlock {
+    const candidate = requireSnapshotRecord(snapshot.block, 'block', 'evm');
+    return {
+      hash: this.requireString(readSnapshotString(candidate, 'hash'), 'block.hash').toLowerCase(),
+      height: Number(
+        BigInt(this.requireString(readSnapshotString(candidate, 'number'), 'block.number')),
+      ),
+      time: Number(
+        BigInt(this.requireString(readSnapshotString(candidate, 'timestamp'), 'block.timestamp')),
+      ),
+      transactions: readSnapshotItems(candidate.transactions, isEvmTransaction),
+    };
+  }
+
+  private parseErc20Transfer(log: EvmLog): EvmProjectedTransfer | null {
+    const topics = erc20TransferTopics(log);
+    if (!topics) {
+      return null;
+    }
+
+    const fromAddress = this.topicAddress(topics.from);
+    const toAddress = this.topicAddress(topics.to);
     const assetAddress = this.requireString(log.address, 'log.address').toLowerCase();
-    const amountBase = fromHexUnits(log.data?.trim() ?? '0x0');
+    const amountBase = fromHexUnits(evmHexValue(log.data));
     if (amountBase === '0') {
       return null;
     }
@@ -276,6 +346,7 @@ export class EvmBlockProjector {
       toAddress,
       assetAddress,
       amountBase,
+      derivationMethod: 'evm_erc20_transfer_v1',
     };
   }
 
@@ -315,25 +386,26 @@ export class EvmBlockProjector {
 
     return `0x${normalized.slice(-40)}`;
   }
-
-  private readString(record: Record<string, unknown>, key: string): string | undefined {
-    const value = record[key];
-    return typeof value === 'string' ? value : undefined;
-  }
-
-  private readTransactions(value: unknown): EvmTransaction[] {
-    return Array.isArray(value) ? value.filter(isEvmTransaction) : [];
-  }
-
-  private requireRecord(value: unknown, field: string): Record<string, unknown> {
-    if (!value || typeof value !== 'object') {
-      throw new InfrastructureError(`invalid evm field: ${field}`);
-    }
-
-    return Object.fromEntries(Object.entries(value));
-  }
 }
 
 function isEvmTransaction(value: unknown): value is EvmTransaction {
   return typeof value === 'object' && value !== null;
+}
+
+function nativeMovementSpec(txid: string): EvmMovementSpec {
+  return {
+    debitMovementId: `${txid}:native:debit`,
+    creditMovementId: `${txid}:native:credit`,
+    debitEntryIndex: 0,
+    creditEntryIndex: 1,
+  };
+}
+
+function erc20MovementSpec(txid: string, logIndex: number): EvmMovementSpec {
+  return {
+    debitMovementId: `${txid}:erc20:debit:${logIndex}`,
+    creditMovementId: `${txid}:erc20:credit:${logIndex}`,
+    debitEntryIndex: logIndex * 2,
+    creditEntryIndex: logIndex * 2 + 1,
+  };
 }

@@ -81,29 +81,78 @@ export function loadSettings(input?: {
   port?: number;
 }): AppSettings {
   const homePlaceholder = '${' + 'HOME}';
-  const env = input?.env ?? process.env;
+  const env = resolveSettingsEnv(input);
   assertRequiredEnvironment(env);
-  const mode = parseMode(input?.mode ?? env.ONLYDOGE_MODE);
-  const databaseLocation = expandHomePath(
-    resolveDatabaseLocation(env) ?? `sqlite://${homePlaceholder}/.onlydoge/onlydoge.sqlite.db`,
-  );
-  const storageLocation = expandHomePath(
-    env.ONLYDOGE_STORAGE ?? `file://${homePlaceholder}/.onlydoge/storage`,
-  );
-  const warehouseLocation = expandHomePath(
-    env.ONLYDOGE_WAREHOUSE ?? `${homePlaceholder}/.onlydoge/onlydoge.duckdb.db`,
-  );
+  const mode = parseMode(resolveSettingsValue(input?.mode, env.ONLYDOGE_MODE));
+  const locations = resolveStorageLocations(env, homePlaceholder);
 
   return {
     mode,
-    isIndexer: mode === 'both' || mode === 'indexer',
-    isHttp: mode === 'both' || mode === 'http',
-    ip: input?.ip ?? env.ONLYDOGE_IP ?? '127.0.0.1',
-    port: input?.port ?? Number(env.ONLYDOGE_PORT ?? 2277),
-    database: parseDatabaseSettings(databaseLocation, env),
+    isIndexer: isIndexerMode(mode),
+    isHttp: isHttpMode(mode),
+    ip: resolveSettingsValue(input?.ip, env.ONLYDOGE_IP, '127.0.0.1'),
+    port: resolveSettingsPort(input, env),
+    database: parseDatabaseSettings(locations.database, env),
     indexer: parseIndexerSettings(env),
-    storage: parseStorageSettings(storageLocation, env),
-    warehouse: parseWarehouseSettings(warehouseLocation, env),
+    storage: parseStorageSettings(locations.storage, env),
+    warehouse: parseWarehouseSettings(locations.warehouse, env),
+  };
+}
+
+function isIndexerMode(mode: Mode): boolean {
+  return mode === 'both' || mode === 'indexer';
+}
+
+function isHttpMode(mode: Mode): boolean {
+  return mode === 'both' || mode === 'http';
+}
+
+function resolveSettingsPort(input: { port?: number } | undefined, env: NodeJS.ProcessEnv): number {
+  return input?.port ?? Number(resolveSettingsValue(env.ONLYDOGE_PORT, undefined, '2277'));
+}
+
+function resolveSettingsEnv(input?: { env?: NodeJS.ProcessEnv }): NodeJS.ProcessEnv {
+  return input?.env ?? process.env;
+}
+
+function resolveSettingsValue(
+  primary: string | undefined,
+  secondary: string | undefined,
+  fallback = '',
+): string {
+  return primary ?? secondary ?? fallback;
+}
+
+function resolveStorageLocations(
+  env: NodeJS.ProcessEnv,
+  homePlaceholder: string,
+): {
+  database: string;
+  storage: string;
+  warehouse: string;
+} {
+  return {
+    database: expandHomePath(
+      resolveSettingsValue(
+        resolveDatabaseLocation(env),
+        undefined,
+        `sqlite://${homePlaceholder}/.onlydoge/onlydoge.sqlite.db`,
+      ),
+    ),
+    storage: expandHomePath(
+      resolveSettingsValue(
+        env.ONLYDOGE_STORAGE,
+        undefined,
+        `file://${homePlaceholder}/.onlydoge/storage`,
+      ),
+    ),
+    warehouse: expandHomePath(
+      resolveSettingsValue(
+        env.ONLYDOGE_WAREHOUSE,
+        undefined,
+        `${homePlaceholder}/.onlydoge/onlydoge.duckdb.db`,
+      ),
+    ),
   };
 }
 
@@ -112,14 +161,25 @@ function assertRequiredEnvironment(env: NodeJS.ProcessEnv): void {
     return;
   }
 
-  const missing = [
-    ...(hasDatabaseConfiguration(env) ? [] : ['ONLYDOGE_DATABASE']),
-    ...(!env.ONLYDOGE_STORAGE ? ['ONLYDOGE_STORAGE'] : []),
-    ...(!env.ONLYDOGE_WAREHOUSE ? ['ONLYDOGE_WAREHOUSE'] : []),
-  ];
+  const missing = missingRequiredEnvironmentKeys(env);
   if (missing.length > 0) {
     throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
   }
+}
+
+function missingRequiredEnvironmentKeys(env: NodeJS.ProcessEnv): string[] {
+  const missing: string[] = [];
+  if (!hasDatabaseConfiguration(env)) {
+    missing.push('ONLYDOGE_DATABASE');
+  }
+  if (!env.ONLYDOGE_STORAGE) {
+    missing.push('ONLYDOGE_STORAGE');
+  }
+  if (!env.ONLYDOGE_WAREHOUSE) {
+    missing.push('ONLYDOGE_WAREHOUSE');
+  }
+
+  return missing;
 }
 
 function hasDatabaseConfiguration(env: NodeJS.ProcessEnv): boolean {
@@ -135,42 +195,65 @@ function resolveDatabaseLocation(env: NodeJS.ProcessEnv): string | undefined {
     return undefined;
   }
 
-  const user = env.ONLYDOGE_DATABASE_USER ?? 'onlydoge';
+  return buildPostgresDatabaseLocation(env);
+}
+
+function buildPostgresDatabaseLocation(env: NodeJS.ProcessEnv): string {
+  const user = resolveSettingsValue(env.ONLYDOGE_DATABASE_USER, undefined, 'onlydoge');
   const password = env.ONLYDOGE_DATABASE_PASSWORD ?? '';
-  const port = env.ONLYDOGE_DATABASE_PORT ?? '5432';
-  const database = env.ONLYDOGE_DATABASE_NAME ?? 'onlydoge';
-  const credentials = password
-    ? `${encodeURIComponent(user)}:${encodeURIComponent(password)}`
-    : encodeURIComponent(user);
+  const port = resolveSettingsValue(env.ONLYDOGE_DATABASE_PORT, undefined, '5432');
+  const database = resolveSettingsValue(env.ONLYDOGE_DATABASE_NAME, undefined, 'onlydoge');
+  const credentials = encodeDatabaseCredentials(user, password);
 
   return `postgres://${credentials}@${env.ONLYDOGE_DATABASE_HOST}:${port}/${database}`;
 }
 
-function parseDatabaseSettings(location: string, env: NodeJS.ProcessEnv): DatabaseSettings {
-  if (location.startsWith('sqlite://')) {
-    return {
-      driver: 'sqlite',
-      location: `file:${new URL(location).pathname}`,
-    };
+function encodeDatabaseCredentials(user: string, password: string): string {
+  if (!password) {
+    return encodeURIComponent(user);
   }
 
-  if (location.startsWith('postgres://') || location.startsWith('postgresql://')) {
-    const ssl = parseDatabaseSslSettings(env);
-    return {
-      driver: 'postgres',
-      location: ssl ? stripPostgresSslQueryParams(location) : location,
-      ...(ssl ? { ssl } : {}),
-    };
+  return `${encodeURIComponent(user)}:${encodeURIComponent(password)}`;
+}
+
+function parseDatabaseSettings(location: string, env: NodeJS.ProcessEnv): DatabaseSettings {
+  if (location.startsWith('sqlite://')) {
+    return sqliteDatabaseSettings(location);
+  }
+
+  if (isPostgresLocation(location)) {
+    return postgresDatabaseSettings(location, env);
   }
 
   if (location.startsWith('mysql://')) {
-    return {
-      driver: 'mysql',
-      location,
-    };
+    return { driver: 'mysql', location };
   }
 
   throw new Error(`Unsupported database configuration: ${location}`);
+}
+
+function sqliteDatabaseSettings(location: string): DatabaseSettings {
+  return {
+    driver: 'sqlite',
+    location: `file:${new URL(location).pathname}`,
+  };
+}
+
+function isPostgresLocation(location: string): boolean {
+  return location.startsWith('postgres://') || location.startsWith('postgresql://');
+}
+
+function postgresDatabaseSettings(location: string, env: NodeJS.ProcessEnv): DatabaseSettings {
+  const ssl = parseDatabaseSslSettings(env);
+  if (!ssl) {
+    return { driver: 'postgres', location };
+  }
+
+  return {
+    driver: 'postgres',
+    location: stripPostgresSslQueryParams(location),
+    ssl,
+  };
 }
 
 function decodeMaybeBase64(value: string): string {
@@ -183,16 +266,16 @@ function decodeMaybeBase64(value: string): string {
     return trimmed;
   }
 
-  try {
-    const decoded = Buffer.from(trimmed, 'base64').toString('utf8');
-    if (decoded.includes('-----BEGIN CERTIFICATE-----')) {
-      return decoded;
-    }
-  } catch {
-    return trimmed;
-  }
+  return decodeBase64Certificate(trimmed) ?? trimmed;
+}
 
-  return trimmed;
+function decodeBase64Certificate(value: string): string | null {
+  try {
+    const decoded = Buffer.from(value, 'base64').toString('utf8');
+    return decoded.includes('-----BEGIN CERTIFICATE-----') ? decoded : null;
+  } catch {
+    return null;
+  }
 }
 
 function parseDatabaseSslSettings(env: NodeJS.ProcessEnv): DatabaseSettings['ssl'] | undefined {
@@ -235,24 +318,47 @@ function parseStorageSettings(location: string, env: NodeJS.ProcessEnv): Storage
 
 function parseWarehouseSettings(location: string, env: NodeJS.ProcessEnv): WarehouseSettings {
   if (location.startsWith('http://') || location.startsWith('https://')) {
-    const url = new URL(location);
-    const database = url.searchParams.get('database') ?? undefined;
-    url.searchParams.delete('database');
-
-    return {
-      driver: 'clickhouse',
-      location: url.toString(),
-      ...(database ? { database } : {}),
-      requestTimeoutMs: parsePositiveInteger(env.ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS, 30_000),
-      ...(env.ONLYDOGE_WAREHOUSE_USER ? { user: env.ONLYDOGE_WAREHOUSE_USER } : {}),
-      ...(env.ONLYDOGE_WAREHOUSE_PASSWORD ? { password: env.ONLYDOGE_WAREHOUSE_PASSWORD } : {}),
-    };
+    return parseClickHouseWarehouseSettings(location, env);
   }
 
   return {
     driver: 'duckdb',
     location: location.replace(/^file:/u, ''),
   };
+}
+
+function parseClickHouseWarehouseSettings(
+  location: string,
+  env: NodeJS.ProcessEnv,
+): WarehouseSettings {
+  const url = new URL(location);
+  const database = url.searchParams.get('database');
+  url.searchParams.delete('database');
+
+  const settings: WarehouseSettings = {
+    driver: 'clickhouse',
+    location: url.toString(),
+    requestTimeoutMs: parsePositiveInteger(env.ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS, 30_000),
+  };
+  applyClickHouseDatabase(settings, database);
+  applyClickHouseCredentials(settings, env);
+
+  return settings;
+}
+
+function applyClickHouseDatabase(settings: WarehouseSettings, database: string | null): void {
+  if (database) {
+    settings.database = database;
+  }
+}
+
+function applyClickHouseCredentials(settings: WarehouseSettings, env: NodeJS.ProcessEnv): void {
+  if (env.ONLYDOGE_WAREHOUSE_USER) {
+    settings.user = env.ONLYDOGE_WAREHOUSE_USER;
+  }
+  if (env.ONLYDOGE_WAREHOUSE_PASSWORD) {
+    settings.password = env.ONLYDOGE_WAREHOUSE_PASSWORD;
+  }
 }
 
 function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {

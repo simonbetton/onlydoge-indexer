@@ -48,6 +48,16 @@ const REQUIRED_ENV_KEYS = [
   'ONLYDOGE_INDEXER_RELINK_TIMEOUT_MS',
 ] as const;
 
+interface DeployPlan {
+  envFile: string;
+  forwardedEnv: Record<string, string>;
+  host: string;
+  remoteArgs: string[];
+  resolvedImage: string;
+  sshJump: string;
+  sshTarget: string;
+}
+
 const { values } = parseArgs({
   args: Bun.argv.slice(2),
   options: {
@@ -78,31 +88,80 @@ const { values } = parseArgs({
 });
 
 async function main() {
-  const fileValues = await loadEnvFile(values.envFile);
-  const host = values.host ?? fileValues.ONCE_APP_HOST ?? DEFAULT_HOST;
-  const sshJump = values.sshJump ?? fileValues.ONCE_SSH_JUMP ?? DEFAULT_SSH_JUMP;
-  const sshTarget = values.sshTarget ?? fileValues.ONCE_SSH_TARGET ?? DEFAULT_SSH_TARGET;
-  const requestedImage = values.image ?? DEFAULT_IMAGE;
-  const resolvedImage = await resolveImage(requestedImage);
-  const forwardedEnv = collectForwardedEnv(fileValues);
-  validateRequiredEnv(forwardedEnv);
-
-  const remoteArgs = ['-o', 'BatchMode=yes', '-J', sshJump, sshTarget];
-  remoteArgs.push(`sh -lc ${shellEscape(buildRemoteCommand(host, resolvedImage, forwardedEnv))}`);
+  const plan = await createDeployPlan();
 
   if (values.dryRun) {
-    console.log(`env file: ${values.envFile}`);
-    console.log(`host: ${host}`);
-    console.log(`ssh jump: ${sshJump}`);
-    console.log(`ssh target: ${sshTarget}`);
-    console.log(`image: ${resolvedImage}`);
-    console.log(`env keys: ${Object.keys(forwardedEnv).sort().join(', ')}`);
+    printDeployPlan(plan);
     return;
   }
 
-  await runCommand('ssh', remoteArgs);
-  await verifyHealth(host);
-  console.log(`deployed ${resolvedImage} to ${host}`);
+  await runDeployPlan(plan);
+}
+
+async function createDeployPlan(): Promise<DeployPlan> {
+  const fileValues = await loadEnvFile(values.envFile);
+  const host = resolveDeployValue(values.host, fileValues.ONCE_APP_HOST, DEFAULT_HOST);
+  const sshJump = resolveDeployValue(values.sshJump, fileValues.ONCE_SSH_JUMP, DEFAULT_SSH_JUMP);
+  const sshTarget = resolveDeployValue(
+    values.sshTarget,
+    fileValues.ONCE_SSH_TARGET,
+    DEFAULT_SSH_TARGET,
+  );
+  const resolvedImage = await resolveImage(
+    resolveDeployValue(values.image, undefined, DEFAULT_IMAGE),
+  );
+  const forwardedEnv = collectForwardedEnv(fileValues);
+  validateRequiredEnv(forwardedEnv);
+
+  return {
+    envFile: values.envFile,
+    forwardedEnv,
+    host,
+    remoteArgs: buildSshRemoteArgs(sshJump, sshTarget, host, resolvedImage, forwardedEnv),
+    resolvedImage,
+    sshJump,
+    sshTarget,
+  };
+}
+
+function resolveDeployValue(
+  explicit: string | undefined,
+  envValue: string | undefined,
+  fallback: string,
+): string {
+  return explicit ?? envValue ?? fallback;
+}
+
+function buildSshRemoteArgs(
+  sshJump: string,
+  sshTarget: string,
+  host: string,
+  resolvedImage: string,
+  forwardedEnv: Record<string, string>,
+): string[] {
+  return [
+    '-o',
+    'BatchMode=yes',
+    '-J',
+    sshJump,
+    sshTarget,
+    `sh -lc ${shellEscape(buildRemoteCommand(host, resolvedImage, forwardedEnv))}`,
+  ];
+}
+
+function printDeployPlan(plan: DeployPlan): void {
+  console.log(`env file: ${plan.envFile}`);
+  console.log(`host: ${plan.host}`);
+  console.log(`ssh jump: ${plan.sshJump}`);
+  console.log(`ssh target: ${plan.sshTarget}`);
+  console.log(`image: ${plan.resolvedImage}`);
+  console.log(`env keys: ${Object.keys(plan.forwardedEnv).sort().join(', ')}`);
+}
+
+async function runDeployPlan(plan: DeployPlan): Promise<void> {
+  await runCommand('ssh', plan.remoteArgs);
+  await verifyHealth(plan.host);
+  console.log(`deployed ${plan.resolvedImage} to ${plan.host}`);
 }
 
 async function loadEnvFile(path: string): Promise<Record<string, string>> {

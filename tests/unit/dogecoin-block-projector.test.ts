@@ -1,11 +1,10 @@
-import { DogecoinBlockProjector } from '@onlydoge/indexing-pipeline';
+import { DogecoinBlockProjector, type ProjectionUtxoOutput } from '@onlydoge/indexing-pipeline';
 import { InMemoryWarehouseAdapter } from '@onlydoge/platform';
 import { describe, expect, it } from 'vitest';
 
 describe('dogecoin block projector', () => {
   it('resolves same-block spends and emits deterministic transfer legs', async () => {
-    const warehouse = new InMemoryWarehouseAdapter();
-    const projector = new DogecoinBlockProjector(warehouse);
+    const projector = createProjector();
 
     const batch = await projector.project(1, {
       block: {
@@ -16,37 +15,14 @@ describe('dogecoin block projector', () => {
           {
             txid: 'tx-coinbase',
             vin: [{ coinbase: 'coinbase' }],
-            vout: [
-              {
-                n: 0,
-                value: '50.00000000',
-                scriptPubKey: {
-                  type: 'pubkeyhash',
-                  addresses: ['DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'],
-                },
-              },
-            ],
+            vout: [dogecoinVout(0, '50.00000000', sourceAddress)],
           },
           {
             txid: 'tx-spend',
             vin: [{ txid: 'tx-coinbase', vout: 0 }],
             vout: [
-              {
-                n: 0,
-                value: '30.00000000',
-                scriptPubKey: {
-                  type: 'pubkeyhash',
-                  addresses: ['DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'],
-                },
-              },
-              {
-                n: 1,
-                value: '19.00000000',
-                scriptPubKey: {
-                  type: 'pubkeyhash',
-                  addresses: ['DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'],
-                },
-              },
+              dogecoinVout(0, '30.00000000', targetAddress),
+              dogecoinVout(1, '19.00000000', sourceAddress),
             ],
           },
         ],
@@ -66,34 +42,34 @@ describe('dogecoin block projector', () => {
           movementId: 'tx-spend:vin:0',
           direction: 'debit',
           amountBase: '5000000000',
-          address: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+          address: sourceAddress,
         }),
         expect.objectContaining({
           movementId: 'tx-spend:vout:0',
           direction: 'credit',
           amountBase: '3000000000',
-          address: 'DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+          address: targetAddress,
         }),
       ]),
     );
     expect(batch.transfers).toEqual([
       expect.objectContaining({
-        fromAddress: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-        toAddress: 'DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+        fromAddress: sourceAddress,
+        toAddress: targetAddress,
         amountBase: '3000000000',
         isChange: false,
       }),
       expect.objectContaining({
-        fromAddress: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-        toAddress: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+        fromAddress: sourceAddress,
+        toAddress: sourceAddress,
         amountBase: '1900000000',
         isChange: true,
       }),
     ]);
     expect(batch.directLinkDeltas).toEqual([
       expect.objectContaining({
-        fromAddress: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-        toAddress: 'DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+        fromAddress: sourceAddress,
+        toAddress: targetAddress,
         totalAmountBase: '3000000000',
         transferCount: 1,
       }),
@@ -101,60 +77,13 @@ describe('dogecoin block projector', () => {
   });
 
   it('treats a later spend in persisted state as unspent for historical replay', async () => {
-    const warehouse = new InMemoryWarehouseAdapter();
-    const projector = new DogecoinBlockProjector(warehouse);
-
-    const batch = await projector.project(
-      1,
-      {
-        block: {
-          hash: 'block-10',
-          height: 10,
-          time: 1_700_000_000,
-          tx: [
-            {
-              txid: 'tx-spend',
-              vin: [{ txid: 'tx-prev', vout: 1 }],
-              vout: [
-                {
-                  n: 0,
-                  value: '30.00000000',
-                  scriptPubKey: {
-                    type: 'pubkeyhash',
-                    addresses: ['DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'],
-                  },
-                },
-              ],
-            },
-          ],
-        },
-      },
-      {
-        persistedOutputs: new Map([
-          [
-            'tx-prev:1',
-            {
-              networkId: 1,
-              blockHeight: 5,
-              blockHash: 'block-5',
-              blockTime: 1_699_999_000,
-              txid: 'tx-prev',
-              txIndex: 0,
-              vout: 1,
-              outputKey: 'tx-prev:1',
-              address: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-              scriptType: 'pubkeyhash',
-              valueBase: '3000000000',
-              isCoinbase: false,
-              isSpendable: true,
-              spentByTxid: 'tx-later',
-              spentInBlock: 25,
-              spentInputIndex: 0,
-            },
-          ],
-        ]),
-      },
-    );
+    const batch = await projectStandardSpend({
+      persistedOutput: persistedPrevOutput({
+        spentByTxid: 'tx-later',
+        spentInBlock: 25,
+        spentInputIndex: 0,
+      }),
+    });
 
     expect(batch.utxoSpends).toEqual([
       expect.objectContaining({
@@ -165,68 +94,21 @@ describe('dogecoin block projector', () => {
     ]);
     expect(batch.transfers).toEqual([
       expect.objectContaining({
-        fromAddress: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-        toAddress: 'DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+        fromAddress: sourceAddress,
+        toAddress: targetAddress,
         amountBase: '3000000000',
       }),
     ]);
   });
 
   it('treats the same persisted spend as idempotent during replay', async () => {
-    const warehouse = new InMemoryWarehouseAdapter();
-    const projector = new DogecoinBlockProjector(warehouse);
-
-    const batch = await projector.project(
-      1,
-      {
-        block: {
-          hash: 'block-10',
-          height: 10,
-          time: 1_700_000_000,
-          tx: [
-            {
-              txid: 'tx-spend',
-              vin: [{ txid: 'tx-prev', vout: 1 }],
-              vout: [
-                {
-                  n: 0,
-                  value: '30.00000000',
-                  scriptPubKey: {
-                    type: 'pubkeyhash',
-                    addresses: ['DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'],
-                  },
-                },
-              ],
-            },
-          ],
-        },
-      },
-      {
-        persistedOutputs: new Map([
-          [
-            'tx-prev:1',
-            {
-              networkId: 1,
-              blockHeight: 5,
-              blockHash: 'block-5',
-              blockTime: 1_699_999_000,
-              txid: 'tx-prev',
-              txIndex: 0,
-              vout: 1,
-              outputKey: 'tx-prev:1',
-              address: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-              scriptType: 'pubkeyhash',
-              valueBase: '3000000000',
-              isCoinbase: false,
-              isSpendable: true,
-              spentByTxid: 'tx-spend',
-              spentInBlock: 10,
-              spentInputIndex: 0,
-            },
-          ],
-        ]),
-      },
-    );
+    const batch = await projectStandardSpend({
+      persistedOutput: persistedPrevOutput({
+        spentByTxid: 'tx-spend',
+        spentInBlock: 10,
+        spentInputIndex: 0,
+      }),
+    });
 
     expect(batch.utxoSpends).toEqual([
       expect.objectContaining({
@@ -238,72 +120,20 @@ describe('dogecoin block projector', () => {
     ]);
     expect(batch.transfers).toEqual([
       expect.objectContaining({
-        fromAddress: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-        toAddress: 'DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+        fromAddress: sourceAddress,
+        toAddress: targetAddress,
         amountBase: '3000000000',
       }),
     ]);
   });
 
   it('can derive state without transfer and link facts', async () => {
-    const warehouse = new InMemoryWarehouseAdapter();
-    const projector = new DogecoinBlockProjector(warehouse);
-
-    const batch = await projector.project(
-      1,
-      {
-        block: {
-          hash: 'block-10',
-          height: 10,
-          time: 1_700_000_000,
-          tx: [
-            {
-              txid: 'tx-spend',
-              vin: [{ txid: 'tx-prev', vout: 1 }],
-              vout: [
-                {
-                  n: 0,
-                  value: '30.00000000',
-                  scriptPubKey: {
-                    type: 'pubkeyhash',
-                    addresses: ['DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'],
-                  },
-                },
-              ],
-            },
-          ],
-        },
-      },
-      {
-        persistedOutputs: new Map([
-          [
-            'tx-prev:1',
-            {
-              networkId: 1,
-              blockHeight: 5,
-              blockHash: 'block-5',
-              blockTime: 1_699_999_000,
-              txid: 'tx-prev',
-              txIndex: 0,
-              vout: 1,
-              outputKey: 'tx-prev:1',
-              address: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-              scriptType: 'pubkeyhash',
-              valueBase: '3000000000',
-              isCoinbase: false,
-              isSpendable: true,
-              spentByTxid: null,
-              spentInBlock: null,
-              spentInputIndex: null,
-            },
-          ],
-        ]),
-      },
-      {
+    const batch = await projectStandardSpend({
+      options: {
         includeTransfers: false,
         includeDirectLinkDeltas: false,
       },
-    );
+    });
 
     expect(batch.utxoSpends).toEqual([
       expect.objectContaining({
@@ -315,11 +145,11 @@ describe('dogecoin block projector', () => {
       expect.arrayContaining([
         expect.objectContaining({
           direction: 'debit',
-          address: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+          address: sourceAddress,
         }),
         expect.objectContaining({
           direction: 'credit',
-          address: 'DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
+          address: targetAddress,
         }),
       ]),
     );
@@ -328,8 +158,7 @@ describe('dogecoin block projector', () => {
   });
 
   it('skips pathological transfer derivation when guardrails are exceeded', async () => {
-    const warehouse = new InMemoryWarehouseAdapter();
-    const projector = new DogecoinBlockProjector(warehouse);
+    const projector = createProjector();
 
     const batch = await projector.project(
       1,
@@ -346,22 +175,8 @@ describe('dogecoin block projector', () => {
                 { txid: 'tx-prev-b', vout: 0 },
               ],
               vout: [
-                {
-                  n: 0,
-                  value: '20.00000000',
-                  scriptPubKey: {
-                    type: 'pubkeyhash',
-                    addresses: ['DCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'],
-                  },
-                },
-                {
-                  n: 1,
-                  value: '20.00000000',
-                  scriptPubKey: {
-                    type: 'pubkeyhash',
-                    addresses: ['DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD'],
-                  },
-                },
+                dogecoinVout(0, '20.00000000', 'DCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'),
+                dogecoinVout(1, '20.00000000', 'DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD'),
               ],
             },
           ],
@@ -371,45 +186,23 @@ describe('dogecoin block projector', () => {
         persistedOutputs: new Map([
           [
             'tx-prev-a:0',
-            {
-              networkId: 1,
-              blockHeight: 5,
-              blockHash: 'block-5',
-              blockTime: 1_699_999_000,
+            persistedPrevOutput({
               txid: 'tx-prev-a',
-              txIndex: 0,
               vout: 0,
               outputKey: 'tx-prev-a:0',
-              address: 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
-              scriptType: 'pubkeyhash',
               valueBase: '2000000000',
-              isCoinbase: false,
-              isSpendable: true,
-              spentByTxid: null,
-              spentInBlock: null,
-              spentInputIndex: null,
-            },
+            }),
           ],
           [
             'tx-prev-b:0',
-            {
-              networkId: 1,
-              blockHeight: 5,
-              blockHash: 'block-5',
-              blockTime: 1_699_999_000,
+            persistedPrevOutput({
               txid: 'tx-prev-b',
               txIndex: 1,
               vout: 0,
               outputKey: 'tx-prev-b:0',
-              address: 'DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',
-              scriptType: 'pubkeyhash',
+              address: targetAddress,
               valueBase: '2000000000',
-              isCoinbase: false,
-              isSpendable: true,
-              spentByTxid: null,
-              spentInBlock: null,
-              spentInputIndex: null,
-            },
+            }),
           ],
         ]),
       },
@@ -423,3 +216,72 @@ describe('dogecoin block projector', () => {
     expect(batch.directLinkDeltas).toEqual([]);
   });
 });
+
+const sourceAddress = 'DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const targetAddress = 'DBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+
+type ProjectOptions = Parameters<DogecoinBlockProjector['project']>[3];
+
+function createProjector(): DogecoinBlockProjector {
+  return new DogecoinBlockProjector(new InMemoryWarehouseAdapter());
+}
+
+async function projectStandardSpend(
+  input: { options?: ProjectOptions; persistedOutput?: ProjectionUtxoOutput } = {},
+) {
+  const persistedOutput = input.persistedOutput ?? persistedPrevOutput();
+  return createProjector().project(
+    1,
+    {
+      block: {
+        hash: 'block-10',
+        height: 10,
+        time: 1_700_000_000,
+        tx: [
+          {
+            txid: 'tx-spend',
+            vin: [{ txid: 'tx-prev', vout: 1 }],
+            vout: [dogecoinVout(0, '30.00000000', targetAddress)],
+          },
+        ],
+      },
+    },
+    {
+      persistedOutputs: new Map([[persistedOutput.outputKey, persistedOutput]]),
+    },
+    input.options,
+  );
+}
+
+function dogecoinVout(n: number, value: string, address: string) {
+  return {
+    n,
+    value,
+    scriptPubKey: {
+      type: 'pubkeyhash',
+      addresses: [address],
+    },
+  };
+}
+
+function persistedPrevOutput(overrides: Partial<ProjectionUtxoOutput> = {}): ProjectionUtxoOutput {
+  return {
+    networkId: 1,
+    blockHeight: 5,
+    blockHash: 'block-5',
+    blockTime: 1_699_999_000,
+    txid: 'tx-prev',
+    txIndex: 0,
+    vout: 1,
+    outputKey: 'tx-prev:1',
+    address: sourceAddress,
+    scriptType: 'pubkeyhash',
+    valueBase: '3000000000',
+    isCoinbase: false,
+    isSpendable: true,
+    spentByTxid: null,
+    spentInBlock: null,
+    spentInputIndex: null,
+    ...overrides,
+  };
+}

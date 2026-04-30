@@ -1,6 +1,14 @@
 import { ApiSecret, ExternalId, UnauthorizedError, ValidationError } from '@onlydoge/shared-kernel';
 import type { ApiKeyRepository } from '../contracts/api-key-repository';
-import { ApiKey, type CreateApiKeyInput, requireApiKey } from '../domain/api-key';
+import {
+  ApiKey,
+  type ApiKeyResponse,
+  apiKeyToResponse,
+  type CreateApiKeyInput,
+  hideApiKeySecret,
+  requireApiKey,
+  setApiKeyIsActive,
+} from '../domain/api-key';
 
 export class AccessControlService {
   public constructor(private readonly apiKeys: ApiKeyRepository) {}
@@ -9,7 +17,7 @@ export class AccessControlService {
     return (await this.apiKeys.countApiKeys()) > 0;
   }
 
-  public async createKey(input: CreateApiKeyInput): Promise<ReturnType<ApiKey['toResponse']>> {
+  public async createKey(input: CreateApiKeyInput): Promise<ApiKeyResponse> {
     if (input.id) {
       ExternalId.parse(input.id, 'key');
       const existing = await this.apiKeys.getApiKeyById(input.id);
@@ -21,25 +29,23 @@ export class AccessControlService {
     const entity = ApiKey.create(input);
     const created = await this.apiKeys.createApiKey(entity.record);
 
-    return ApiKey.rehydrate(created).toResponse();
+    return apiKeyToResponse(created);
   }
 
   public async listKeys(
     offset?: number,
     limit?: number,
   ): Promise<{
-    keys: Array<ReturnType<ApiKey['toResponse']>>;
+    keys: ApiKeyResponse[];
   }> {
     return {
-      keys: (await this.apiKeys.listApiKeys(offset, limit)).map((record) =>
-        ApiKey.rehydrate(record).toResponse(),
-      ),
+      keys: (await this.apiKeys.listApiKeys(offset, limit)).map(apiKeyToResponse),
     };
   }
 
-  public async getKey(id: string): Promise<{ key: ReturnType<ApiKey['toResponse']> }> {
+  public async getKey(id: string): Promise<{ key: ApiKeyResponse }> {
     return {
-      key: ApiKey.rehydrate(requireApiKey(await this.apiKeys.getApiKeyById(id))).toResponse(),
+      key: apiKeyToResponse(requireApiKey(await this.apiKeys.getApiKeyById(id))),
     };
   }
 
@@ -49,11 +55,11 @@ export class AccessControlService {
       isActive?: boolean;
     },
   ): Promise<void> {
-    const current = ApiKey.rehydrate(requireApiKey(await this.apiKeys.getApiKeyById(id)));
+    const current = requireApiKey(await this.apiKeys.getApiKeyById(id));
     const updated =
-      typeof input.isActive === 'boolean' ? current.setIsActive(input.isActive) : current.record;
+      typeof input.isActive === 'boolean' ? setApiKeyIsActive(current, input.isActive) : current;
 
-    if (updated !== current.record) {
+    if (updated !== current) {
       await this.apiKeys.updateApiKey(updated);
     }
   }
@@ -67,19 +73,32 @@ export class AccessControlService {
       return;
     }
 
-    const token = apiToken?.trim();
-    if (!token) {
-      throw new UnauthorizedError();
-    }
-
-    const secretHash = ApiSecret.hashFromToken(token);
+    const secretHash = ApiSecret.hashFromToken(requireApiTokenHeader(apiToken));
     const record = await this.apiKeys.getApiKeyByHash(secretHash);
-    if (!record || !record.isActive) {
-      throw new UnauthorizedError();
-    }
+    assertApiKeyAuthenticates(record);
+    await this.hidePlaintextSecret(record);
+  }
 
+  private async hidePlaintextSecret(record: Parameters<typeof hideApiKeySecret>[0]): Promise<void> {
     if (record.secretKeyPlaintext) {
-      await this.apiKeys.updateApiKey(ApiKey.rehydrate(record).hideSecret());
+      await this.apiKeys.updateApiKey(hideApiKeySecret(record));
     }
+  }
+}
+
+function requireApiTokenHeader(apiToken: string | null | undefined): string {
+  const token = apiToken?.trim();
+  if (!token) {
+    throw new UnauthorizedError();
+  }
+
+  return token;
+}
+
+function assertApiKeyAuthenticates(
+  record: Awaited<ReturnType<ApiKeyRepository['getApiKeyByHash']>>,
+): asserts record is NonNullable<typeof record> {
+  if (!record || !record.isActive) {
+    throw new UnauthorizedError();
   }
 }

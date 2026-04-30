@@ -84,28 +84,40 @@ export async function enforceApiTokenAuth(
   path: string,
   apiTokenHeader: string | null,
 ): Promise<void> {
-  const normalizedPath = path !== '/' && path.endsWith('/') ? path.slice(0, -1) : path;
+  const normalizedPath = normalizeAuthPath(path);
 
-  if (
-    normalizedPath === '/up' ||
-    normalizedPath.startsWith('/v1/heartbeat') ||
-    normalizedPath.startsWith('/openapi')
-  ) {
+  if (isPublicRoute(normalizedPath)) {
     return;
   }
 
-  if (
-    method.toUpperCase() === 'POST' &&
-    normalizedPath === '/v1/keys' &&
-    !(await service.hasConfiguredKeys())
-  ) {
+  const hasConfiguredKeys = await service.hasConfiguredKeys();
+  if (isBootstrapKeyRoute(method, normalizedPath, hasConfiguredKeys)) {
     return;
   }
 
-  if (!(await service.hasConfiguredKeys())) {
+  if (!hasConfiguredKeys) {
     throw new UnauthorizedError();
   }
 
+  await authenticateOrThrow(service, apiTokenHeader);
+}
+
+function normalizeAuthPath(path: string): string {
+  return path !== '/' && path.endsWith('/') ? path.slice(0, -1) : path;
+}
+
+function isPublicRoute(path: string): boolean {
+  return path === '/up' || path.startsWith('/v1/heartbeat') || path.startsWith('/openapi');
+}
+
+function isBootstrapKeyRoute(method: string, path: string, hasConfiguredKeys: boolean): boolean {
+  return method.toUpperCase() === 'POST' && path === '/v1/keys' && !hasConfiguredKeys;
+}
+
+async function authenticateOrThrow(
+  service: AccessControlService,
+  apiTokenHeader: string | null,
+): Promise<void> {
   try {
     await service.authenticate(apiTokenHeader);
   } catch (_error) {

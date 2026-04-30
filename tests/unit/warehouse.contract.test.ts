@@ -7,6 +7,7 @@ import { InMemoryWarehouseAdapter } from '@onlydoge/platform';
 import { describe, expect, it } from 'vitest';
 
 import { dogecoinFixture } from '../fixtures/dogecoin';
+import { expectDogecoinBalances } from '../helpers';
 
 describe('projection warehouse contract', () => {
   it('materializes balances, direct links, and source links from projected blocks', async () => {
@@ -28,26 +29,11 @@ describe('projection warehouse contract', () => {
       address: dogecoinFixture.intermediaryAddress,
       spentByTxid: 'doge-tx-2',
     });
-    await expect(
-      warehouse.getBalancesByAddresses([
+    expectDogecoinBalances(
+      await warehouse.getBalancesByAddresses([
         dogecoinFixture.sourceAddress,
         dogecoinFixture.intermediaryAddress,
         dogecoinFixture.targetAddress,
-      ]),
-    ).resolves.toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          address: dogecoinFixture.sourceAddress,
-          balance: '5900000000',
-        }),
-        expect.objectContaining({
-          address: dogecoinFixture.intermediaryAddress,
-          balance: '1400000000',
-        }),
-        expect.objectContaining({
-          address: dogecoinFixture.targetAddress,
-          balance: '2500000000',
-        }),
       ]),
     );
     await expect(

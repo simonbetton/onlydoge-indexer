@@ -4,6 +4,7 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
+    "@onlydoge/access-control": "workspace:*",
     "@onlydoge/indexing-pipeline": "workspace:*",
     "@onlydoge/investigation-query": "workspace:*",
     "@onlydoge/shared-kernel": "workspace:*",

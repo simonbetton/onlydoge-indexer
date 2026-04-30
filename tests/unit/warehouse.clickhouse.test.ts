@@ -120,22 +120,8 @@ describe('clickhouse warehouse adapter', () => {
       }) => ({
         json: async () =>
           query_params.outputKeys.map((outputKey) => ({
-            networkId: 7,
-            blockHeight: 1,
-            blockHash: 'hash',
-            blockTime: 1,
-            txid: 'txid',
-            txIndex: 0,
-            vout: 0,
+            ...clickHouseUtxoRow(),
             outputKey,
-            address: 'DTestAddress',
-            scriptType: 'pubkeyhash',
-            valueBase: '1',
-            isCoinbase: false,
-            isSpendable: true,
-            spentByTxid: null,
-            spentInBlock: null,
-            spentInputIndex: null,
           })),
       }),
     );
@@ -183,24 +169,14 @@ describe('clickhouse warehouse adapter', () => {
       if (statement.includes('FROM utxo_outputs_current_v2')) {
         return {
           json: async () => [
-            {
-              networkId: 7,
-              blockHeight: 1,
+            clickHouseUtxoRow({
               blockHash: 'prev-hash',
-              blockTime: 1,
-              txid: 'prev-txid',
-              txIndex: 0,
-              vout: 1,
               outputKey: 'prev-txid:1',
               address: 'DInputAddress',
-              scriptType: 'pubkeyhash',
+              txid: 'prev-txid',
               valueBase: '10',
-              isCoinbase: false,
-              isSpendable: true,
-              spentByTxid: null,
-              spentInBlock: null,
-              spentInputIndex: null,
-            },
+              vout: 1,
+            }),
           ],
         };
       }
@@ -222,12 +198,7 @@ describe('clickhouse warehouse adapter', () => {
 
       return { json: async () => [] };
     });
-    const insert = vi.fn(async () => undefined);
-
-    (adapter as unknown as { client: { insert: typeof insert; query: typeof query } }).client = {
-      query,
-      insert,
-    };
+    const { insert } = installClickHouseClient(adapter, query);
 
     await adapter.applyProjectionWindow([
       {
@@ -338,8 +309,7 @@ describe('clickhouse warehouse adapter', () => {
       ) {
         return {
           json: async () => [
-            {
-              networkId: 7,
+            clickHouseUtxoRow({
               blockHeight: 123,
               blockHash: 'prev-hash',
               blockTime: 456,
@@ -355,7 +325,7 @@ describe('clickhouse warehouse adapter', () => {
               spentByTxid: null,
               spentInBlock: null,
               spentInputIndex: null,
-            },
+            }),
           ],
         };
       }
@@ -396,8 +366,7 @@ describe('clickhouse warehouse adapter', () => {
       if (statement.includes('FROM utxo_outputs_v2')) {
         return {
           json: async () => [
-            {
-              networkId: 7,
+            clickHouseUtxoRow({
               blockHeight: 123,
               blockHash: 'prev-hash',
               blockTime: 456,
@@ -406,26 +375,17 @@ describe('clickhouse warehouse adapter', () => {
               vout: 1,
               outputKey: 'prev-txid:1',
               address: 'DInputAddress',
-              scriptType: 'pubkeyhash',
               valueBase: '10',
-              isCoinbase: false,
-              isSpendable: true,
               spentByTxid: 'next-txid',
               spentInBlock: 124,
-              spentInputIndex: 0,
-            },
+            }),
           ],
         };
       }
 
       return { json: async () => [] };
     });
-    const insert = vi.fn(async () => undefined);
-
-    (adapter as unknown as { client: { insert: typeof insert; query: typeof query } }).client = {
-      query,
-      insert,
-    };
+    const { insert } = installClickHouseClient(adapter, query);
 
     const rows = await adapter.getUtxoOutputs(7, ['prev-txid:1']);
 
@@ -582,3 +542,37 @@ describe('clickhouse warehouse adapter', () => {
     ).toBe(true);
   });
 });
+
+function clickHouseUtxoRow(overrides: Record<string, unknown> = {}) {
+  return {
+    networkId: 7,
+    blockHeight: 1,
+    blockHash: 'hash',
+    blockTime: 1,
+    txid: 'txid',
+    txIndex: 0,
+    vout: 0,
+    outputKey: 'txid:0',
+    address: 'DTestAddress',
+    scriptType: 'pubkeyhash',
+    valueBase: '1',
+    isCoinbase: false,
+    isSpendable: true,
+    spentByTxid: null,
+    spentInBlock: null,
+    spentInputIndex: null,
+    ...overrides,
+  };
+}
+
+function installClickHouseClient(
+  adapter: ClickHouseWarehouseAdapter,
+  query: (parameters: { query: string }) => Promise<unknown>,
+) {
+  const insert = vi.fn(async () => undefined);
+  (adapter as unknown as { client: { insert: typeof insert; query: typeof query } }).client = {
+    query,
+    insert,
+  };
+  return { insert };
+}

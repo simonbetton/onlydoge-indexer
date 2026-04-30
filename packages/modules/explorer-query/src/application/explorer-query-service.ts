@@ -1,10 +1,20 @@
 import {
+  type DogecoinTransaction,
+  type DogecoinVin,
+  type DogecoinVout,
+  extractDogecoinOutputAddress,
   formatAmountBase,
+  isDogecoinTransaction,
+  type ParsedDogecoinBlock,
   type ProjectionUtxoOutput,
   type ProjectionWarehousePort,
   parseAmountBase,
 } from '@onlydoge/indexing-pipeline';
-import type { InfoResponse, InvestigationWarehousePort } from '@onlydoge/investigation-query';
+import {
+  buildInfoResponse,
+  type InfoResponse,
+  type InvestigationWarehousePort,
+} from '@onlydoge/investigation-query';
 import {
   NotFoundError,
   type PrimaryId,
@@ -15,7 +25,6 @@ import {
 import type {
   ExplorerActiveNetworkPort,
   ExplorerConfigPort,
-  ExplorerLabelRef,
   ExplorerMetadataPort,
   ExplorerRawBlockPort,
   ExplorerWarehousePort,
@@ -25,6 +34,7 @@ import type {
   ExplorerAddressTransactionSummary,
   ExplorerAddressUtxo,
   ExplorerBlockSummary,
+  ExplorerLabelRef,
   ExplorerNetworkSummary,
   ExplorerSearchResult,
   ExplorerTransactionDetail,
@@ -32,39 +42,29 @@ import type {
   ExplorerTransactionOutput,
   ExplorerTransactionSummary,
 } from '../domain/query-models';
+import {
+  addressDetail,
+  addressSearchResult,
+  buildExplorerTransferBasis,
+  type ExplorerProjectedTransfer,
+  outputIndex,
+  outputScriptType,
+  projectExplorerTransfers,
+  spentByTxid,
+  spentInBlock,
+  type WarehouseAddressSummary,
+  withTransactionLabels,
+} from './explorer-response-builders';
 
-interface DogecoinVin {
-  coinbase?: string;
-  txid?: string;
-  vout?: number;
-}
-
-interface DogecoinVout {
-  n?: number;
-  value?: number | string;
-  scriptPubKey?: {
-    address?: string;
-    addresses?: string[];
-    type?: string;
-  };
-}
-
-interface DogecoinTransaction {
-  txid?: string;
-  vin?: DogecoinVin[];
-  vout?: DogecoinVout[];
-}
-
-interface ParsedDogecoinBlock {
-  hash: string;
-  height: number;
-  time: number;
-  tx: DogecoinTransaction[];
-}
-
-type ExplorerWarehouse = ExplorerWarehousePort &
+export type ExplorerWarehouse = ExplorerWarehousePort &
   InvestigationWarehousePort &
   Pick<ProjectionWarehousePort, 'getUtxoOutputs'>;
+
+type ExplorerNetworkRef = {
+  id: string;
+  name: string;
+  networkId: PrimaryId;
+};
 
 export class ExplorerQueryService {
   public constructor(
@@ -112,82 +112,89 @@ export class ExplorerQueryService {
   ): Promise<{
     matches: ExplorerSearchResult[];
   }> {
-    const q = query?.trim() ?? '';
-    if (!q) {
-      throw new ValidationError('missing input params');
-    }
-
+    const q = normalizeRequiredQuery(query);
     const network = await this.resolveNetwork(networkId);
-    const matches: ExplorerSearchResult[] = [];
 
     if (/^\d+$/u.test(q)) {
-      const block = await this.getBlockByHeight(network.networkId, network.id, Number(q));
-      if (block) {
-        matches.push({
-          type: 'block',
-          network: network.id,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-        });
-      }
-
-      return { matches };
+      return { matches: await this.searchBlockHeight(network, Number(q)) };
     }
 
+    return { matches: await this.searchNonNumeric(network, q) };
+  }
+
+  private async searchBlockHeight(
+    network: ExplorerNetworkRef,
+    blockHeight: number,
+  ): Promise<ExplorerSearchResult[]> {
+    const block = await this.getBlockByHeight(network.networkId, network.id, blockHeight);
+    return block ? [blockSearchResult(block)] : [];
+  }
+
+  private async searchNonNumeric(
+    network: ExplorerNetworkRef,
+    q: string,
+  ): Promise<ExplorerSearchResult[]> {
+    const matches: ExplorerSearchResult[] = [];
+    const txMatch = await this.searchTransaction(network, q);
+    if (txMatch) {
+      matches.push(txMatch);
+    }
+
+    const blockMatch = await this.searchBlockHash(network, q);
+    if (blockMatch) {
+      matches.push(blockMatch);
+    }
+
+    const addressMatch = await this.searchAddress(network, q);
+    if (addressMatch) {
+      matches.push(addressMatch);
+    }
+
+    return matches;
+  }
+
+  private async searchTransaction(
+    network: ExplorerNetworkRef,
+    q: string,
+  ): Promise<ExplorerSearchResult | null> {
     const txRef = await this.warehouse.getTransactionRef(network.networkId, q);
-    if (txRef) {
-      matches.push({
-        type: 'transaction',
-        network: network.id,
-        txid: q,
-        blockHeight: txRef.blockHeight,
-        blockHash: txRef.blockHash,
-        blockTime: txRef.blockTime,
-      });
+    if (!txRef) {
+      return null;
     }
 
+    return {
+      type: 'transaction',
+      network: network.id,
+      txid: q,
+      blockHeight: txRef.blockHeight,
+      blockHash: txRef.blockHash,
+      blockTime: txRef.blockTime,
+    };
+  }
+
+  private async searchBlockHash(
+    network: ExplorerNetworkRef,
+    q: string,
+  ): Promise<ExplorerSearchResult | null> {
     const blockRef = await this.warehouse.getAppliedBlockByHash(network.networkId, q);
-    if (blockRef) {
-      const block = await this.getBlockByHeight(
-        network.networkId,
-        network.id,
-        blockRef.blockHeight,
-      );
-      if (block) {
-        matches.push({
-          type: 'block',
-          network: network.id,
-          blockHeight: block.height,
-          blockHash: block.hash,
-          blockTime: block.time,
-        });
-      }
+    if (!blockRef) {
+      return null;
     }
 
+    const block = await this.getBlockByHeight(network.networkId, network.id, blockRef.blockHeight);
+    return block ? blockSearchResult(block) : null;
+  }
+
+  private async searchAddress(
+    network: ExplorerNetworkRef,
+    q: string,
+  ): Promise<ExplorerSearchResult | null> {
     const [summary, labelMap] = await Promise.all([
       this.warehouse.getAddressSummary(network.networkId, q),
       this.buildLabelMap(network.networkId, [q]),
     ]);
-    const label = labelMap.get(q);
-    const hasAddressMatch = Boolean(summary) || Boolean(label);
-    if (hasAddressMatch) {
-      matches.push({
-        type: 'address',
-        network: network.id,
-        address: q,
-        ...(summary
-          ? {
-              balance: summary.balance,
-              txCount: summary.txCount,
-            }
-          : {}),
-        hasLabel: Boolean(label),
-        ...(label ? { riskLevel: label.riskLevel } : {}),
-      });
-    }
 
-    return { matches };
+    return addressSearchResult(network.id, q, summary, labelMap.get(q));
   }
 
   public async listBlocks(
@@ -233,20 +240,11 @@ export class ExplorerQueryService {
     txid: string,
     networkId?: string,
   ): Promise<ExplorerTransactionDetail> {
+    const normalizedTxid = txid.trim();
     const network = await this.resolveNetwork(networkId);
-    const txRef = await this.warehouse.getTransactionRef(network.networkId, txid.trim());
-    if (!txRef) {
-      throw new NotFoundError('transaction not found');
-    }
-
+    const txRef = await this.requireTransactionRef(network.networkId, normalizedTxid);
     const block = await this.loadBlockSnapshot(network.networkId, txRef.blockHeight);
-    const transaction = block.tx.find(
-      (candidate) => this.readString(candidate.txid) === txid.trim(),
-    );
-    if (!transaction) {
-      throw new NotFoundError('transaction not found');
-    }
-
+    const transaction = this.requireTransaction(block, normalizedTxid);
     const inputMap = await this.loadResolvedInputs(network.networkId, [transaction]);
     const summary = this.serializeTransactionSummary(
       network.id,
@@ -256,71 +254,120 @@ export class ExplorerQueryService {
       inputMap,
     );
     const outputs = this.readOutputs(transaction.vout);
-    const outputKeys = outputs.map((_output, index) => `${txid.trim()}:${index}`);
+    const outputKeys = outputs.map((_output, index) => `${normalizedTxid}:${index}`);
     const currentOutputs = await this.warehouse.getUtxoOutputs(network.networkId, outputKeys);
     const addresses = new Set<string>();
-    const inputs: ExplorerTransactionInput[] = this.readInputs(transaction.vin).flatMap((input) => {
-      if (input.coinbase) {
-        return [];
-      }
-
-      const outputKey = `${this.requireString(input.txid, 'vin.txid')}:${this.requireNumber(input.vout, 'vin.vout')}`;
-      const resolved = inputMap.get(outputKey);
-      if (!resolved || !resolved.address) {
-        return [];
-      }
-      addresses.add(resolved.address);
-      return [
-        {
-          address: resolved.address,
-          outputKey,
-          valueBase: resolved.valueBase,
-        },
-      ];
-    });
-    const serializedOutputs: ExplorerTransactionOutput[] = outputs.map((output, index) => {
-      const outputKey = `${txid.trim()}:${index}`;
-      const current = currentOutputs.get(outputKey);
-      const address = this.extractOutputAddress(output);
-      if (address) {
-        addresses.add(address);
-      }
-      return {
-        address,
-        vout: this.requireNumber(output.n ?? index, 'vout.n'),
-        outputKey,
-        valueBase: this.requireAmountBase(output.value),
-        scriptType: output.scriptPubKey?.type?.trim() ?? '',
-        isSpendable: Boolean(address),
-        spentByTxid: current?.spentByTxid ?? null,
-        spentInBlock: current?.spentInBlock ?? null,
-      };
-    });
+    const inputs = this.serializeTransactionInputs(transaction, inputMap, addresses);
+    const serializedOutputs = this.serializeTransactionOutputs(
+      normalizedTxid,
+      outputs,
+      currentOutputs,
+      addresses,
+    );
 
     const labelMap = await this.buildLabelMap(network.networkId, [...addresses]);
-    for (const input of inputs) {
-      const label = labelMap.get(input.address);
-      if (label) {
-        input.label = label;
-      }
-    }
-    for (const output of serializedOutputs) {
-      const label = labelMap.get(output.address);
-      if (label) {
-        output.label = label;
-      }
-    }
+    const labeled = withTransactionLabels(inputs, serializedOutputs, labelMap);
 
-    const transfers = this.projectTransfers(summary, inputs, serializedOutputs);
+    const transfers = this.projectTransfers(summary, labeled.inputs, labeled.outputs);
 
     return {
       transaction: summary,
-      inputs,
-      outputs: serializedOutputs,
+      inputs: labeled.inputs,
+      outputs: labeled.outputs,
       transfers,
       overlay: {
         labels: [...new Map([...labelMap.values()].map((label) => [label.entity, label])).values()],
       },
+    };
+  }
+
+  private async requireTransactionRef(networkId: PrimaryId, txid: string) {
+    const txRef = await this.warehouse.getTransactionRef(networkId, txid);
+    if (!txRef) {
+      throw new NotFoundError('transaction not found');
+    }
+
+    return txRef;
+  }
+
+  private requireTransaction(block: ParsedDogecoinBlock, txid: string): DogecoinTransaction {
+    const transaction = block.tx.find((candidate) => this.readString(candidate.txid) === txid);
+    if (!transaction) {
+      throw new NotFoundError('transaction not found');
+    }
+
+    return transaction;
+  }
+
+  private serializeTransactionInputs(
+    transaction: DogecoinTransaction,
+    inputMap: Map<string, ProjectionUtxoOutput>,
+    addresses: Set<string>,
+  ): ExplorerTransactionInput[] {
+    return this.readInputs(transaction.vin).flatMap((input) =>
+      this.serializeTransactionInput(input, inputMap, addresses),
+    );
+  }
+
+  private serializeTransactionInput(
+    input: DogecoinVin,
+    inputMap: Map<string, ProjectionUtxoOutput>,
+    addresses: Set<string>,
+  ): ExplorerTransactionInput[] {
+    if (input.coinbase) {
+      return [];
+    }
+
+    const outputKey = `${this.requireString(input.txid, 'vin.txid')}:${this.requireNumber(input.vout, 'vin.vout')}`;
+    const resolved = inputMap.get(outputKey);
+    if (!resolved?.address) {
+      return [];
+    }
+
+    addresses.add(resolved.address);
+    return [
+      {
+        address: resolved.address,
+        outputKey,
+        valueBase: resolved.valueBase,
+      },
+    ];
+  }
+
+  private serializeTransactionOutputs(
+    txid: string,
+    outputs: DogecoinVout[],
+    currentOutputs: Map<string, ProjectionUtxoOutput>,
+    addresses: Set<string>,
+  ): ExplorerTransactionOutput[] {
+    return outputs.map((output, index) =>
+      this.serializeTransactionOutput(txid, output, index, currentOutputs, addresses),
+    );
+  }
+
+  private serializeTransactionOutput(
+    txid: string,
+    output: DogecoinVout,
+    index: number,
+    currentOutputs: Map<string, ProjectionUtxoOutput>,
+    addresses: Set<string>,
+  ): ExplorerTransactionOutput {
+    const outputKey = `${txid}:${index}`;
+    const current = currentOutputs.get(outputKey);
+    const address = extractDogecoinOutputAddress(output);
+    if (address) {
+      addresses.add(address);
+    }
+
+    return {
+      address,
+      vout: this.requireNumber(outputIndex(output, index), 'vout.n'),
+      outputKey,
+      valueBase: this.requireAmountBase(output.value),
+      scriptType: outputScriptType(output),
+      isSpendable: Boolean(address),
+      spentByTxid: spentByTxid(current),
+      spentInBlock: spentInBlock(current),
     };
   }
 
@@ -331,28 +378,24 @@ export class ExplorerQueryService {
     }
 
     const network = await this.resolveNetwork(networkId);
-    const summary = await this.warehouse.getAddressSummary(network.networkId, normalizedAddress);
-    const overlay = await this.buildAddressOverlay(network.networkId, normalizedAddress);
+    const [summary, overlay, labeledRecord] = await Promise.all([
+      this.warehouse.getAddressSummary(network.networkId, normalizedAddress),
+      this.buildAddressOverlay(network.networkId, normalizedAddress),
+      this.findLabeledAddress(network.networkId, normalizedAddress),
+    ]);
 
-    const labeledRecord = (await this.metadata.listAddressesByValues([normalizedAddress])).find(
-      (candidate) => candidate.networkId === network.networkId,
-    );
-    if (!summary && !labeledRecord) {
-      throw new NotFoundError('address not found');
-    }
+    assertAddressExists(summary, labeledRecord);
 
     return {
-      address: {
-        network: network.id,
-        address: normalizedAddress,
-        balance: summary?.balance ?? '0',
-        receivedBase: summary?.receivedBase ?? '0',
-        sentBase: summary?.sentBase ?? '0',
-        txCount: summary?.txCount ?? 0,
-        utxoCount: summary?.utxoCount ?? 0,
-      },
+      address: addressDetail(network.id, normalizedAddress, summary),
       overlay,
     };
+  }
+
+  private async findLabeledAddress(networkId: PrimaryId, address: string) {
+    return (await this.metadata.listAddressesByValues([address])).find(
+      (candidate) => candidate.networkId === networkId,
+    );
   }
 
   public async listAddressTransactions(
@@ -448,45 +491,16 @@ export class ExplorerQueryService {
     };
   }
 
-  private async resolveNetwork(networkId?: string): Promise<{
-    id: string;
-    name: string;
-    networkId: PrimaryId;
-  }> {
+  private async resolveNetwork(networkId?: string): Promise<ExplorerNetworkRef> {
     const activeNetworks = (await this.networks.listActiveNetworks()).filter(
       (network) => network.architecture === 'dogecoin',
     );
-    if (activeNetworks.length === 0) {
-      throw new NotFoundError('dogecoin network not found');
-    }
 
     if (networkId) {
-      const network = activeNetworks.find((candidate) => candidate.id === networkId);
-      if (!network) {
-        throw new ValidationError(`invalid parameter for \`network\`: ${networkId}`);
-      }
-
-      return {
-        id: network.id,
-        name: network.name,
-        networkId: network.networkId,
-      };
+      return explorerNetworkRef(requireExplorerNetwork(activeNetworks, networkId));
     }
 
-    if (activeNetworks.length > 1) {
-      throw new ValidationError('missing parameter for `network`');
-    }
-
-    const [network] = activeNetworks;
-    if (!network) {
-      throw new NotFoundError('dogecoin network not found');
-    }
-
-    return {
-      id: network.id,
-      name: network.name,
-      networkId: network.networkId,
-    };
+    return explorerNetworkRef(requireDefaultExplorerNetwork(activeNetworks));
   }
 
   private async resolveBlockSnapshot(
@@ -601,26 +615,8 @@ export class ExplorerQueryService {
     const inputs = this.readInputs(transaction.vin);
     const outputs = this.readOutputs(transaction.vout);
     const isCoinbase = inputs.some((input) => Boolean(input.coinbase));
-
-    let totalInput = 0n;
-    for (const input of inputs) {
-      if (input.coinbase) {
-        continue;
-      }
-
-      const outputKey = `${this.requireString(input.txid, 'vin.txid')}:${this.requireNumber(input.vout, 'vin.vout')}`;
-      const resolved = resolvedInputs?.get(outputKey);
-      if (resolved) {
-        totalInput += parseAmountBase(resolved.valueBase);
-      }
-    }
-
-    const totalOutput = outputs.reduce(
-      (sum, output) => sum + parseAmountBase(this.requireAmountBase(output.value)),
-      0n,
-    );
-    const feeBase =
-      isCoinbase || totalInput === 0n ? null : formatAmountBase(totalInput - totalOutput);
+    const totalInput = this.totalResolvedInputBase(inputs, resolvedInputs);
+    const totalOutput = this.totalOutputBase(outputs);
 
     return {
       network,
@@ -634,92 +630,53 @@ export class ExplorerQueryService {
       outputCount: outputs.length,
       totalInputBase: formatAmountBase(totalInput),
       totalOutputBase: formatAmountBase(totalOutput),
-      feeBase,
+      feeBase: transactionFeeBase(isCoinbase, totalInput, totalOutput),
     };
+  }
+
+  private totalResolvedInputBase(
+    inputs: DogecoinVin[],
+    resolvedInputs?: Map<string, ProjectionUtxoOutput>,
+  ): bigint {
+    let totalInput = 0n;
+    for (const input of inputs) {
+      totalInput += this.resolvedInputValue(input, resolvedInputs);
+    }
+
+    return totalInput;
+  }
+
+  private resolvedInputValue(
+    input: DogecoinVin,
+    resolvedInputs?: Map<string, ProjectionUtxoOutput>,
+  ): bigint {
+    if (input.coinbase) {
+      return 0n;
+    }
+
+    const outputKey = `${this.requireString(input.txid, 'vin.txid')}:${this.requireNumber(input.vout, 'vin.vout')}`;
+    const resolved = resolvedInputs?.get(outputKey);
+    return resolved ? parseAmountBase(resolved.valueBase) : 0n;
+  }
+
+  private totalOutputBase(outputs: DogecoinVout[]): bigint {
+    return outputs.reduce(
+      (sum, output) => sum + parseAmountBase(this.requireAmountBase(output.value)),
+      0n,
+    );
   }
 
   private projectTransfers(
     summary: ExplorerTransactionSummary,
     inputs: ExplorerTransactionInput[],
     outputs: ExplorerTransactionOutput[],
-  ): Array<{
-    amountBase: string;
-    from: string;
-    to: string;
-  }> {
-    if (summary.isCoinbase || inputs.length === 0 || outputs.length === 0) {
+  ): ExplorerProjectedTransfer[] {
+    const basis = buildExplorerTransferBasis(summary, inputs, outputs);
+    if (!basis) {
       return [];
     }
 
-    const inputTotals = new Map<string, bigint>();
-    for (const input of inputs) {
-      const current = inputTotals.get(input.address) ?? 0n;
-      inputTotals.set(input.address, current + parseAmountBase(input.valueBase));
-    }
-
-    const totalInput = [...inputTotals.values()].reduce((sum, value) => sum + value, 0n);
-    const addresses = [...inputTotals.keys()].sort((left, right) => left.localeCompare(right));
-    const transfers: Array<{
-      amountBase: string;
-      from: string;
-      to: string;
-    }> = [];
-
-    for (const output of outputs) {
-      if (!output.address) {
-        continue;
-      }
-
-      const allocations = this.allocateOutputAmount(
-        parseAmountBase(output.valueBase),
-        addresses,
-        inputTotals,
-        totalInput,
-      );
-      for (const allocation of allocations) {
-        if (allocation.amount <= 0n) {
-          continue;
-        }
-
-        transfers.push({
-          from: allocation.address,
-          to: output.address,
-          amountBase: formatAmountBase(allocation.amount),
-        });
-      }
-    }
-
-    return transfers;
-  }
-
-  private allocateOutputAmount(
-    target: bigint,
-    inputAddresses: string[],
-    inputTotals: Map<string, bigint>,
-    totalInput: bigint,
-  ): Array<{ address: string; amount: bigint }> {
-    if (totalInput <= 0n || inputAddresses.length === 0) {
-      return [];
-    }
-
-    const allocations: Array<{ address: string; amount: bigint }> = [];
-    let allocated = 0n;
-    for (const [index, address] of inputAddresses.entries()) {
-      if (index === inputAddresses.length - 1) {
-        allocations.push({
-          address,
-          amount: target - allocated,
-        });
-        continue;
-      }
-
-      const contribution = inputTotals.get(address) ?? 0n;
-      const amount = (target * contribution) / totalInput;
-      allocations.push({ address, amount });
-      allocated += amount;
-    }
-
-    return allocations;
+    return projectExplorerTransfers(outputs, basis);
   }
 
   private async buildLabelMap(
@@ -792,88 +749,22 @@ export class ExplorerQueryService {
       ),
     ]);
 
-    const reasons = new Set<'entity' | 'source'>();
-    let riskLevel: RiskLevel = 'low';
-    for (const tag of joinedTags) {
-      reasons.add('entity');
-      if (tag.riskLevel === 'high') {
-        riskLevel = 'high';
-      }
-    }
-    if (links.length > 0) {
-      reasons.add('source');
-    }
-
     const tokens = (
       await this.warehouse.getTokensByAddresses(
         balances.map((balance) => balance.assetAddress).filter(Boolean),
       )
     ).filter((token) => token.networkId === networkId);
-    const tokenByNetworkAndAddress = new Map(
-      tokens.map((token) => [`${token.networkId}:${token.address}`, token]),
-    );
-    const networkById = new Map(networks.map((network) => [network.networkId, network]));
-    const entityIdsByAddress = new Map(
-      addressRecords.map((record) => [record.address, record.entityId]),
-    );
-    const tagIdsByEntityId = new Map<PrimaryId, string[]>();
-    for (const tag of joinedTags) {
-      const current = tagIdsByEntityId.get(tag.entityId) ?? [];
-      current.push(tag.id);
-      tagIdsByEntityId.set(tag.entityId, current);
-    }
 
-    return {
+    return buildInfoResponse({
       addresses: [address],
-      risk: {
-        level: riskLevel,
-        reasons: [...reasons],
-      },
-      assets: balances.map((balance) => {
-        const tokenId = tokenByNetworkAndAddress.get(
-          `${balance.networkId}:${balance.assetAddress}`,
-        )?.id;
-        return {
-          network: networkById.get(balance.networkId)?.id ?? '',
-          balance: balance.balance,
-          ...(tokenId ? { token: tokenId } : {}),
-        };
-      }),
-      tokens: tokens.map((token) => ({
-        id: token.id,
-        name: token.name,
-        symbol: token.symbol,
-        address: token.address,
-        decimals: token.decimals,
-      })),
-      sources: links.map((link) => ({
-        network: networkById.get(link.networkId)?.id ?? '',
-        entity:
-          entities.find(
-            (candidate) => candidate.entityId === entityIdsByAddress.get(link.fromAddress),
-          )?.id ?? '',
-        from: link.fromAddress,
-        to: link.toAddress,
-        hops: link.transferCount,
-      })),
-      networks: networks.map((network) => ({
-        id: network.id,
-        name: network.name,
-        chainId: network.chainId,
-      })),
-      entities: entities.map((candidate) => ({
-        id: candidate.id,
-        name: candidate.name,
-        description: candidate.description,
-        data: candidate.data,
-        tags: tagIdsByEntityId.get(candidate.entityId) ?? [],
-      })),
-      tags: joinedTags.map((tag) => ({
-        id: tag.id,
-        name: tag.name,
-        riskLevel: tag.riskLevel,
-      })),
-    };
+      addressRecords,
+      balances,
+      entities,
+      joinedTags,
+      links,
+      networks,
+      tokens,
+    });
   }
 
   private parseBlock(snapshot: Record<string, unknown>): ParsedDogecoinBlock {
@@ -894,36 +785,20 @@ export class ExplorerQueryService {
     return Array.isArray(value) ? value : [];
   }
 
-  private extractOutputAddress(output: DogecoinVout): string {
-    const direct = output.scriptPubKey?.address?.trim();
-    if (direct) {
-      return direct;
-    }
-
-    const first = output.scriptPubKey?.addresses?.find((value) => value.trim());
-    return first?.trim() ?? '';
-  }
-
   private requireAmountBase(value: number | string | undefined): string {
     if (value === undefined) {
       throw new ValidationError('missing output value');
     }
 
     if (typeof value === 'number') {
-      const [whole, fraction = ''] = value.toFixed(8).split('.');
-      return `${whole}${fraction.padEnd(8, '0')}`.replace(/^0+(?=\d)/u, '') || '0';
+      return decimalPartsToBase(value.toFixed(8).split('.'));
     }
 
-    const [whole = '', fraction = ''] = value.trim().split('.');
-    if (!/^\d+$/u.test(whole) || !/^\d*$/u.test(fraction)) {
-      throw new ValidationError(`invalid decimal amount: ${value}`);
-    }
-
-    return `${whole}${fraction.padEnd(8, '0').slice(0, 8)}`.replace(/^0+(?=\d)/u, '') || '0';
+    return stringDecimalToBase(value);
   }
 
   private requireNumber(value: number | undefined, field: string): number {
-    if (value === undefined || !Number.isInteger(value) || value < 0) {
+    if (!isNonNegativeInteger(value)) {
       throw new ValidationError(`invalid parameter for \`${field}\`: ${value ?? ''}`);
     }
 
@@ -956,6 +831,99 @@ export class ExplorerQueryService {
   }
 }
 
-function isDogecoinTransaction(value: unknown): value is DogecoinTransaction {
-  return typeof value === 'object' && value !== null;
+function normalizeRequiredQuery(query: string | undefined): string {
+  const q = query?.trim() ?? '';
+  if (!q) {
+    throw new ValidationError('missing input params');
+  }
+
+  return q;
+}
+
+function blockSearchResult(block: ExplorerBlockSummary): ExplorerSearchResult {
+  return {
+    type: 'block',
+    network: block.network,
+    blockHeight: block.height,
+    blockHash: block.hash,
+    blockTime: block.time,
+  };
+}
+
+function requireExplorerNetwork(
+  networks: Array<ExplorerNetworkRef & { architecture?: string }>,
+  networkId: string,
+): ExplorerNetworkRef {
+  const network = networks.find((candidate) => candidate.id === networkId);
+  if (!network) {
+    throw new ValidationError(`invalid parameter for \`network\`: ${networkId}`);
+  }
+
+  return network;
+}
+
+function requireDefaultExplorerNetwork(
+  networks: Array<ExplorerNetworkRef & { architecture?: string }>,
+): ExplorerNetworkRef {
+  if (networks.length === 0) {
+    throw new NotFoundError('dogecoin network not found');
+  }
+  if (networks.length > 1) {
+    throw new ValidationError('missing parameter for `network`');
+  }
+
+  return networks[0] as ExplorerNetworkRef;
+}
+
+function explorerNetworkRef(network: ExplorerNetworkRef): ExplorerNetworkRef {
+  return {
+    id: network.id,
+    name: network.name,
+    networkId: network.networkId,
+  };
+}
+
+function assertAddressExists(
+  summary: WarehouseAddressSummary | null,
+  labeledRecord: unknown,
+): void {
+  if (!summary && !labeledRecord) {
+    throw new NotFoundError('address not found');
+  }
+}
+
+function transactionFeeBase(
+  isCoinbase: boolean,
+  totalInput: bigint,
+  totalOutput: bigint,
+): string | null {
+  if (isCoinbase || totalInput === 0n) {
+    return null;
+  }
+
+  return formatAmountBase(totalInput - totalOutput);
+}
+
+function stringDecimalToBase(value: string): string {
+  const [whole = '', fraction = ''] = value.trim().split('.');
+  assertDecimalParts(value, whole, fraction);
+  return decimalPartsToBase([whole, fraction.slice(0, 8)]);
+}
+
+function decimalPartsToBase(parts: string[]): string {
+  const [whole = '', fraction = ''] = parts;
+  return `${whole}${fraction.padEnd(8, '0')}`.replace(/^0+(?=\d)/u, '') || '0';
+}
+
+function assertDecimalParts(raw: string, whole: string, fraction: string): void {
+  if (!/^\d+$/u.test(whole)) {
+    throw new ValidationError(`invalid decimal amount: ${raw}`);
+  }
+  if (!/^\d*$/u.test(fraction)) {
+    throw new ValidationError(`invalid decimal amount: ${raw}`);
+  }
+}
+
+function isNonNegativeInteger(value: number | undefined): value is number {
+  return value !== undefined && Number.isInteger(value) && value >= 0;
 }

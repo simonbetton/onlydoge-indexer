@@ -1,15 +1,10 @@
-import {
-  type PrimaryId,
-  type RiskLevel,
-  type RiskReason,
-  ValidationError,
-} from '@onlydoge/shared-kernel';
+import { ValidationError } from '@onlydoge/shared-kernel';
 import type {
   ConfigReader,
   InvestigationMetadataPort,
   InvestigationWarehousePort,
 } from '../contracts/ports';
-import type { InfoResponse } from '../domain/query-models';
+import { buildInfoResponse, type InfoResponse } from '../domain/query-models';
 
 export class InvestigationQueryService {
   public constructor(
@@ -75,85 +70,19 @@ export class InvestigationQueryService {
       this.metadata.listNetworksByInternalIds(addressRecords.map((address) => address.networkId)),
     ]);
 
-    const reasons = new Set<RiskReason>();
-    let riskLevel: RiskLevel = 'low';
-    for (const tag of joinedTags) {
-      reasons.add('entity');
-      if (tag.riskLevel === 'high') {
-        riskLevel = 'high';
-      }
-    }
-    if (links.length > 0) {
-      reasons.add('source');
-    }
-
     const tokens = await this.warehouse.getTokensByAddresses(
       balances.map((balance) => balance.assetAddress).filter(Boolean),
     );
-    const tokenByNetworkAndAddress = new Map(
-      tokens.map((token) => [`${token.networkId}:${token.address}`, token]),
-    );
-    const networkById = new Map(networks.map((network) => [network.networkId, network]));
-    const entityIdsByAddress = new Map(
-      addressRecords.map((address) => [address.address, address.entityId]),
-    );
-    const tagIdsByEntityId = new Map<PrimaryId, string[]>();
-    for (const tag of joinedTags) {
-      const current = tagIdsByEntityId.get(tag.entityId) ?? [];
-      current.push(tag.id);
-      tagIdsByEntityId.set(tag.entityId, current);
-    }
 
-    return {
+    return buildInfoResponse({
       addresses,
-      risk: {
-        level: riskLevel,
-        reasons: [...reasons],
-      },
-      assets: balances.map((balance) => {
-        const tokenId = tokenByNetworkAndAddress.get(
-          `${balance.networkId}:${balance.assetAddress}`,
-        )?.id;
-        return {
-          network: networkById.get(balance.networkId)?.id ?? '',
-          balance: balance.balance,
-          ...(tokenId ? { token: tokenId } : {}),
-        };
-      }),
-      tokens: tokens.map((token) => ({
-        id: token.id,
-        name: token.name,
-        symbol: token.symbol,
-        address: token.address,
-        decimals: token.decimals,
-      })),
-      sources: links.map((link) => ({
-        network: networkById.get(link.networkId)?.id ?? '',
-        entity:
-          entities.find(
-            (candidate) => candidate.entityId === entityIdsByAddress.get(link.fromAddress),
-          )?.id ?? '',
-        from: link.fromAddress,
-        to: link.toAddress,
-        hops: link.transferCount,
-      })),
-      networks: networks.map((network) => ({
-        id: network.id,
-        name: network.name,
-        chainId: network.chainId,
-      })),
-      entities: entities.map((candidate) => ({
-        id: candidate.id,
-        name: candidate.name,
-        description: candidate.description,
-        data: candidate.data,
-        tags: tagIdsByEntityId.get(candidate.entityId) ?? [],
-      })),
-      tags: joinedTags.map((tag) => ({
-        id: tag.id,
-        name: tag.name,
-        riskLevel: tag.riskLevel,
-      })),
-    };
+      addressRecords,
+      balances,
+      entities,
+      joinedTags,
+      links,
+      networks,
+      tokens,
+    });
   }
 }

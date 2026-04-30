@@ -39,6 +39,17 @@ export interface TagRecord {
   createdAt: string;
 }
 
+export interface UpdateEntityInput {
+  data?: Record<string, unknown>;
+  description?: string;
+  name?: string | null;
+}
+
+export interface UpdateTagInput {
+  name?: string;
+  riskLevel?: RiskLevel;
+}
+
 export class Entity {
   public readonly record: EntityRecord;
 
@@ -52,41 +63,42 @@ export class Entity {
     id?: string;
     name?: string | null;
   }): Entity {
-    if (!input.description.trim()) {
-      throw new ValidationError('invalid parameter for `description`: ');
-    }
+    assertEntityDescription(input.description);
 
-    return new Entity({
-      entityId: 0,
-      id: input.id
-        ? ExternalId.parse(input.id, 'ent').toString()
-        : ExternalId.create('ent').toString(),
-      name: input.name?.trim() || null,
-      description: input.description.trim(),
-      data: input.data ?? {},
-      isDeleted: false,
-      updatedAt: null,
-      createdAt: new Date().toISOString(),
-    });
+    return new Entity(entityRecordFromInput(input));
   }
+}
 
-  public static rehydrate(record: EntityRecord): Entity {
-    return new Entity(record);
-  }
+function entityRecordFromInput(input: {
+  data?: Record<string, unknown>;
+  description: string;
+  id?: string;
+  name?: string | null;
+}): EntityRecord {
+  return {
+    entityId: 0,
+    id: resolveEntityExternalId(input.id),
+    name: normalizeOptionalName(input.name),
+    description: input.description.trim(),
+    data: input.data ?? {},
+    isDeleted: false,
+    updatedAt: null,
+    createdAt: new Date().toISOString(),
+  };
+}
 
-  public update(input: {
-    data?: Record<string, unknown>;
-    description?: string;
-    name?: string | null;
-  }): EntityRecord {
-    return {
-      ...this.record,
-      name: input.name === undefined ? this.record.name : input.name?.trim() || null,
-      description: input.description?.trim() ?? this.record.description,
-      data: input.data ?? this.record.data,
-      updatedAt: new Date().toISOString(),
-    };
+function assertEntityDescription(value: string): void {
+  if (!value.trim()) {
+    throw new ValidationError('invalid parameter for `description`: ');
   }
+}
+
+function resolveEntityExternalId(id: string | undefined): string {
+  return id ? ExternalId.parse(id, 'ent').value : ExternalId.create('ent').value;
+}
+
+function normalizeOptionalName(value: string | null | undefined): string | null {
+  return value?.trim() || null;
 }
 
 export class Address {
@@ -112,7 +124,7 @@ export class Address {
       addressId: 0,
       entityId: input.entityId,
       networkId: input.networkId,
-      id: ExternalId.create('adr').toString(),
+      id: ExternalId.create('adr').value,
       network: input.network,
       address: input.address.trim(),
       description: input.description.trim(),
@@ -121,10 +133,6 @@ export class Address {
       updatedAt: null,
       createdAt: new Date().toISOString(),
     });
-  }
-
-  public static rehydrate(record: AddressRecord): Address {
-    return new Address(record);
   }
 }
 
@@ -142,26 +150,45 @@ export class Tag {
 
     return new Tag({
       tagId: 0,
-      id: input.id
-        ? ExternalId.parse(input.id, 'tag').toString()
-        : ExternalId.create('tag').toString(),
+      id: input.id ? ExternalId.parse(input.id, 'tag').value : ExternalId.create('tag').value,
       name: input.name.trim(),
       riskLevel: input.riskLevel,
       updatedAt: null,
       createdAt: new Date().toISOString(),
     });
   }
+}
 
-  public static rehydrate(record: TagRecord): Tag {
-    return new Tag(record);
-  }
+export function updateEntityRecord(record: EntityRecord, input: UpdateEntityInput): EntityRecord {
+  return {
+    ...record,
+    name: updatedEntityName(input.name, record.name),
+    description: updatedText(input.description, record.description),
+    data: updatedValue(input.data, record.data),
+    updatedAt: new Date().toISOString(),
+  };
+}
 
-  public update(input: { name?: string; riskLevel?: RiskLevel }): TagRecord {
-    return {
-      ...this.record,
-      name: input.name?.trim() ?? this.record.name,
-      riskLevel: input.riskLevel ?? this.record.riskLevel,
-      updatedAt: new Date().toISOString(),
-    };
-  }
+function updatedEntityName(
+  value: string | null | undefined,
+  fallback: string | null,
+): string | null {
+  return value === undefined ? fallback : normalizeOptionalName(value);
+}
+
+function updatedText(value: string | undefined, fallback: string): string {
+  return value === undefined ? fallback : value.trim();
+}
+
+function updatedValue<T>(value: T | undefined, fallback: T): T {
+  return value === undefined ? fallback : value;
+}
+
+export function updateTagRecord(record: TagRecord, input: UpdateTagInput): TagRecord {
+  return {
+    ...record,
+    name: input.name?.trim() ?? record.name,
+    riskLevel: input.riskLevel ?? record.riskLevel,
+    updatedAt: new Date().toISOString(),
+  };
 }

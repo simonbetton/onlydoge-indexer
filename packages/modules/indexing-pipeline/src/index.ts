@@ -5,4 +5,5 @@ export * from './application/source-link-projector';
 export * from './contracts/ports';
 export * from './domain/amounts';
 export * from './domain/config-keys';
+export * from './domain/dogecoin-block';
 export * from './domain/projection-models';

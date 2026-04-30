@@ -1,10 +1,4 @@
-import {
-  ApiSecret,
-  ExternalId,
-  NotFoundError,
-  type PrimaryId,
-  ValidationError,
-} from '@onlydoge/shared-kernel';
+import { ApiSecret, ExternalId, NotFoundError, type PrimaryId } from '@onlydoge/shared-kernel';
 
 export interface ApiKeyRecord {
   apiKeyId: PrimaryId;
@@ -20,6 +14,13 @@ export interface CreateApiKeyInput {
   id?: string;
 }
 
+export interface ApiKeyResponse {
+  createdAt: string;
+  id: string;
+  isActive: boolean;
+  key?: string;
+}
+
 export class ApiKey {
   public readonly record: ApiKeyRecord;
 
@@ -28,9 +29,7 @@ export class ApiKey {
   }
 
   public static create(input: CreateApiKeyInput, nextPrimaryId = 0): ApiKey {
-    const id = input.id
-      ? ExternalId.parse(input.id, 'key').toString()
-      : ExternalId.create('key').toString();
+    const id = input.id ? ExternalId.parse(input.id, 'key').value : ExternalId.create('key').value;
     const secret = ApiSecret.generate();
 
     return new ApiKey({
@@ -43,50 +42,31 @@ export class ApiKey {
       createdAt: new Date().toISOString(),
     });
   }
+}
 
-  public static rehydrate(record: ApiKeyRecord): ApiKey {
-    if (!record.id) {
-      throw new ValidationError('invalid api key record');
-    }
+export function hideApiKeySecret(record: ApiKeyRecord): ApiKeyRecord {
+  return {
+    ...record,
+    secretKeyPlaintext: null,
+    updatedAt: new Date().toISOString(),
+  };
+}
 
-    return new ApiKey(record);
-  }
+export function setApiKeyIsActive(record: ApiKeyRecord, isActive: boolean): ApiKeyRecord {
+  return {
+    ...record,
+    isActive,
+    updatedAt: new Date().toISOString(),
+  };
+}
 
-  public requireActive(): void {
-    if (!this.record.isActive) {
-      throw new ValidationError('unauthorized');
-    }
-  }
-
-  public hideSecret(): ApiKeyRecord {
-    return {
-      ...this.record,
-      secretKeyPlaintext: null,
-      updatedAt: new Date().toISOString(),
-    };
-  }
-
-  public setIsActive(isActive: boolean): ApiKeyRecord {
-    return {
-      ...this.record,
-      isActive,
-      updatedAt: new Date().toISOString(),
-    };
-  }
-
-  public toResponse(): {
-    createdAt: string;
-    id: string;
-    isActive: boolean;
-    key?: string;
-  } {
-    return {
-      id: this.record.id,
-      isActive: this.record.isActive,
-      createdAt: this.record.createdAt,
-      ...(this.record.secretKeyPlaintext ? { key: this.record.secretKeyPlaintext } : {}),
-    };
-  }
+export function apiKeyToResponse(record: ApiKeyRecord): ApiKeyResponse {
+  return {
+    id: record.id,
+    isActive: record.isActive,
+    createdAt: record.createdAt,
+    ...(record.secretKeyPlaintext ? { key: record.secretKeyPlaintext } : {}),
+  };
 }
 
 export function requireApiKey(record: ApiKeyRecord | null): ApiKeyRecord {

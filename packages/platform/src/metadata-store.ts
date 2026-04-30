@@ -14,13 +14,15 @@ import type {
   TagRepository,
 } from '@onlydoge/entity-labeling';
 import {
-  addAmountBase,
+  applyDirectLinkDeltasToSnapshots,
   type BlockProjectionBatch,
+  buildProjectionStateChanges,
   type CoordinatorConfigPort,
+  collectProjectionDirectLinkSnapshotKeys,
   configKeyNewlyAddedAddress,
   configKeyProjectionBootstrapTail,
+  type DirectLinkDelta,
   type DirectLinkRecord,
-  formatAmountBase,
   type IndexedNetworkPort,
   type ProjectionAppliedBlock,
   type ProjectionBalanceSnapshot,
@@ -29,8 +31,13 @@ import {
   type ProjectionStateBootstrapSnapshot,
   type ProjectionStateStorePort,
   type ProjectionUtxoOutput,
-  parseAmountBase,
+  parseProjectionDirectLinkSnapshotKey,
+  projectionBalanceSnapshotKey,
+  projectionBlockIdentity,
+  projectionDirectLinkSnapshotKey,
+  resolvePendingProjectionWindow,
   type SourceLinkRecord,
+  toProjectionAppliedBlocks,
 } from '@onlydoge/indexing-pipeline';
 import type {
   ConfigReader,
@@ -56,6 +63,19 @@ import { drizzle as drizzlePg } from 'drizzle-orm/node-postgres';
 import mysql from 'mysql2/promise';
 import { Pool, type PoolClient } from 'pg';
 
+import {
+  compileQuery,
+  currentAddressSummary,
+  nullableNumber,
+  nullableString,
+  type SqlValue,
+  sqlLimitClause,
+  sqlNullableOffsetClause,
+  sqlNullablePaginationParams,
+  sqlOffsetClause,
+  sqlPaginationParams,
+  toBoolean,
+} from './metadata-query';
 import type { DatabaseSettings } from './settings';
 
 type SupportedClient =
@@ -69,25 +89,7 @@ type SupportedExecutor =
   | { kind: 'postgres'; raw: PoolClient }
   | { kind: 'mysql'; raw: mysql.PoolConnection };
 
-type SqlValue = boolean | number | string | null;
-
 type DatabaseRow = Record<string, SqlValue>;
-
-function compileQuery(kind: SupportedClient['kind'], query: string): string {
-  if (kind !== 'postgres') {
-    return query;
-  }
-
-  let index = 0;
-  return query.replaceAll('?', () => {
-    index += 1;
-    return `$${index}`;
-  });
-}
-
-function toBoolean(value: unknown): boolean {
-  return value === true || value === 1 || value === '1';
-}
 
 export class RelationalMetadataStore
   implements
@@ -189,17 +191,7 @@ export class RelationalMetadataStore
   }
 
   public async listApiKeys(offset?: number, limit?: number) {
-    const rows = await this.query<DatabaseRow>(
-      `
-        SELECT * FROM api_keys
-        ORDER BY api_key_id ASC
-        ${limit !== undefined ? 'LIMIT ?' : ''}
-        ${offset !== undefined ? 'OFFSET ?' : ''}
-      `,
-      [...(limit !== undefined ? [limit] : []), ...(offset !== undefined ? [offset] : [])],
-    );
-
-    return rows.map((row) => this.mapApiKey(row));
+    return this.listTable('api_keys', 'api_key_id', (row) => this.mapApiKey(row), offset, limit);
   }
 
   public async updateApiKey(record: {
@@ -286,30 +278,11 @@ export class RelationalMetadataStore
   }
 
   public async getNetworkByName(name: string, includeDeleted = false) {
-    const row = await this.one<DatabaseRow>(
-      `
-        SELECT * FROM networks
-        WHERE LOWER(name) = LOWER(?)
-        ${includeDeleted ? '' : `AND ${this.booleanCondition('is_deleted', false)}`}
-        LIMIT 1
-      `,
-      [name],
-    );
-    return row ? this.mapNetwork(row) : null;
+    return this.getNamedRecord('networks', name, includeDeleted, (row) => this.mapNetwork(row));
   }
 
   public async listNetworks(offset?: number, limit?: number) {
-    const rows = await this.query<DatabaseRow>(
-      `
-        SELECT * FROM networks
-        ORDER BY network_id ASC
-        ${limit !== undefined ? 'LIMIT ?' : ''}
-        ${offset !== undefined ? 'OFFSET ?' : ''}
-      `,
-      [...(limit !== undefined ? [limit] : []), ...(offset !== undefined ? [offset] : [])],
-    );
-
-    return rows.map((row) => this.mapNetwork(row));
+    return this.listTable('networks', 'network_id', (row) => this.mapNetwork(row), offset, limit);
   }
 
   public async updateNetworkRecord(record: NetworkRecord): Promise<void> {
@@ -334,28 +307,7 @@ export class RelationalMetadataStore
   }
 
   public async softDeleteNetworks(ids: string[]) {
-    if (ids.length === 0) {
-      return [];
-    }
-
-    const networks = await Promise.all(ids.map((id) => this.getNetworkById(id)));
-    const existing = networks.filter((network): network is NonNullable<typeof network> =>
-      Boolean(network),
-    );
-    if (existing.length === 0) {
-      return [];
-    }
-
-    await this.execute(
-      `UPDATE networks SET is_deleted = ${this.booleanLiteral(true)}, updated_at = ? WHERE id IN (${placeholders(
-        existing.length,
-      )})`,
-      [nowIsoString(), ...existing.map((network) => network.id)],
-    );
-
-    return Promise.all(existing.map((network) => this.getNetworkById(network.id))).then((updated) =>
-      updated.filter((network): network is NonNullable<typeof network> => Boolean(network)),
-    );
+    return this.softDeleteRecords('networks', ids, (id) => this.getNetworkById(id));
   }
 
   public async createToken(record: TokenRecord) {
@@ -385,29 +337,23 @@ export class RelationalMetadataStore
   }
 
   public async listTokens(offset?: number, limit?: number) {
-    const rows = await this.query<DatabaseRow>(
-      `
-        SELECT * FROM tokens
-        ORDER BY token_id ASC
-        ${limit !== undefined ? 'LIMIT ?' : ''}
-        ${offset !== undefined ? 'OFFSET ?' : ''}
-      `,
-      [...(limit !== undefined ? [limit] : []), ...(offset !== undefined ? [offset] : [])],
-    );
-
-    return rows.map((row) => this.mapToken(row));
+    return this.listTable('tokens', 'token_id', (row) => this.mapToken(row), offset, limit);
   }
 
   public async listTokensByNetworkIds(networkIds: PrimaryId[]) {
-    if (networkIds.length === 0) {
-      return [];
-    }
+    return this.listRowsByIds('tokens', 'network_id', networkIds, (row) => this.mapToken(row));
+  }
 
-    const rows = await this.query<DatabaseRow>(
-      `SELECT * FROM tokens WHERE network_id IN (${placeholders(networkIds.length)})`,
-      networkIds,
-    );
-    return rows.map((row) => this.mapToken(row));
+  public async listEntitiesByIds(entityIds: PrimaryId[]) {
+    return this.listRowsByIds('entities', 'entity_id', entityIds, (row) => this.mapEntity(row));
+  }
+
+  public async listAddressesByEntityIds(entityIds: PrimaryId[]) {
+    return this.listRowsByIds('addresses', 'entity_id', entityIds, (row) => this.mapAddress(row));
+  }
+
+  public async listAddressesByNetworkIds(networkIds: PrimaryId[]) {
+    return this.listRowsByIds('addresses', 'network_id', networkIds, (row) => this.mapAddress(row));
   }
 
   public async getTokenByNetworkAndAddress(networkId: PrimaryId, address: string) {
@@ -459,42 +405,11 @@ export class RelationalMetadataStore
   }
 
   public async getEntityByName(name: string, includeDeleted = false) {
-    const row = await this.one<DatabaseRow>(
-      `
-        SELECT * FROM entities
-        WHERE LOWER(name) = LOWER(?)
-        ${includeDeleted ? '' : `AND ${this.booleanCondition('is_deleted', false)}`}
-        LIMIT 1
-      `,
-      [name],
-    );
-    return row ? this.mapEntity(row) : null;
+    return this.getNamedRecord('entities', name, includeDeleted, (row) => this.mapEntity(row));
   }
 
   public async listEntities(offset?: number, limit?: number) {
-    const rows = await this.query<DatabaseRow>(
-      `
-        SELECT * FROM entities
-        ORDER BY entity_id ASC
-        ${limit !== undefined ? 'LIMIT ?' : ''}
-        ${offset !== undefined ? 'OFFSET ?' : ''}
-      `,
-      [...(limit !== undefined ? [limit] : []), ...(offset !== undefined ? [offset] : [])],
-    );
-
-    return rows.map((row) => this.mapEntity(row));
-  }
-
-  public async listEntitiesByIds(entityIds: PrimaryId[]) {
-    if (entityIds.length === 0) {
-      return [];
-    }
-
-    const rows = await this.query<DatabaseRow>(
-      `SELECT * FROM entities WHERE entity_id IN (${placeholders(entityIds.length)})`,
-      entityIds,
-    );
-    return rows.map((row) => this.mapEntity(row));
+    return this.listTable('entities', 'entity_id', (row) => this.mapEntity(row), offset, limit);
   }
 
   public async listEntitiesByTagIds(tagIds: PrimaryId[]) {
@@ -537,26 +452,7 @@ export class RelationalMetadataStore
   }
 
   public async softDeleteEntities(ids: string[]) {
-    if (ids.length === 0) {
-      return [];
-    }
-
-    const entities = await Promise.all(ids.map((id) => this.getEntityById(id)));
-    const existing = entities.filter((entity): entity is NonNullable<typeof entity> =>
-      Boolean(entity),
-    );
-    if (existing.length === 0) {
-      return [];
-    }
-
-    await this.execute(
-      `UPDATE entities SET is_deleted = ${this.booleanLiteral(true)}, updated_at = ? WHERE id IN (${placeholders(existing.length)})`,
-      [nowIsoString(), ...existing.map((entity) => entity.id)],
-    );
-
-    return Promise.all(existing.map((entity) => this.getEntityById(entity.id))).then((updated) =>
-      updated.filter((entity): entity is NonNullable<typeof entity> => Boolean(entity)),
-    );
+    return this.softDeleteRecords('entities', ids, (id) => this.getEntityById(id));
   }
 
   public async createAddresses(records: AddressRecord[]) {
@@ -612,41 +508,7 @@ export class RelationalMetadataStore
   }
 
   public async listAddresses(offset?: number, limit?: number) {
-    const rows = await this.query<DatabaseRow>(
-      `
-        SELECT * FROM addresses
-        ORDER BY address_id ASC
-        ${limit !== undefined ? 'LIMIT ?' : ''}
-        ${offset !== undefined ? 'OFFSET ?' : ''}
-      `,
-      [...(limit !== undefined ? [limit] : []), ...(offset !== undefined ? [offset] : [])],
-    );
-
-    return rows.map((row) => this.mapAddress(row));
-  }
-
-  public async listAddressesByEntityIds(entityIds: PrimaryId[]) {
-    if (entityIds.length === 0) {
-      return [];
-    }
-
-    const rows = await this.query<DatabaseRow>(
-      `SELECT * FROM addresses WHERE entity_id IN (${placeholders(entityIds.length)})`,
-      entityIds,
-    );
-    return rows.map((row) => this.mapAddress(row));
-  }
-
-  public async listAddressesByNetworkIds(networkIds: PrimaryId[]) {
-    if (networkIds.length === 0) {
-      return [];
-    }
-
-    const rows = await this.query<DatabaseRow>(
-      `SELECT * FROM addresses WHERE network_id IN (${placeholders(networkIds.length)})`,
-      networkIds,
-    );
-    return rows.map((row) => this.mapAddress(row));
+    return this.listTable('addresses', 'address_id', (row) => this.mapAddress(row), offset, limit);
   }
 
   public async listTrackedAddresses(networkId: PrimaryId) {
@@ -800,29 +662,11 @@ export class RelationalMetadataStore
   }
 
   public async listTags(offset?: number, limit?: number) {
-    const rows = await this.query<DatabaseRow>(
-      `
-        SELECT * FROM tags
-        ORDER BY tag_id ASC
-        ${limit !== undefined ? 'LIMIT ?' : ''}
-        ${offset !== undefined ? 'OFFSET ?' : ''}
-      `,
-      [...(limit !== undefined ? [limit] : []), ...(offset !== undefined ? [offset] : [])],
-    );
-
-    return rows.map((row) => this.mapTag(row));
+    return this.listTable('tags', 'tag_id', (row) => this.mapTag(row), offset, limit);
   }
 
   public async listTagsByIds(tagIds: PrimaryId[]) {
-    if (tagIds.length === 0) {
-      return [];
-    }
-
-    const rows = await this.query<DatabaseRow>(
-      `SELECT * FROM tags WHERE tag_id IN (${placeholders(tagIds.length)})`,
-      tagIds,
-    );
-    return rows.map((row) => this.mapTag(row));
+    return this.listRowsByIds('tags', 'tag_id', tagIds, (row) => this.mapTag(row));
   }
 
   public async updateTagRecord(record: TagRecord): Promise<void> {
@@ -968,73 +812,58 @@ export class RelationalMetadataStore
   }
 
   public async getBalancesByAddresses(addresses: string[]) {
-    if (addresses.length === 0) {
-      return [];
-    }
-
-    const rows = await this.query<DatabaseRow>(
-      `
+    return this.queryByAddresses(
+      addresses,
+      (count) => `
         SELECT network_id, address, asset_address, balance, as_of_block_height
         FROM projection_balances_current
-        WHERE address IN (${placeholders(addresses.length)})
+        WHERE address IN (${placeholders(count)})
         ORDER BY network_id ASC, address ASC, asset_address ASC
       `,
-      addresses,
+      (row) => ({
+        networkId: Number(row.network_id),
+        assetAddress: String(row.asset_address),
+        balance: String(row.balance),
+      }),
     );
-
-    return rows.map((row) => ({
-      networkId: Number(row.network_id),
-      assetAddress: String(row.asset_address),
-      balance: String(row.balance),
-    }));
   }
 
   public async getTokensByAddresses(addresses: string[]) {
-    if (addresses.length === 0) {
-      return [];
-    }
-
-    const rows = await this.query<DatabaseRow>(
-      `
+    return this.queryByAddresses(
+      addresses,
+      (count) => `
         SELECT network_id, id, name, symbol, address, decimals
         FROM tokens
-        WHERE address IN (${placeholders(addresses.length)})
+        WHERE address IN (${placeholders(count)})
         ORDER BY network_id ASC, address ASC
       `,
-      addresses,
+      (row) => ({
+        networkId: Number(row.network_id),
+        id: String(row.id),
+        name: String(row.name),
+        symbol: String(row.symbol),
+        address: String(row.address),
+        decimals: Number(row.decimals),
+      }),
     );
-
-    return rows.map((row) => ({
-      networkId: Number(row.network_id),
-      id: String(row.id),
-      name: String(row.name),
-      symbol: String(row.symbol),
-      address: String(row.address),
-      decimals: Number(row.decimals),
-    }));
   }
 
   public async getDistinctLinksByAddresses(addresses: string[]) {
-    if (addresses.length === 0) {
-      return [];
-    }
-
-    const rows = await this.query<DatabaseRow>(
-      `
+    return this.queryByAddresses(
+      addresses,
+      (count) => `
         SELECT DISTINCT network_id, source_address, to_address, hop_count
         FROM projection_source_links_current
-        WHERE to_address IN (${placeholders(addresses.length)})
+        WHERE to_address IN (${placeholders(count)})
         ORDER BY network_id ASC, source_address ASC, to_address ASC
       `,
-      addresses,
+      (row) => ({
+        networkId: Number(row.network_id),
+        fromAddress: String(row.source_address),
+        toAddress: String(row.to_address),
+        transferCount: Number(row.hop_count),
+      }),
     );
-
-    return rows.map((row) => ({
-      networkId: Number(row.network_id),
-      fromAddress: String(row.source_address),
-      toAddress: String(row.to_address),
-      transferCount: Number(row.hop_count),
-    }));
   }
 
   public async getBalanceSnapshots(
@@ -1121,16 +950,7 @@ export class RelationalMetadataStore
 
     return new Map(
       rows.map((row) => {
-        const snapshot: DirectLinkRecord = {
-          networkId: Number(row.network_id),
-          fromAddress: String(row.from_address),
-          toAddress: String(row.to_address),
-          assetAddress: String(row.asset_address),
-          transferCount: Number(row.transfer_count),
-          totalAmountBase: String(row.total_amount_base),
-          firstSeenBlockHeight: Number(row.first_seen_block_height),
-          lastSeenBlockHeight: Number(row.last_seen_block_height),
-        };
+        const snapshot = this.mapDirectLinkRecord(row);
         return [
           projectionDirectLinkSnapshotKey(
             snapshot.fromAddress,
@@ -1154,40 +974,42 @@ export class RelationalMetadataStore
     balance: string;
     utxoCount: number;
   } | null> {
-    const [balanceRow, utxoRow] = await Promise.all([
-      this.one<DatabaseRow>(
-        `
-          SELECT balance
-          FROM projection_balances_current
-          WHERE network_id = ? AND address = ? AND asset_address = ''
-          LIMIT 1
-        `,
-        [networkId, address],
-      ),
-      this.one<DatabaseRow>(
-        `
-          SELECT COUNT(*) AS utxo_count
-          FROM projection_utxo_outputs_current
-          WHERE
-            network_id = ?
-            AND address = ?
-            AND ${this.booleanCondition('is_spendable', true)}
-            AND spent_by_txid IS NULL
-        `,
-        [networkId, address],
-      ),
+    const [balance, utxoCount] = await Promise.all([
+      this.getCurrentNativeBalance(networkId, address),
+      this.countCurrentSpendableUtxos(networkId, address),
     ]);
+    return currentAddressSummary(balance, utxoCount);
+  }
 
-    const balance = balanceRow?.balance ? String(balanceRow.balance) : '0';
-    const utxoCount = Number(utxoRow?.utxo_count ?? 0);
-    if (balance === '0' && utxoCount === 0) {
-      return null;
-    }
+  private async getCurrentNativeBalance(networkId: PrimaryId, address: string): Promise<string> {
+    const row = await this.one<DatabaseRow>(
+      `
+        SELECT balance
+        FROM projection_balances_current
+        WHERE network_id = ? AND address = ? AND asset_address = ''
+        LIMIT 1
+      `,
+      [networkId, address],
+    );
 
-    return {
-      balance,
-      utxoCount,
-    };
+    return row?.balance ? String(row.balance) : '0';
+  }
+
+  private async countCurrentSpendableUtxos(networkId: PrimaryId, address: string): Promise<number> {
+    const row = await this.one<DatabaseRow>(
+      `
+        SELECT COUNT(*) AS utxo_count
+        FROM projection_utxo_outputs_current
+        WHERE
+          network_id = ?
+          AND address = ?
+          AND ${this.booleanCondition('is_spendable', true)}
+          AND spent_by_txid IS NULL
+      `,
+      [networkId, address],
+    );
+
+    return Number(row?.utxo_count ?? 0);
   }
 
   public async getUtxoOutputs(
@@ -1243,7 +1065,17 @@ export class RelationalMetadataStore
     offset = 0,
     limit?: number,
   ): Promise<ProjectionUtxoOutput[]> {
-    const rows = await this.query<DatabaseRow>(
+    const rows = await this.listSpendableUtxoRows(networkId, address, offset, limit);
+    return rows.map((row) => this.mapProjectionUtxoOutput(row));
+  }
+
+  private async listSpendableUtxoRows(
+    networkId: PrimaryId,
+    address: string,
+    offset: number,
+    limit?: number,
+  ): Promise<DatabaseRow[]> {
+    return this.query<DatabaseRow>(
       `
         SELECT
           network_id,
@@ -1269,18 +1101,11 @@ export class RelationalMetadataStore
           AND ${this.booleanCondition('is_spendable', true)}
           AND spent_by_txid IS NULL
         ORDER BY block_height DESC, tx_index DESC, vout ASC
-        ${limit !== undefined ? 'LIMIT ?' : ''}
-        ${offset > 0 ? 'OFFSET ?' : ''}
+        ${sqlLimitClause(limit)}
+        ${sqlOffsetClause(offset)}
       `,
-      [
-        networkId,
-        address,
-        ...(limit !== undefined ? [limit] : []),
-        ...(offset > 0 ? [offset] : []),
-      ],
+      [networkId, address, ...sqlPaginationParams(offset, limit)],
     );
-
-    return rows.map((row) => this.mapProjectionUtxoOutput(row));
   }
 
   public async hasAppliedBlock(
@@ -1312,30 +1137,16 @@ export class RelationalMetadataStore
       blockHeight: number;
     }>,
   ): Promise<Set<string>> {
-    if (blocks.length === 0) {
-      return new Set();
-    }
-
-    const conditions = blocks.map(() => '(block_height = ? AND block_hash = ?)').join(' OR ');
-    const rows = await this.query<DatabaseRow>(
-      `
-        SELECT block_height, block_hash
-        FROM projection_applied_blocks
-        WHERE network_id = ? AND (${conditions})
-      `,
-      [networkId, ...blocks.flatMap((block) => [block.blockHeight, block.blockHash])],
-    );
-
-    const identities = new Set(
-      rows.map((row) =>
-        appliedBlockIdentity(networkId, Number(row.block_height), String(row.block_hash)),
-      ),
+    const identities = await this.listAppliedBlockIdentities(
+      'projection_applied_blocks',
+      networkId,
+      blocks,
     );
     const bootstrapTail = await this.getProjectionBootstrapTail(networkId);
     if (bootstrapTail !== null) {
       for (const block of blocks) {
         if (block.blockHeight <= bootstrapTail) {
-          identities.add(appliedBlockIdentity(networkId, block.blockHeight, block.blockHash));
+          identities.add(projectionBlockIdentity(networkId, block.blockHeight, block.blockHash));
         }
       }
     }
@@ -1344,80 +1155,23 @@ export class RelationalMetadataStore
   }
 
   public async applyDirectLinkDeltasWindow(batches: ProjectionDirectLinkBatch[]): Promise<void> {
-    if (batches.length === 0) {
-      return;
-    }
-
-    const orderedBatches = [...batches].sort((left, right) => left.blockHeight - right.blockHeight);
-    const networkId = orderedBatches[0]?.networkId;
-    if (networkId === undefined) {
-      return;
-    }
-
-    const appliedBlocks = await this.listDirectLinkAppliedBlockSet(
-      networkId,
-      orderedBatches.map((batch) => ({
-        blockHeight: batch.blockHeight,
-        blockHash: batch.blockHash,
-      })),
+    const window = await resolvePendingProjectionWindow(batches, (networkId, blocks) =>
+      this.listDirectLinkAppliedBlockSet(networkId, blocks),
     );
-    const pendingBatches = orderedBatches.filter(
-      (batch) =>
-        !appliedBlocks.has(
-          appliedBlockIdentity(batch.networkId, batch.blockHeight, batch.blockHash),
-        ),
-    );
-    if (pendingBatches.length === 0) {
+    if (window === null) {
       return;
     }
 
-    const directLinkKeys = [
-      ...new Set(
-        pendingBatches.flatMap((batch) =>
-          batch.directLinkDeltas.map((delta) =>
-            projectionDirectLinkSnapshotKey(delta.fromAddress, delta.toAddress, delta.assetAddress),
-          ),
-        ),
-      ),
-    ].map(parseProjectionDirectLinkKey);
-    const currentDirectLinks = await this.getDirectLinkSnapshots(networkId, directLinkKeys);
-    const nextDirectLinks = new Map<string, DirectLinkRecord>();
-
-    for (const batch of pendingBatches) {
-      for (const delta of batch.directLinkDeltas) {
-        const key = projectionDirectLinkSnapshotKey(
-          delta.fromAddress,
-          delta.toAddress,
-          delta.assetAddress,
-        );
-        const current = nextDirectLinks.get(key) ?? currentDirectLinks.get(key);
-        if (current) {
-          nextDirectLinks.set(key, {
-            ...current,
-            transferCount: current.transferCount + delta.transferCount,
-            totalAmountBase: addAmountBase(current.totalAmountBase, delta.totalAmountBase),
-            firstSeenBlockHeight: Math.min(
-              current.firstSeenBlockHeight,
-              delta.firstSeenBlockHeight,
-            ),
-            lastSeenBlockHeight: Math.max(current.lastSeenBlockHeight, delta.lastSeenBlockHeight),
-          });
-          continue;
-        }
-
-        nextDirectLinks.set(key, { ...delta });
-      }
-    }
+    const directLinks = await this.buildProjectionDirectLinks(
+      window.networkId,
+      window.pendingBatches,
+    );
 
     const timestamp = nowIsoString();
     await this.withTransaction(async (executor) => {
-      await this.upsertProjectionDirectLinks([...nextDirectLinks.values()], timestamp, executor);
+      await this.upsertProjectionDirectLinks(directLinks, timestamp, executor);
       await this.insertProjectionDirectLinkAppliedBlocks(
-        pendingBatches.map((batch) => ({
-          networkId: batch.networkId,
-          blockHeight: batch.blockHeight,
-          blockHash: batch.blockHash,
-        })),
+        toProjectionAppliedBlocks(window.pendingBatches),
         timestamp,
         executor,
       );
@@ -1431,24 +1185,10 @@ export class RelationalMetadataStore
       blockHeight: number;
     }>,
   ): Promise<Set<string>> {
-    if (blocks.length === 0) {
-      return new Set();
-    }
-
-    const conditions = blocks.map(() => '(block_height = ? AND block_hash = ?)').join(' OR ');
-    const rows = await this.query<DatabaseRow>(
-      `
-        SELECT block_height, block_hash
-        FROM projection_direct_link_applied_blocks
-        WHERE network_id = ? AND (${conditions})
-      `,
-      [networkId, ...blocks.flatMap((block) => [block.blockHeight, block.blockHash])],
-    );
-
-    return new Set(
-      rows.map((row) =>
-        appliedBlockIdentity(networkId, Number(row.block_height), String(row.block_hash)),
-      ),
+    return this.listAppliedBlockIdentities(
+      'projection_direct_link_applied_blocks',
+      networkId,
+      blocks,
     );
   }
 
@@ -1589,16 +1329,7 @@ export class RelationalMetadataStore
       [networkId, ...fromAddresses],
     );
 
-    return rows.map((row) => ({
-      networkId: Number(row.network_id),
-      fromAddress: String(row.from_address),
-      toAddress: String(row.to_address),
-      assetAddress: String(row.asset_address),
-      transferCount: Number(row.transfer_count),
-      totalAmountBase: String(row.total_amount_base),
-      firstSeenBlockHeight: Number(row.first_seen_block_height),
-      lastSeenBlockHeight: Number(row.last_seen_block_height),
-    }));
+    return rows.map((row) => this.mapDirectLinkRecord(row));
   }
 
   public async listSourceSeedIdsReachingAddresses(
@@ -1638,152 +1369,65 @@ export class RelationalMetadataStore
   }
 
   public async applyProjectionWindow(batches: BlockProjectionBatch[]): Promise<void> {
-    if (batches.length === 0) {
+    const window = await this.resolvePendingBlockProjectionWindow(batches);
+    if (window === null) {
       return;
     }
 
-    const orderedBatches = [...batches].sort((left, right) => left.blockHeight - right.blockHeight);
-    const networkId = orderedBatches[0]?.networkId;
-    if (networkId === undefined) {
-      return;
-    }
+    const { nextBalances, nextOutputs } = await buildProjectionStateChanges<{
+      address: string;
+      assetAddress: string;
+    }>({
+      batches: window.pendingBatches,
+      keyForMovement: (movement) =>
+        projectionBalanceSnapshotKey(movement.address, movement.assetAddress),
+      loadBalances: (keys) => this.getBalanceSnapshots(window.networkId, keys),
+      loadOutputs: (networkId, outputKeys) => this.getUtxoOutputs(networkId, outputKeys),
+      networkId: window.networkId,
+      toSnapshotKey: (key) => key,
+    });
 
-    const appliedBlocks = await this.listAppliedBlockSet(
-      networkId,
-      orderedBatches.map((batch) => ({
-        blockHeight: batch.blockHeight,
-        blockHash: batch.blockHash,
-      })),
+    const directLinks = await this.buildProjectionDirectLinks(
+      window.networkId,
+      window.pendingBatches,
     );
-    const pendingBatches = orderedBatches.filter(
-      (batch) =>
-        !appliedBlocks.has(
-          appliedBlockIdentity(batch.networkId, batch.blockHeight, batch.blockHash),
-        ),
-    );
-    if (pendingBatches.length === 0) {
-      return;
-    }
-
-    const spendKeys = [
-      ...new Set(
-        pendingBatches.flatMap((batch) => batch.utxoSpends.map((spend) => spend.outputKey)),
-      ),
-    ];
-    const currentOutputs = await this.getUtxoOutputs(networkId, spendKeys);
-    const nextOutputs = new Map<string, ProjectionUtxoOutput>();
-
-    for (const batch of pendingBatches) {
-      for (const output of batch.utxoCreates) {
-        nextOutputs.set(output.outputKey, { ...output });
-      }
-
-      for (const spend of batch.utxoSpends) {
-        const current = nextOutputs.get(spend.outputKey) ?? currentOutputs.get(spend.outputKey);
-        if (!current) {
-          throw new Error(`missing utxo output: ${spend.outputKey}`);
-        }
-
-        nextOutputs.set(spend.outputKey, {
-          ...current,
-          spentByTxid: spend.spentByTxid,
-          spentInBlock: spend.spentInBlock,
-          spentInputIndex: spend.spentInputIndex,
-        });
-      }
-    }
-
-    const balanceKeys = [
-      ...new Set(
-        pendingBatches.flatMap((batch) =>
-          batch.addressMovements.map((movement) =>
-            projectionBalanceSnapshotKey(movement.address, movement.assetAddress),
-          ),
-        ),
-      ),
-    ].map(parseProjectionBalanceKey);
-    const currentBalances = await this.getBalanceSnapshots(networkId, balanceKeys);
-    const nextBalances = new Map<string, ProjectionBalanceSnapshot>();
-
-    for (const batch of pendingBatches) {
-      for (const movement of batch.addressMovements) {
-        const key = projectionBalanceSnapshotKey(movement.address, movement.assetAddress);
-        const current = nextBalances.get(key) ?? currentBalances.get(key);
-        const currentAmount = parseAmountBase(current?.balance ?? '0');
-        const movementAmount = parseAmountBase(movement.amountBase);
-        const nextAmount =
-          movement.direction === 'credit'
-            ? currentAmount + movementAmount
-            : currentAmount - movementAmount;
-        if (nextAmount < 0n) {
-          throw new Error(
-            `negative balance for ${movement.networkId}:${movement.address}:${movement.assetAddress}`,
-          );
-        }
-
-        nextBalances.set(key, {
-          networkId: movement.networkId,
-          address: movement.address,
-          assetAddress: movement.assetAddress,
-          balance: formatAmountBase(nextAmount),
-          asOfBlockHeight: batch.blockHeight,
-        });
-      }
-    }
-
-    const directLinkKeys = [
-      ...new Set(
-        pendingBatches.flatMap((batch) =>
-          batch.directLinkDeltas.map((delta) =>
-            projectionDirectLinkSnapshotKey(delta.fromAddress, delta.toAddress, delta.assetAddress),
-          ),
-        ),
-      ),
-    ].map(parseProjectionDirectLinkKey);
-    const currentDirectLinks = await this.getDirectLinkSnapshots(networkId, directLinkKeys);
-    const nextDirectLinks = new Map<string, DirectLinkRecord>();
-
-    for (const batch of pendingBatches) {
-      for (const delta of batch.directLinkDeltas) {
-        const key = projectionDirectLinkSnapshotKey(
-          delta.fromAddress,
-          delta.toAddress,
-          delta.assetAddress,
-        );
-        const current = nextDirectLinks.get(key) ?? currentDirectLinks.get(key);
-        if (current) {
-          nextDirectLinks.set(key, {
-            ...current,
-            transferCount: current.transferCount + delta.transferCount,
-            totalAmountBase: addAmountBase(current.totalAmountBase, delta.totalAmountBase),
-            firstSeenBlockHeight: Math.min(
-              current.firstSeenBlockHeight,
-              delta.firstSeenBlockHeight,
-            ),
-            lastSeenBlockHeight: Math.max(current.lastSeenBlockHeight, delta.lastSeenBlockHeight),
-          });
-          continue;
-        }
-
-        nextDirectLinks.set(key, { ...delta });
-      }
-    }
 
     const timestamp = nowIsoString();
     await this.withTransaction(async (executor) => {
       await this.upsertProjectionUtxoOutputs([...nextOutputs.values()], timestamp, executor);
       await this.upsertProjectionBalances([...nextBalances.values()], timestamp, executor);
-      await this.upsertProjectionDirectLinks([...nextDirectLinks.values()], timestamp, executor);
+      await this.upsertProjectionDirectLinks(directLinks, timestamp, executor);
       await this.insertProjectionAppliedBlocks(
-        pendingBatches.map((batch) => ({
-          networkId: batch.networkId,
-          blockHeight: batch.blockHeight,
-          blockHash: batch.blockHash,
-        })),
+        toProjectionAppliedBlocks(window.pendingBatches),
         timestamp,
         executor,
       );
     });
+  }
+
+  private resolvePendingBlockProjectionWindow(batches: BlockProjectionBatch[]) {
+    return resolvePendingProjectionWindow(batches, (networkId, blocks) =>
+      this.listAppliedBlockSet(networkId, blocks),
+    );
+  }
+
+  private async buildProjectionDirectLinks(
+    networkId: PrimaryId,
+    batches: Array<{ directLinkDeltas: DirectLinkDelta[] }>,
+  ): Promise<DirectLinkRecord[]> {
+    const directLinkKeys = collectProjectionDirectLinkSnapshotKeys(batches).map(
+      parseProjectionDirectLinkSnapshotKey,
+    );
+    const currentDirectLinks = await this.getDirectLinkSnapshots(networkId, directLinkKeys);
+    const nextDirectLinks = new Map<string, DirectLinkRecord>();
+    applyDirectLinkDeltasToSnapshots({
+      currentDirectLinks,
+      directLinkDeltas: batches.flatMap((batch) => batch.directLinkDeltas),
+      keyForDelta: (delta) =>
+        projectionDirectLinkSnapshotKey(delta.fromAddress, delta.toAddress, delta.assetAddress),
+      nextDirectLinks,
+    });
+    return [...nextDirectLinks.values()];
   }
 
   public async getActiveNetworkById(id: string) {
@@ -1847,19 +1491,10 @@ export class RelationalMetadataStore
 
   public async listActiveNetworks() {
     const rows = await this.query<DatabaseRow>(
-      `SELECT network_id, id, name, architecture, chain_id, block_time, rpc_endpoint, rps FROM networks WHERE ${this.booleanCondition('is_deleted', false)} ORDER BY network_id ASC`,
+      `SELECT * FROM networks WHERE ${this.booleanCondition('is_deleted', false)} ORDER BY network_id ASC`,
     );
 
-    return rows.map((row) => ({
-      networkId: Number(row.network_id),
-      id: String(row.id),
-      name: String(row.name),
-      architecture: parseChainFamily(String(row.architecture)),
-      chainId: Number(row.chain_id),
-      blockTime: Number(row.block_time),
-      rpcEndpoint: String(row.rpc_endpoint),
-      rps: Number(row.rps),
-    }));
+    return rows.map((row) => this.mapActiveNetwork(row));
   }
 
   private mapProjectionUtxoOutput(row: DatabaseRow): ProjectionUtxoOutput {
@@ -1877,15 +1512,9 @@ export class RelationalMetadataStore
       valueBase: String(row.value_base),
       isCoinbase: toBoolean(row.is_coinbase),
       isSpendable: toBoolean(row.is_spendable),
-      spentByTxid: row.spent_by_txid === null ? null : String(row.spent_by_txid),
-      spentInBlock:
-        row.spent_in_block === null || row.spent_in_block === undefined
-          ? null
-          : Number(row.spent_in_block),
-      spentInputIndex:
-        row.spent_input_index === null || row.spent_input_index === undefined
-          ? null
-          : Number(row.spent_input_index),
+      spentByTxid: nullableString(row.spent_by_txid),
+      spentInBlock: nullableNumber(row.spent_in_block),
+      spentInputIndex: nullableNumber(row.spent_input_index),
     };
   }
 
@@ -2145,55 +1774,32 @@ export class RelationalMetadataStore
     timestamp: string,
     executor: SupportedExecutor = this.client,
   ): Promise<void> {
-    if (blocks.length === 0) {
-      return;
-    }
-
-    for (const chunk of chunkArray(blocks, this.bulkChunkSize(executor.kind))) {
-      const params = chunk.flatMap((block) => [
-        block.networkId,
-        block.blockHeight,
-        block.blockHash,
-        timestamp,
-        timestamp,
-      ]);
-      const values = multiRowPlaceholders(chunk.length, 5);
-
-      if (executor.kind === 'mysql') {
-        await this.executeWithExecutor(
-          executor,
-          `
-            INSERT INTO projection_applied_blocks (
-              network_id, block_height, block_hash, updated_at, created_at
-            )
-            VALUES ${values}
-            ON DUPLICATE KEY UPDATE
-              updated_at = VALUES(updated_at)
-          `,
-          params,
-        );
-        continue;
-      }
-
-      await this.executeWithExecutor(
-        executor,
-        `
-          INSERT INTO projection_applied_blocks (
-            network_id, block_height, block_hash, updated_at, created_at
-          )
-          VALUES ${values}
-          ON CONFLICT (network_id, block_height, block_hash) DO UPDATE SET
-            updated_at = excluded.updated_at
-        `,
-        params,
-      );
-    }
+    await this.insertProjectionAppliedBlockRows(
+      'projection_applied_blocks',
+      blocks,
+      timestamp,
+      executor,
+    );
   }
 
   private async insertProjectionDirectLinkAppliedBlocks(
     blocks: ProjectionAppliedBlock[],
     timestamp: string,
     executor: SupportedExecutor = this.client,
+  ): Promise<void> {
+    await this.insertProjectionAppliedBlockRows(
+      'projection_direct_link_applied_blocks',
+      blocks,
+      timestamp,
+      executor,
+    );
+  }
+
+  private async insertProjectionAppliedBlockRows(
+    table: 'projection_applied_blocks' | 'projection_direct_link_applied_blocks',
+    blocks: ProjectionAppliedBlock[],
+    timestamp: string,
+    executor: SupportedExecutor,
   ): Promise<void> {
     if (blocks.length === 0) {
       return;
@@ -2213,7 +1819,7 @@ export class RelationalMetadataStore
         await this.executeWithExecutor(
           executor,
           `
-            INSERT INTO projection_direct_link_applied_blocks (
+            INSERT INTO ${table} (
               network_id, block_height, block_hash, updated_at, created_at
             )
             VALUES ${values}
@@ -2228,7 +1834,7 @@ export class RelationalMetadataStore
       await this.executeWithExecutor(
         executor,
         `
-          INSERT INTO projection_direct_link_applied_blocks (
+          INSERT INTO ${table} (
             network_id, block_height, block_hash, updated_at, created_at
           )
           VALUES ${values}
@@ -2247,6 +1853,126 @@ export class RelationalMetadataStore
     return this.queryWithExecutor<T>(this.client, statement, params);
   }
 
+  private async softDeleteRecords<T extends { id: string }>(
+    table: 'entities' | 'networks',
+    ids: string[],
+    loadById: (id: string) => Promise<T | null>,
+  ): Promise<T[]> {
+    if (ids.length === 0) {
+      return [];
+    }
+
+    const records: Array<T | null> = await Promise.all(ids.map((id) => loadById(id)));
+    const existing = records.filter((record): record is T => record !== null);
+    if (existing.length === 0) {
+      return [];
+    }
+
+    await this.execute(
+      `UPDATE ${table} SET is_deleted = ${this.booleanLiteral(true)}, updated_at = ? WHERE id IN (${placeholders(existing.length)})`,
+      [nowIsoString(), ...existing.map((record) => record.id)],
+    );
+
+    const updated: Array<T | null> = await Promise.all(
+      existing.map((record) => loadById(record.id)),
+    );
+    return updated.filter((record): record is T => record !== null);
+  }
+
+  private async listTable<T>(
+    table: string,
+    orderBy: string,
+    mapRow: (row: DatabaseRow) => T,
+    offset?: number,
+    limit?: number,
+  ): Promise<T[]> {
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT * FROM ${table}
+        ORDER BY ${orderBy} ASC
+        ${sqlLimitClause(limit)}
+        ${sqlNullableOffsetClause(offset)}
+      `,
+      sqlNullablePaginationParams(offset, limit),
+    );
+
+    return rows.map(mapRow);
+  }
+
+  private async listRowsByIds<T>(
+    table: string,
+    column: string,
+    values: PrimaryId[],
+    mapRow: (row: DatabaseRow) => T,
+  ): Promise<T[]> {
+    if (values.length === 0) {
+      return [];
+    }
+
+    const rows = await this.query<DatabaseRow>(
+      `SELECT * FROM ${table} WHERE ${column} IN (${placeholders(values.length)})`,
+      values,
+    );
+    return rows.map(mapRow);
+  }
+
+  private async getNamedRecord<T>(
+    table: string,
+    name: string,
+    includeDeleted: boolean,
+    mapRow: (row: DatabaseRow) => T,
+  ): Promise<T | null> {
+    const row = await this.one<DatabaseRow>(
+      `
+        SELECT * FROM ${table}
+        WHERE LOWER(name) = LOWER(?)
+        ${includeDeleted ? '' : `AND ${this.booleanCondition('is_deleted', false)}`}
+        LIMIT 1
+      `,
+      [name],
+    );
+    return row ? mapRow(row) : null;
+  }
+
+  private async queryByAddresses<T>(
+    addresses: string[],
+    buildStatement: (placeholderCount: number) => string,
+    mapRow: (row: DatabaseRow) => T,
+  ): Promise<T[]> {
+    if (addresses.length === 0) {
+      return [];
+    }
+
+    const rows = await this.query<DatabaseRow>(buildStatement(addresses.length), addresses);
+    return rows.map(mapRow);
+  }
+
+  private async listAppliedBlockIdentities(
+    table: string,
+    networkId: PrimaryId,
+    blocks: Array<{ blockHash: string; blockHeight: number }>,
+  ): Promise<Set<string>> {
+    if (blocks.length === 0) {
+      return new Set();
+    }
+
+    const conditions = blocks.map(() => '(block_height = ? AND block_hash = ?)').join(' OR ');
+    const rows = await this.query<DatabaseRow>(
+      `
+        SELECT block_height, block_hash
+        FROM ${table}
+        WHERE network_id = ? AND (${conditions})
+      `,
+      [networkId, ...blocks.flatMap((block) => [block.blockHeight, block.blockHash])],
+    );
+
+    return new Set(
+      rows.map((row) =>
+        projectionBlockIdentity(networkId, Number(row.block_height), String(row.block_hash)),
+      ),
+    );
+  }
+
   private async one<T extends DatabaseRow>(
     statement: string,
     params: SqlValue[] = [],
@@ -2261,34 +1987,54 @@ export class RelationalMetadataStore
 
   private async withTransaction<T>(work: (executor: SupportedExecutor) => Promise<T>): Promise<T> {
     if (this.client.kind === 'sqlite') {
-      await this.executeWithExecutor(this.client, 'BEGIN IMMEDIATE');
-      try {
-        const result = await work(this.client);
-        await this.executeWithExecutor(this.client, 'COMMIT');
-        return result;
-      } catch (error) {
-        await this.executeWithExecutor(this.client, 'ROLLBACK');
-        throw error;
-      }
+      return this.withSqliteTransaction(work);
     }
 
     if (this.client.kind === 'postgres') {
-      const client = await this.client.raw.connect();
-      const executor: SupportedExecutor = { kind: 'postgres', raw: client };
-      try {
-        await this.executeWithExecutor(executor, 'BEGIN');
-        const result = await work(executor);
-        await this.executeWithExecutor(executor, 'COMMIT');
-        return result;
-      } catch (error) {
-        await this.executeWithExecutor(executor, 'ROLLBACK');
-        throw error;
-      } finally {
-        client.release();
-      }
+      return this.withPostgresTransaction(this.client, work);
     }
 
-    const connection = await this.client.raw.getConnection();
+    return this.withMysqlTransaction(this.client, work);
+  }
+
+  private async withSqliteTransaction<T>(
+    work: (executor: SupportedExecutor) => Promise<T>,
+  ): Promise<T> {
+    await this.executeWithExecutor(this.client, 'BEGIN IMMEDIATE');
+    try {
+      const result = await work(this.client);
+      await this.executeWithExecutor(this.client, 'COMMIT');
+      return result;
+    } catch (error) {
+      await this.executeWithExecutor(this.client, 'ROLLBACK');
+      throw error;
+    }
+  }
+
+  private async withPostgresTransaction<T>(
+    clientPool: Extract<SupportedClient, { kind: 'postgres' }>,
+    work: (executor: SupportedExecutor) => Promise<T>,
+  ): Promise<T> {
+    const client = await clientPool.raw.connect();
+    const executor: SupportedExecutor = { kind: 'postgres', raw: client };
+    try {
+      await this.executeWithExecutor(executor, 'BEGIN');
+      const result = await work(executor);
+      await this.executeWithExecutor(executor, 'COMMIT');
+      return result;
+    } catch (error) {
+      await this.executeWithExecutor(executor, 'ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async withMysqlTransaction<T>(
+    mysqlPool: Extract<SupportedClient, { kind: 'mysql' }>,
+    work: (executor: SupportedExecutor) => Promise<T>,
+  ): Promise<T> {
+    const connection = await mysqlPool.raw.getConnection();
     const executor: SupportedExecutor = { kind: 'mysql', raw: connection };
     try {
       await connection.beginTransaction();
@@ -2409,6 +2155,20 @@ export class RelationalMetadataStore
     };
   }
 
+  private mapActiveNetwork(row: DatabaseRow) {
+    const network = this.mapNetwork(row);
+    return {
+      networkId: network.networkId,
+      id: network.id,
+      name: network.name,
+      architecture: network.architecture,
+      chainId: network.chainId,
+      blockTime: network.blockTime,
+      rpcEndpoint: network.rpcEndpoint,
+      rps: network.rps,
+    };
+  }
+
   private mapToken(row: DatabaseRow): TokenRecord {
     return {
       tokenId: Number(row.token_id),
@@ -2428,11 +2188,7 @@ export class RelationalMetadataStore
       entityId: Number(row.entity_id),
       id: String(row.id),
       name: row.name === null ? null : String(row.name),
-      description: String(row.description),
-      data: safeJsonParse<Record<string, unknown>>(String(row.data ?? '{}'), {}),
-      isDeleted: toBoolean(row.is_deleted),
-      updatedAt: row.updated_at ? String(row.updated_at) : null,
-      createdAt: String(row.created_at),
+      ...this.mapLabelMetadata(row),
     };
   }
 
@@ -2444,6 +2200,12 @@ export class RelationalMetadataStore
       id: String(row.id),
       network: String(row.network),
       address: String(row.address),
+      ...this.mapLabelMetadata(row),
+    };
+  }
+
+  private mapLabelMetadata(row: DatabaseRow) {
+    return {
       description: String(row.description),
       data: safeJsonParse<Record<string, unknown>>(String(row.data ?? '{}'), {}),
       isDeleted: toBoolean(row.is_deleted),
@@ -2460,6 +2222,19 @@ export class RelationalMetadataStore
       riskLevel: parseRiskLevel(String(row.risk_level)),
       updatedAt: row.updated_at ? String(row.updated_at) : null,
       createdAt: String(row.created_at),
+    };
+  }
+
+  private mapDirectLinkRecord(row: DatabaseRow): DirectLinkRecord {
+    return {
+      networkId: Number(row.network_id),
+      fromAddress: String(row.from_address),
+      toAddress: String(row.to_address),
+      assetAddress: String(row.asset_address),
+      transferCount: Number(row.transfer_count),
+      totalAmountBase: String(row.total_amount_base),
+      firstSeenBlockHeight: Number(row.first_seen_block_height),
+      lastSeenBlockHeight: Number(row.last_seen_block_height),
     };
   }
 }
@@ -2492,14 +2267,6 @@ function chunkArray<T>(values: T[], size: number): T[][] {
   return chunks;
 }
 
-function appliedBlockIdentity(
-  networkId: PrimaryId,
-  blockHeight: number,
-  blockHash: string,
-): string {
-  return `${networkId}:${blockHeight}:${blockHash}`;
-}
-
 function parsePendingRelinkAddressId(key: string, networkId: PrimaryId): PrimaryId | null {
   const match = key.match(new RegExp(`^newly_added_address_n${networkId}_a(\\d+)$`, 'u'));
   if (!match?.[1]) {
@@ -2508,45 +2275,6 @@ function parsePendingRelinkAddressId(key: string, networkId: PrimaryId): Primary
 
   return Number(match[1]);
 }
-
-function projectionBalanceSnapshotKey(address: string, assetAddress: string): string {
-  return `${address}:${assetAddress}`;
-}
-
-function parseProjectionBalanceKey(key: string): {
-  address: string;
-  assetAddress: string;
-} {
-  const [networkId, address, ...assetAddressParts] = key.split(':');
-  void networkId;
-  return {
-    address: address ?? '',
-    assetAddress: assetAddressParts.join(':'),
-  };
-}
-
-function projectionDirectLinkSnapshotKey(
-  fromAddress: string,
-  toAddress: string,
-  assetAddress: string,
-): string {
-  return `${fromAddress}:${toAddress}:${assetAddress}`;
-}
-
-function parseProjectionDirectLinkKey(key: string): {
-  assetAddress: string;
-  fromAddress: string;
-  toAddress: string;
-} {
-  const [networkId, fromAddress, toAddress, ...assetAddressParts] = key.split(':');
-  void networkId;
-  return {
-    fromAddress: fromAddress ?? '',
-    toAddress: toAddress ?? '',
-    assetAddress: assetAddressParts.join(':'),
-  };
-}
-
 const sqliteMigrations = [
   `CREATE TABLE IF NOT EXISTS configs (
       config_id INTEGER PRIMARY KEY AUTOINCREMENT,

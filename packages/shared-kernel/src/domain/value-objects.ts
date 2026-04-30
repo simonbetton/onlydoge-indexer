@@ -53,24 +53,42 @@ export class ExternalId {
   public static parse(value: string, expectedPrefix?: IdPrefix): ExternalId {
     const trimmed = value.trim();
     const [prefix, suffix] = trimmed.split('_');
+    const idPrefix = requireIdPrefix(prefix, value);
 
-    if (!isIdPrefix(prefix)) {
-      throw new ValidationError(`invalid id prefix: ${value}`);
-    }
+    assertExpectedPrefix(idPrefix, expectedPrefix, value);
+    assertValidIdSuffix(suffix, value);
 
-    if (expectedPrefix && prefix !== expectedPrefix) {
-      throw new ValidationError(`invalid parameter for \`id\`: ${value}`);
-    }
+    return new ExternalId(trimmed, idPrefix);
+  }
+}
 
-    if (!suffix || suffix.length > 32 || !/^[A-Za-z0-9]+$/u.test(suffix)) {
-      throw new ValidationError(`invalid parameter for \`id\`: ${value}`);
-    }
-
-    return new ExternalId(trimmed, prefix);
+function requireIdPrefix(value: string | undefined, raw: string): IdPrefix {
+  if (!isIdPrefix(value)) {
+    throw new ValidationError(`invalid id prefix: ${raw}`);
   }
 
-  public toString(): string {
-    return this.value;
+  return value;
+}
+
+function assertExpectedPrefix(
+  prefix: IdPrefix,
+  expectedPrefix: IdPrefix | undefined,
+  raw: string,
+): void {
+  if (expectedPrefix && prefix !== expectedPrefix) {
+    throw new ValidationError(`invalid parameter for \`id\`: ${raw}`);
+  }
+}
+
+function assertValidIdSuffix(value: string | undefined, raw: string): void {
+  if (!value) {
+    throw new ValidationError(`invalid parameter for \`id\`: ${raw}`);
+  }
+  if (value.length > 32) {
+    throw new ValidationError(`invalid parameter for \`id\`: ${raw}`);
+  }
+  if (!/^[A-Za-z0-9]+$/u.test(value)) {
+    throw new ValidationError(`invalid parameter for \`id\`: ${raw}`);
   }
 }
 
@@ -95,22 +113,6 @@ export class RpcEndpoint {
       throw new ValidationError(`invalid RPC endpoint: ${value}`);
     }
   }
-
-  public maskAuth(): string {
-    const url = new URL(this.value);
-    if (url.username) {
-      url.username = '***';
-    }
-    if (url.password) {
-      url.password = '***';
-    }
-
-    return url.toString();
-  }
-
-  public toString(): string {
-    return this.value;
-  }
 }
 
 export class BlockchainAddress {
@@ -119,19 +121,6 @@ export class BlockchainAddress {
   private constructor(value: string) {
     this.value = value;
   }
-
-  public static parse(value: string): BlockchainAddress {
-    const trimmed = value.trim();
-    if (!trimmed) {
-      throw new ValidationError('address cannot be empty');
-    }
-
-    return new BlockchainAddress(trimmed);
-  }
-
-  public toString(): string {
-    return this.value;
-  }
 }
 
 export class BlockHeight {
@@ -139,14 +128,6 @@ export class BlockHeight {
 
   private constructor(value: number) {
     this.value = value;
-  }
-
-  public static parse(value: number): BlockHeight {
-    if (!Number.isInteger(value) || value < 0) {
-      throw new ValidationError(`invalid block height: ${value}`);
-    }
-
-    return new BlockHeight(value);
   }
 }
 
@@ -187,10 +168,18 @@ export class ApiSecret {
 
     return hashSha256(token);
   }
+}
 
-  public static hashFromBearer(bearerToken: string): string {
-    return ApiSecret.hashFromToken(bearerToken);
+export function maskRpcEndpointAuth(endpoint: RpcEndpoint | string): string {
+  const url = new URL(typeof endpoint === 'string' ? endpoint : endpoint.value);
+  if (url.username) {
+    url.username = '***';
   }
+  if (url.password) {
+    url.password = '***';
+  }
+
+  return url.toString();
 }
 
 export function parseMode(input: string | undefined): Mode {
@@ -218,6 +207,15 @@ export function parseRiskLevel(input: string): RiskLevel {
   }
 
   return value;
+}
+
+export function parseNonNegativeInteger(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 export function nowIsoString(): string {

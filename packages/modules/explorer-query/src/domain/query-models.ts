@@ -1,7 +1,13 @@
 import type { ProjectionUtxoOutput } from '@onlydoge/indexing-pipeline';
 import type { InfoResponse } from '@onlydoge/investigation-query';
+import type { RiskLevel } from '@onlydoge/shared-kernel';
 
-import type { ExplorerLabelRef } from '../contracts/ports';
+export interface ExplorerLabelRef {
+  entity: string;
+  name: string | null;
+  riskLevel: RiskLevel;
+  tags: string[];
+}
 
 export interface ExplorerNetworkSummary {
   blockHeight: number;

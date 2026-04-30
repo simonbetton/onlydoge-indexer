@@ -2,6 +2,7 @@ import {
   BlockTime,
   type ChainFamily,
   ExternalId,
+  maskRpcEndpointAuth,
   type PrimaryId,
   RpcEndpoint,
   ValidationError,
@@ -31,6 +32,21 @@ export interface CreateNetworkInput {
   rps?: number;
 }
 
+export interface NetworkResponse {
+  architecture: ChainFamily;
+  blockTime: number;
+  chainId: number;
+  createdAt: string;
+  id: string;
+  name: string;
+  rpcEndpoint: string;
+  rps: number;
+}
+
+export type UpdateNetworkInput = Partial<
+  Pick<NetworkRecord, 'architecture' | 'blockTime' | 'chainId' | 'name' | 'rpcEndpoint' | 'rps'>
+>;
+
 export class Network {
   public readonly record: NetworkRecord;
 
@@ -39,22 +55,11 @@ export class Network {
   }
 
   public static create(input: CreateNetworkInput, nextPrimaryId = 0): Network {
-    if (!input.name.trim()) {
-      throw new ValidationError('invalid parameter for `name`: ');
-    }
-
-    if (!Number.isInteger(input.chainId ?? 0) || (input.chainId ?? 0) < 0) {
-      throw new ValidationError(`invalid parameter for \`chainId\`: ${input.chainId ?? 0}`);
-    }
-
-    BlockTime.parse(input.blockTime);
-    RpcEndpoint.parse(input.rpcEndpoint);
+    validateNetworkInput(input);
 
     return new Network({
       networkId: nextPrimaryId,
-      id: input.id
-        ? ExternalId.parse(input.id, 'net').toString()
-        : ExternalId.create('net').toString(),
+      id: createNetworkExternalId(input.id),
       name: input.name.trim(),
       architecture: input.architecture,
       chainId: input.chainId ?? 0,
@@ -66,62 +71,76 @@ export class Network {
       createdAt: new Date().toISOString(),
     });
   }
+}
 
-  public static rehydrate(record: NetworkRecord): Network {
-    return new Network(record);
+function validateNetworkInput(input: CreateNetworkInput): void {
+  assertNetworkName(input.name);
+  assertNetworkChainId(input.chainId);
+  BlockTime.parse(input.blockTime);
+  RpcEndpoint.parse(input.rpcEndpoint);
+}
+
+function assertNetworkName(value: string): void {
+  if (!value.trim()) {
+    throw new ValidationError('invalid parameter for `name`: ');
   }
+}
 
-  public update(
-    input: Partial<
-      Pick<NetworkRecord, 'architecture' | 'blockTime' | 'chainId' | 'name' | 'rpcEndpoint' | 'rps'>
-    >,
-  ): NetworkRecord {
-    if (input.blockTime !== undefined) {
-      BlockTime.parse(input.blockTime);
-    }
-    if (input.rpcEndpoint !== undefined) {
-      RpcEndpoint.parse(input.rpcEndpoint);
-    }
-
-    return {
-      ...this.record,
-      name: input.name?.trim() ?? this.record.name,
-      architecture: input.architecture ?? this.record.architecture,
-      chainId: input.chainId ?? this.record.chainId,
-      blockTime: input.blockTime ?? this.record.blockTime,
-      rpcEndpoint: input.rpcEndpoint?.trim() ?? this.record.rpcEndpoint,
-      rps: input.rps ?? this.record.rps,
-      updatedAt: new Date().toISOString(),
-    };
+function assertNetworkChainId(value: number | undefined): void {
+  const chainId = value ?? 0;
+  if (!Number.isInteger(chainId) || chainId < 0) {
+    throw new ValidationError(`invalid parameter for \`chainId\`: ${chainId}`);
   }
+}
 
-  public markDeleted(): NetworkRecord {
-    return {
-      ...this.record,
-      isDeleted: true,
-      updatedAt: new Date().toISOString(),
-    };
-  }
+function createNetworkExternalId(id: string | undefined): string {
+  return id ? ExternalId.parse(id, 'net').value : ExternalId.create('net').value;
+}
 
-  public toResponse(): {
-    architecture: ChainFamily;
-    blockTime: number;
-    chainId: number;
-    createdAt: string;
-    id: string;
-    name: string;
-    rpcEndpoint: string;
-    rps: number;
-  } {
-    return {
-      id: this.record.id,
-      name: this.record.name,
-      architecture: this.record.architecture,
-      chainId: this.record.chainId,
-      blockTime: this.record.blockTime,
-      rpcEndpoint: RpcEndpoint.parse(this.record.rpcEndpoint).maskAuth(),
-      rps: this.record.rps,
-      createdAt: this.record.createdAt,
-    };
+export function updateNetworkRecord(
+  record: NetworkRecord,
+  input: UpdateNetworkInput,
+): NetworkRecord {
+  validateNetworkUpdate(input);
+
+  return {
+    ...record,
+    name: updatedText(input.name, record.name),
+    architecture: updatedValue(input.architecture, record.architecture),
+    chainId: updatedValue(input.chainId, record.chainId),
+    blockTime: updatedValue(input.blockTime, record.blockTime),
+    rpcEndpoint: updatedText(input.rpcEndpoint, record.rpcEndpoint),
+    rps: updatedValue(input.rps, record.rps),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function validateNetworkUpdate(input: UpdateNetworkInput): void {
+  if (input.blockTime !== undefined) {
+    BlockTime.parse(input.blockTime);
   }
+  if (input.rpcEndpoint !== undefined) {
+    RpcEndpoint.parse(input.rpcEndpoint);
+  }
+}
+
+function updatedValue<T>(value: T | undefined, fallback: T): T {
+  return value === undefined ? fallback : value;
+}
+
+function updatedText(value: string | undefined, fallback: string): string {
+  return value === undefined ? fallback : value.trim();
+}
+
+export function networkToResponse(record: NetworkRecord): NetworkResponse {
+  return {
+    id: record.id,
+    name: record.name,
+    architecture: record.architecture,
+    chainId: record.chainId,
+    blockTime: record.blockTime,
+    rpcEndpoint: maskRpcEndpointAuth(RpcEndpoint.parse(record.rpcEndpoint)),
+    rps: record.rps,
+    createdAt: record.createdAt,
+  };
 }

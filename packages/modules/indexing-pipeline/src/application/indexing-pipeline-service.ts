@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { nowIsoString, sleep } from '@onlydoge/shared-kernel';
+import { nowIsoString, type PrimaryId, sleep } from '@onlydoge/shared-kernel';
 
 import type {
   BlockchainRpcPort,
@@ -11,7 +11,6 @@ import type {
   ProjectionStateStorePort,
   RawBlockStoragePort,
 } from '../contracts/ports';
-import { addAmountBase, formatAmountBase, parseAmountBase } from '../domain/amounts';
 import {
   configKeyBlockHeight,
   configKeyIndexerFactProgress,
@@ -37,11 +36,61 @@ import type {
   ProjectionFactWindow,
   ProjectionUtxoOutput,
 } from '../domain/projection-models';
+import {
+  applyAddressMovementsToBalances,
+  applyDirectLinkDeltasToSnapshots,
+  buildNextProjectionUtxoOutputs,
+  collectProjectionBalanceSnapshotKeys,
+  collectProjectionDirectLinkSnapshotKeys,
+  collectProjectionTouchedOutputKeys,
+  orderProjectionBatches,
+  parseProjectionBalanceSnapshotKey,
+  parseProjectionDirectLinkSnapshotKey,
+  projectionBalanceSnapshotKey,
+  projectionBlockIdentity,
+  projectionDirectLinkSnapshotKey,
+  toProjectionAppliedBlocks,
+} from '../domain/projection-models';
 import { DogecoinBlockProjector } from './dogecoin-block-projector';
 import { EvmBlockProjector } from './evm-block-projector';
+import {
+  type AppliedSnapshotRecovery,
+  adaptiveWindowLogLine,
+  type BootstrapPhase,
+  type BootstrapStatus,
+  blockRangeWork,
+  bootstrapCursorLabel,
+  bootstrapRequiredMessage,
+  bootstrapRetryMarker,
+  bootstrapStatusPhase,
+  contiguousStoredTail,
+  createPhaseAttempt,
+  factPhaseMetrics,
+  failedPhaseExecution,
+  formatError,
+  formatMetrics,
+  hasRequiredBootstrapTail,
+  idlePhaseExecution,
+  isBootstrapPhase,
+  isTimeoutError,
+  noPhaseWork,
+  type PhaseAttempt,
+  type PhaseExecutionResult,
+  type PhaseName,
+  type PhaseWorkResult,
+  type ProjectionMode,
+  phasePendingText,
+  phaseRangeText,
+  phaseRate,
+  phaseWindowText,
+  recoveredSnapshotResult,
+  requiresDogecoinPrevoutBootstrap,
+  shouldBackoffWindow,
+  tailOrInitial,
+} from './indexing-pipeline-planning';
 import { SourceLinkProjector } from './source-link-projector';
 
-interface IndexingPipelineSettings {
+export interface IndexingPipelineSettings {
   bootstrapTimeoutMs: number;
   dogecoinTransferMaxEdges: number;
   dogecoinTransferMaxInputAddresses: number;
@@ -80,18 +129,11 @@ interface PhaseTuningState {
   window: number;
 }
 
-interface PhaseWorkResult {
-  didWork: boolean;
-  metrics?: Record<string, number | string>;
-  endBlock?: number;
-  pendingCount?: number;
-  startBlock?: number;
-  workItems: number;
-}
-
-interface PhaseExecutionResult extends PhaseWorkResult {
-  durationMs: number;
-  error?: unknown;
+interface AdaptiveWindowContext {
+  maxWindow: number;
+  minWindow: number;
+  targetMs: number;
+  tuning: PhaseTuningState;
 }
 
 interface BacklogState {
@@ -101,28 +143,46 @@ interface BacklogState {
   syncTail: number;
 }
 
-interface BootstrapStatus {
-  bootstrapTail: number | null;
-  cursorBalance: ProjectionBalanceCursor | null;
-  cursorUtxo: string | null;
-  phase: BootstrapPhase | null;
-  required: boolean;
-  startedAtMs: number | null;
-  targetTail: number | null;
+interface StartedPhaseAttempt {
+  attempt: PhaseAttempt;
+  startedAt: number;
+  workPromise: Promise<PhaseWorkResult>;
 }
 
-interface PhaseAttempt {
-  attemptId: string;
-  controller: AbortController;
-  promise: Promise<void>;
-  startedAtMs: number;
-  timedOut: boolean;
+interface AppliedSnapshotWindow {
+  appliedBlocks: Set<string>;
+  heights: number[];
+  loadSnapshotsMs: number;
+  orderedSnapshots: Record<string, unknown>[];
+  windowEnd: number;
+}
+
+interface ProjectRecoveryOutcome {
+  recoveredTail: number;
+  result: PhaseWorkResult | null;
+  snapshotsToProject: Record<string, unknown>[];
+}
+
+interface FactRecoveryOutcome {
+  metrics: Record<string, number>;
+  recoveredTail: number;
+  result: PhaseWorkResult | null;
+  snapshotsToPersist: Record<string, unknown>[];
+}
+
+interface TimedValue<T> {
+  durationMs: number;
+  value: T;
 }
 
 type IndexedNetwork = Awaited<ReturnType<IndexedNetworkPort['listActiveNetworks']>>[number];
-type BootstrapPhase = 'balances' | 'done' | 'utxos';
-type PhaseName = 'bootstrap' | 'facts' | 'project-state' | 'relink' | 'sync';
-type ProjectionMode = 'facts' | 'state';
+type AppliedBlockSetReader = Pick<ProjectionStateStorePort, 'listAppliedBlockSet'>;
+
+export type IndexingFactWarehouse = ProjectionFactWarehousePort &
+  Pick<
+    ProjectionStateStorePort,
+    'getBalanceSnapshots' | 'getDirectLinkSnapshots' | 'getUtxoOutputs'
+  >;
 
 const bootstrapUtxoChunkSize = 1_000;
 const bootstrapBalanceChunkSize = 5_000;
@@ -156,8 +216,42 @@ const defaultSettings: IndexingPipelineSettings = {
   syncBacklogLowWatermark: 512,
 };
 
-export class IndexingPipelineService {
-  public readonly warehouse: Pick<ProjectionStateStorePort, 'applyProjectionWindow'>;
+export interface IndexingPipelineService {
+  factWarehouse: IndexingFactWarehouse;
+  settings: IndexingPipelineSettings;
+  warehouse: Pick<ProjectionStateStorePort, 'applyProjectionWindow'>;
+  relinkNewAddress(networkId: number, addressId: number): Promise<void>;
+  runOnce(): Promise<boolean>;
+  start(signal?: AbortSignal): Promise<void>;
+}
+
+export function createIndexingPipelineService(
+  configs: CoordinatorConfigPort,
+  networks: IndexedNetworkPort,
+  seeds: ProjectionLinkSeedPort,
+  rawBlocks: RawBlockStoragePort,
+  rpc: BlockchainRpcPort,
+  projectStateStore: ProjectionStateStorePort,
+  stateStore: ProjectionStateStorePort,
+  factWarehouse: IndexingFactWarehouse,
+  settings: IndexingPipelineSettings = defaultSettings,
+): IndexingPipelineService {
+  return new IndexingPipelineServiceEngine(
+    configs,
+    networks,
+    seeds,
+    rawBlocks,
+    rpc,
+    projectStateStore,
+    stateStore,
+    factWarehouse,
+    settings,
+  ).service;
+}
+
+class IndexingPipelineServiceEngine {
+  public readonly service: IndexingPipelineService;
+  private readonly warehouse: Pick<ProjectionStateStorePort, 'applyProjectionWindow'>;
   private readonly instanceId = randomUUID();
   private readonly dogecoinFactProjector: DogecoinBlockProjector;
   private readonly dogecoinStateProjector: DogecoinBlockProjector;
@@ -187,38 +281,46 @@ export class IndexingPipelineService {
     private readonly rpc: BlockchainRpcPort,
     private readonly projectStateStore: ProjectionStateStorePort,
     private readonly stateStore: ProjectionStateStorePort,
-    private readonly factWarehouse: ProjectionFactWarehousePort &
-      Pick<
-        ProjectionStateStorePort,
-        'getBalanceSnapshots' | 'getDirectLinkSnapshots' | 'getUtxoOutputs'
-      >,
+    private readonly factWarehouse: IndexingFactWarehouse,
     private readonly settings: IndexingPipelineSettings = defaultSettings,
   ) {
     this.warehouse = projectStateStore;
     this.dogecoinStateProjector = new DogecoinBlockProjector(projectStateStore);
     this.dogecoinFactProjector = new DogecoinBlockProjector(stateStore);
     this.sourceLinkProjector = new SourceLinkProjector(stateStore);
+    this.service = {
+      factWarehouse: this.factWarehouse,
+      settings: this.settings,
+      warehouse: this.warehouse,
+      relinkNewAddress: (networkId, addressId) => this.relinkNewAddress(networkId, addressId),
+      runOnce: () => this.runOnce(),
+      start: (signal) => this.start(signal),
+    };
   }
 
-  public async start(signal?: AbortSignal): Promise<void> {
-    while (!signal?.aborted) {
-      const isPrimary = await this.leaseLeadership();
-      if (!isPrimary) {
-        this.logIdleOnce('not-primary');
-        await sleep(1_000);
-        continue;
-      }
-
-      try {
-        await this.withLeaseHeartbeat(() => this.runWorkerLoops(signal));
-      } catch (error) {
-        console.error(`[onlydoge] indexer worker set failed error=${formatError(error)}`);
-        await sleep(1_000);
-      }
+  private async start(signal?: AbortSignal): Promise<void> {
+    while (shouldContinue(signal)) {
+      await this.runPrimaryWorkerSet(signal);
     }
   }
 
-  public async runOnce(): Promise<boolean> {
+  private async runPrimaryWorkerSet(signal?: AbortSignal): Promise<void> {
+    const isPrimary = await this.leaseLeadership();
+    if (!isPrimary) {
+      this.logIdleOnce('not-primary');
+      await sleep(1_000);
+      return;
+    }
+
+    try {
+      await this.withLeaseHeartbeat(() => this.runWorkerLoops(signal));
+    } catch (error) {
+      console.error(`[onlydoge] indexer worker set failed error=${formatError(error)}`);
+      await sleep(1_000);
+    }
+  }
+
+  private async runOnce(): Promise<boolean> {
     const isPrimary = await this.leaseLeadership();
     if (!isPrimary) {
       this.logIdleOnce('not-primary');
@@ -236,32 +338,7 @@ export class IndexingPipelineService {
       const didWorkByNetwork = await mapWithConcurrency(
         latestHeights.filter((item): item is NonNullable<typeof item> => Boolean(item)),
         this.settings.networkConcurrency,
-        async ({ latestBlockHeight, network }) => {
-          let didWork = false;
-          const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
-
-          if (backlog.backlog > this.settings.syncBacklogLowWatermark) {
-            didWork = (await this.bootstrapNetworkPhase(network, latestBlockHeight)) || didWork;
-            didWork = (await this.projectNetworkPhase(network, latestBlockHeight)) || didWork;
-            didWork = (await this.factNetworkPhase(network, latestBlockHeight)) || didWork;
-            if (this.canRunRelink(backlog)) {
-              didWork = (await this.relinkNetworkPhase(network, latestBlockHeight)) || didWork;
-            }
-            return didWork;
-          }
-
-          didWork = (await this.bootstrapNetworkPhase(network, latestBlockHeight)) || didWork;
-          didWork = (await this.syncNetworkPhase(network, latestBlockHeight)) || didWork;
-          didWork = (await this.projectNetworkPhase(network, latestBlockHeight)) || didWork;
-          didWork = (await this.factNetworkPhase(network, latestBlockHeight)) || didWork;
-          if (
-            this.canRunRelink(await this.readBacklogState(network.networkId, latestBlockHeight))
-          ) {
-            didWork = (await this.relinkNetworkPhase(network, latestBlockHeight)) || didWork;
-          }
-
-          return didWork;
-        },
+        ({ latestBlockHeight, network }) => this.runNetworkWorkerOnce(network, latestBlockHeight),
       );
 
       const didWork = didWorkByNetwork.some(Boolean);
@@ -275,7 +352,67 @@ export class IndexingPipelineService {
     });
   }
 
-  public async relinkNewAddress(networkId: number, addressId: number): Promise<void> {
+  private async runNetworkWorkerOnce(
+    network: IndexedNetwork,
+    latestBlockHeight: number,
+  ): Promise<boolean> {
+    const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
+    if (this.shouldDrainProjectionBacklog(backlog)) {
+      return this.runBackloggedNetworkPhases(network, latestBlockHeight, backlog);
+    }
+
+    return this.runCaughtUpNetworkPhases(network, latestBlockHeight);
+  }
+
+  private shouldDrainProjectionBacklog(backlog: BacklogState): boolean {
+    return backlog.backlog > this.settings.syncBacklogLowWatermark;
+  }
+
+  private async runBackloggedNetworkPhases(
+    network: IndexedNetwork,
+    latestBlockHeight: number,
+    backlog: BacklogState,
+  ): Promise<boolean> {
+    const didWork = await this.runNetworkPhaseSequence([
+      () => this.bootstrapNetworkPhase(network, latestBlockHeight),
+      () => this.projectNetworkPhase(network, latestBlockHeight),
+      () => this.factNetworkPhase(network, latestBlockHeight),
+    ]);
+    if (!this.canRunRelink(backlog)) {
+      return didWork;
+    }
+
+    return (await this.relinkNetworkPhase(network, latestBlockHeight)) || didWork;
+  }
+
+  private async runCaughtUpNetworkPhases(
+    network: IndexedNetwork,
+    latestBlockHeight: number,
+  ): Promise<boolean> {
+    const didWork = await this.runNetworkPhaseSequence([
+      () => this.bootstrapNetworkPhase(network, latestBlockHeight),
+      () => this.syncNetworkPhase(network, latestBlockHeight),
+      () => this.projectNetworkPhase(network, latestBlockHeight),
+      () => this.factNetworkPhase(network, latestBlockHeight),
+    ]);
+    const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
+    if (!this.canRunRelink(backlog)) {
+      return didWork;
+    }
+
+    return (await this.relinkNetworkPhase(network, latestBlockHeight)) || didWork;
+  }
+
+  private async runNetworkPhaseSequence(phases: Array<() => Promise<boolean>>): Promise<boolean> {
+    let didWork = false;
+    for (const phase of phases) {
+      didWork = (await phase()) || didWork;
+    }
+
+    return didWork;
+  }
+
+  private async relinkNewAddress(networkId: number, addressId: number): Promise<void> {
     const address = await this.seeds.getTrackedAddress(networkId, addressId);
     if (!address) {
       return;
@@ -296,19 +433,24 @@ export class IndexingPipelineService {
   }
 
   private async runLatestHeightLoop(signal?: AbortSignal): Promise<void> {
-    while (!signal?.aborted) {
-      try {
-        const activeNetworks = await this.networks.listActiveNetworks();
-        if (activeNetworks.length === 0) {
-          this.logIdleOnce('no-active-networks');
-        } else {
-          await this.refreshNetworkHeights(activeNetworks);
-        }
-      } catch (error) {
-        console.error(`[onlydoge] height refresh failed error=${formatError(error)}`);
-      }
+    while (shouldContinue(signal)) {
+      await this.refreshLatestHeightsOnce();
 
       await sleep(this.latestHeightRefreshMs);
+    }
+  }
+
+  private async refreshLatestHeightsOnce(): Promise<void> {
+    try {
+      const activeNetworks = await this.networks.listActiveNetworks();
+      if (activeNetworks.length === 0) {
+        this.logIdleOnce('no-active-networks');
+        return;
+      }
+
+      await this.refreshNetworkHeights(activeNetworks);
+    } catch (error) {
+      console.error(`[onlydoge] height refresh failed error=${formatError(error)}`);
     }
   }
 
@@ -358,113 +500,51 @@ export class IndexingPipelineService {
   }
 
   private async runSyncWorkerTick(): Promise<boolean> {
-    const activeNetworks = await this.networks.listActiveNetworks();
-    if (activeNetworks.length === 0) {
-      return false;
-    }
-
-    const didWorkByNetwork = await mapWithConcurrency(
-      activeNetworks,
-      this.settings.networkConcurrency,
-      async (network) => {
-        if (this.syncInFlight.has(network.networkId)) {
-          return false;
-        }
-
-        const latestBlockHeight = await this.getOrRefreshLatestHeight(network);
-        if (latestBlockHeight === null) {
-          return false;
-        }
-
-        return this.syncNetworkPhase(network, latestBlockHeight);
-      },
+    return this.runNetworkWorkerTick(
+      (network) => this.syncInFlight.has(network.networkId),
+      (network, latestBlockHeight) => this.syncNetworkPhase(network, latestBlockHeight),
     );
-
-    return didWorkByNetwork.some(Boolean);
   }
 
   private async runBootstrapWorkerTick(): Promise<boolean> {
-    const activeNetworks = await this.networks.listActiveNetworks();
-    if (activeNetworks.length === 0) {
-      return false;
-    }
-
-    const didWorkByNetwork = await mapWithConcurrency(
-      activeNetworks,
-      this.settings.networkConcurrency,
-      async (network) => {
-        if (this.bootstrapInFlight.has(network.networkId)) {
-          return false;
-        }
-
-        const latestBlockHeight = await this.getOrRefreshLatestHeight(network);
-        if (latestBlockHeight === null) {
-          return false;
-        }
-
-        return this.bootstrapNetworkPhase(network, latestBlockHeight);
-      },
+    return this.runNetworkWorkerTick(
+      (network) => this.bootstrapInFlight.has(network.networkId),
+      (network, latestBlockHeight) => this.bootstrapNetworkPhase(network, latestBlockHeight),
     );
-
-    return didWorkByNetwork.some(Boolean);
   }
 
   private async runProjectWorkerTick(): Promise<boolean> {
-    const activeNetworks = await this.networks.listActiveNetworks();
-    if (activeNetworks.length === 0) {
-      return false;
-    }
-
-    const didWorkByNetwork = await mapWithConcurrency(
-      activeNetworks,
-      this.settings.networkConcurrency,
-      async (network) => {
-        if (
-          this.projectInFlight.has(network.networkId) ||
-          this.bootstrapInFlight.has(network.networkId)
-        ) {
-          return false;
-        }
-
-        const latestBlockHeight = await this.getOrRefreshLatestHeight(network);
-        if (latestBlockHeight === null) {
-          return false;
-        }
-
-        return this.projectNetworkPhase(network, latestBlockHeight);
-      },
+    return this.runNetworkWorkerTick(
+      (network) =>
+        this.projectInFlight.has(network.networkId) ||
+        this.bootstrapInFlight.has(network.networkId),
+      (network, latestBlockHeight) => this.projectNetworkPhase(network, latestBlockHeight),
     );
-
-    return didWorkByNetwork.some(Boolean);
   }
 
   private async runFactWorkerTick(): Promise<boolean> {
-    const activeNetworks = await this.networks.listActiveNetworks();
-    if (activeNetworks.length === 0) {
-      return false;
-    }
-
-    const didWorkByNetwork = await mapWithConcurrency(
-      activeNetworks,
-      this.settings.networkConcurrency,
-      async (network) => {
-        if (this.factInFlight.has(network.networkId)) {
-          return false;
-        }
-
-        const latestBlockHeight = await this.getOrRefreshLatestHeight(network);
-        if (latestBlockHeight === null) {
-          return false;
-        }
-
-        return this.factNetworkPhase(network, latestBlockHeight);
-      },
+    return this.runNetworkWorkerTick(
+      (network) => this.factInFlight.has(network.networkId),
+      (network, latestBlockHeight) => this.factNetworkPhase(network, latestBlockHeight),
     );
-
-    return didWorkByNetwork.some(Boolean);
   }
 
   private async runRelinkWorkerTick(): Promise<boolean> {
+    return this.runNetworkWorkerTick(
+      (network) => this.relinkInFlight.has(network.networkId),
+      async (network, latestBlockHeight) => {
+        const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
+        return this.canRunRelink(backlog)
+          ? this.relinkNetworkPhase(network, latestBlockHeight)
+          : false;
+      },
+    );
+  }
+
+  private async runNetworkWorkerTick(
+    isBlocked: (network: IndexedNetwork) => boolean,
+    runPhase: (network: IndexedNetwork, latestBlockHeight: number) => Promise<boolean>,
+  ): Promise<boolean> {
     const activeNetworks = await this.networks.listActiveNetworks();
     if (activeNetworks.length === 0) {
       return false;
@@ -474,7 +554,7 @@ export class IndexingPipelineService {
       activeNetworks,
       this.settings.networkConcurrency,
       async (network) => {
-        if (this.relinkInFlight.has(network.networkId)) {
+        if (isBlocked(network)) {
           return false;
         }
 
@@ -483,12 +563,7 @@ export class IndexingPipelineService {
           return false;
         }
 
-        const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
-        if (!this.canRunRelink(backlog)) {
-          return false;
-        }
-
-        return await this.relinkNetworkPhase(network, latestBlockHeight);
+        return runPhase(network, latestBlockHeight);
       },
     );
 
@@ -530,24 +605,7 @@ export class IndexingPipelineService {
       return false;
     }
 
-    const retryMarker = `${status.phase ?? 'utxos'}:${status.targetTail ?? backlog.processTail}`;
-    if (
-      !this.bootstrapInFlight.has(network.networkId) &&
-      status.startedAtMs !== null &&
-      Date.now() - status.startedAtMs >= this.settings.bootstrapTimeoutMs &&
-      this.bootstrapRetryMarkers.get(network.networkId) !== retryMarker
-    ) {
-      const cursor =
-        status.phase === 'balances'
-          ? status.cursorBalance
-            ? `${status.cursorBalance.address}:${status.cursorBalance.assetAddress}`
-            : 'start'
-          : (status.cursorUtxo ?? 'start');
-      console.log(
-        `[onlydoge] phase=bootstrap network=${network.id} retrying table_phase=${status.phase ?? 'utxos'} cursor=${cursor} target_tail=${status.targetTail ?? backlog.processTail}`,
-      );
-      this.bootstrapRetryMarkers.set(network.networkId, retryMarker);
-    }
+    this.logBootstrapRetryIfStale(network, status, backlog.processTail);
 
     const result = await this.runNetworkPhase(
       network,
@@ -561,24 +619,45 @@ export class IndexingPipelineService {
     return result.didWork;
   }
 
+  private logBootstrapRetryIfStale(
+    network: IndexedNetwork,
+    status: BootstrapStatus,
+    processTail: number,
+  ): void {
+    const retryMarker = bootstrapRetryMarker(status, processTail);
+    if (!this.shouldLogBootstrapRetry(network.networkId, status, retryMarker)) {
+      return;
+    }
+
+    console.log(
+      `[onlydoge] phase=bootstrap network=${network.id} retrying table_phase=${status.phase ?? 'utxos'} cursor=${bootstrapCursorLabel(status)} target_tail=${status.targetTail ?? processTail}`,
+    );
+    this.bootstrapRetryMarkers.set(network.networkId, retryMarker);
+  }
+
+  private shouldLogBootstrapRetry(
+    networkId: number,
+    status: BootstrapStatus,
+    retryMarker: string,
+  ): boolean {
+    if (this.bootstrapInFlight.has(networkId) || status.startedAtMs === null) {
+      return false;
+    }
+
+    return (
+      Date.now() - status.startedAtMs >= this.settings.bootstrapTimeoutMs &&
+      this.bootstrapRetryMarkers.get(networkId) !== retryMarker
+    );
+  }
+
   private async projectNetworkPhase(
     network: IndexedNetwork,
     latestBlockHeight: number,
   ): Promise<boolean> {
     const backlog = await this.readBacklogState(network.networkId, latestBlockHeight);
     const bootstrapStatus = await this.getBootstrapStatus(network.networkId, backlog.processTail);
-    if (bootstrapStatus.required || this.bootstrapInFlight.has(network.networkId)) {
-      this.logPhaseSkipOnce(network, 'project-state', 'bootstrap-pending', {
-        bootstrap_tail: bootstrapStatus.bootstrapTail ?? -1,
-        bootstrap_phase: bootstrapStatus.phase ?? 'pending',
-        bootstrap_cursor:
-          bootstrapStatus.phase === 'balances'
-            ? bootstrapStatus.cursorBalance
-              ? `${bootstrapStatus.cursorBalance.address}:${bootstrapStatus.cursorBalance.assetAddress}`
-              : 'start'
-            : (bootstrapStatus.cursorUtxo ?? 'start'),
-        target_tail: bootstrapStatus.targetTail ?? backlog.processTail,
-      });
+    if (this.isProjectBlockedByBootstrap(network.networkId, bootstrapStatus)) {
+      this.logProjectBootstrapPending(network, bootstrapStatus, backlog.processTail);
       return false;
     }
 
@@ -595,6 +674,26 @@ export class IndexingPipelineService {
     );
     this.recordWindowOutcome(network, 'project-state', result);
     return result.didWork;
+  }
+
+  private isProjectBlockedByBootstrap(
+    networkId: number,
+    bootstrapStatus: BootstrapStatus,
+  ): boolean {
+    return bootstrapStatus.required || this.bootstrapInFlight.has(networkId);
+  }
+
+  private logProjectBootstrapPending(
+    network: IndexedNetwork,
+    bootstrapStatus: BootstrapStatus,
+    processTail: number,
+  ): void {
+    this.logPhaseSkipOnce(network, 'project-state', 'bootstrap-pending', {
+      bootstrap_tail: bootstrapStatus.bootstrapTail ?? -1,
+      bootstrap_phase: bootstrapStatus.phase ?? 'pending',
+      bootstrap_cursor: bootstrapCursorLabel(bootstrapStatus),
+      target_tail: bootstrapStatus.targetTail ?? processTail,
+    });
   }
 
   private async factNetworkPhase(
@@ -637,38 +736,37 @@ export class IndexingPipelineService {
     const nextLease = this.createLease();
 
     if (!current) {
-      const claimed = await this.configs.compareAndSwapJsonValue(
-        configKeyPrimary(),
-        null,
-        nextLease,
-      );
-      if (claimed) {
-        console.log(`[onlydoge] indexer primary instance=${this.instanceId}`);
-      }
-      return claimed;
+      return this.claimPrimaryLease(null, nextLease, 'fresh');
     }
 
     const lease = this.toPrimaryLease(current);
-    if (lease?.instanceId === this.instanceId) {
+    if (isOwnLease(lease, this.instanceId)) {
       await this.configs.setJsonValue(configKeyPrimary(), nextLease);
       return true;
     }
 
     if (this.isLeaseExpired(lease)) {
-      const claimed = await this.configs.compareAndSwapJsonValue(
-        configKeyPrimary(),
-        current,
-        nextLease,
-      );
-      if (claimed) {
-        console.log(
-          `[onlydoge] indexer primary instance=${this.instanceId} replaced-stale-primary`,
-        );
-      }
-      return claimed;
+      return this.claimPrimaryLease(current, nextLease, 'stale');
     }
 
     return false;
+  }
+
+  private async claimPrimaryLease(
+    expected: PrimaryLease | string | null,
+    nextLease: PrimaryLease,
+    reason: 'fresh' | 'stale',
+  ): Promise<boolean> {
+    const claimed = await this.configs.compareAndSwapJsonValue(
+      configKeyPrimary(),
+      expected,
+      nextLease,
+    );
+    if (claimed) {
+      console.log(primaryLeaseClaimMessage(this.instanceId, reason));
+    }
+
+    return claimed;
   }
 
   private async refreshLeadership(): Promise<void> {
@@ -696,21 +794,8 @@ export class IndexingPipelineService {
       networks,
       this.settings.networkConcurrency,
       async (network) => {
-        try {
-          const latestBlockHeight = await this.rpc.getBlockHeight(network);
-          this.latestHeights.set(network.networkId, latestBlockHeight);
-          await this.configs.setJsonValue(
-            configKeyBlockHeight(network.networkId),
-            latestBlockHeight,
-          );
-
-          return { latestBlockHeight, network };
-        } catch (error) {
-          console.error(
-            `[onlydoge] sync height failed network=${network.id} error=${formatError(error)}`,
-          );
-          return null;
-        }
+        const latestBlockHeight = await this.refreshNetworkHeight(network);
+        return latestBlockHeight === null ? null : { latestBlockHeight, network };
       },
     );
 
@@ -723,6 +808,10 @@ export class IndexingPipelineService {
       return cached;
     }
 
+    return this.refreshNetworkHeight(network);
+  }
+
+  private async refreshNetworkHeight(network: IndexedNetwork): Promise<number | null> {
     try {
       const latestBlockHeight = await this.rpc.getBlockHeight(network);
       this.latestHeights.set(network.networkId, latestBlockHeight);
@@ -736,6 +825,16 @@ export class IndexingPipelineService {
     }
   }
 
+  private async readSyncTail(networkId: PrimaryId): Promise<number> {
+    return (await this.configs.getJsonValue<number>(configKeyIndexerSyncTail(networkId))) ?? -1;
+  }
+
+  private async readProcessTail(networkId: PrimaryId): Promise<number> {
+    return tailOrInitial(
+      await this.configs.getJsonValue<number>(configKeyIndexerProcessTail(networkId)),
+    );
+  }
+
   private async runNetworkPhase(
     network: IndexedNetwork,
     phase: PhaseName,
@@ -746,81 +845,134 @@ export class IndexingPipelineService {
     work: (signal: AbortSignal) => Promise<PhaseWorkResult>,
   ): Promise<PhaseExecutionResult> {
     if (inFlight.has(network.networkId)) {
-      return {
-        didWork: false,
-        workItems: 0,
-        durationMs: 0,
-      };
+      return idlePhaseExecution();
     }
 
-    const startedAt = Date.now();
-    const attemptId = randomUUID();
-    const controller = new AbortController();
-    const attempt: PhaseAttempt = {
-      attemptId,
-      controller,
-      startedAtMs: startedAt,
-      timedOut: false,
-      promise: Promise.resolve(),
-    };
-    const workPromise = work(controller.signal);
-    const trackedPromise = workPromise
-      .then((result) => {
-        if (attempt.timedOut) {
-          console.log(
-            `[onlydoge] phase=${phase} network=${network.id} completed-after-timeout ignored=true attemptId=${attemptId} durationMs=${Date.now() - startedAt} didWork=${result.didWork} workItems=${result.workItems}`,
-          );
-        }
-      })
-      .catch((error) => {
-        if (attempt.timedOut) {
-          console.error(
-            `[onlydoge] phase=${phase} network=${network.id} failed-after-timeout ignored=true attemptId=${attemptId} error=${formatError(error)}`,
-          );
-        }
-      })
-      .finally(() => {
-        if (inFlight.get(network.networkId)?.attemptId === attemptId) {
-          inFlight.delete(network.networkId);
-        }
-      });
-    attempt.promise = trackedPromise;
-    inFlight.set(network.networkId, attempt);
+    const started = this.startPhaseAttempt(network, phase, inFlight, work);
 
     try {
-      const result = await withTimeout(
-        workPromise,
-        timeoutMs,
-        `${phase} timed out after ${timeoutMs}ms`,
-      );
-      const execution = {
-        ...result,
-        durationMs: Date.now() - startedAt,
-      };
-
-      if (result.didWork) {
-        this.logPhaseSuccess(network, phase, backlog, window, execution);
-      }
-      return execution;
+      return await this.completePhaseAttempt(network, phase, backlog, window, timeoutMs, started);
     } catch (error) {
-      if (isTimeoutError(error)) {
-        attempt.timedOut = true;
-        controller.abort(error);
-        if (inFlight.get(network.networkId)?.attemptId === attemptId) {
-          inFlight.delete(network.networkId);
-        }
-        console.error(
-          `[onlydoge] phase=${phase} network=${network.id} aborting attemptId=${attemptId} durationMs=${Date.now() - startedAt} error=${formatError(error)}`,
-        );
-      }
-      const execution = {
-        didWork: false,
-        workItems: 0,
-        durationMs: Date.now() - startedAt,
-        error,
-      };
-      this.logPhaseFailure(network, phase, backlog, window, execution);
-      return execution;
+      return this.failPhaseAttempt(network, phase, backlog, window, inFlight, started, error);
+    }
+  }
+
+  private startPhaseAttempt(
+    network: IndexedNetwork,
+    phase: PhaseName,
+    inFlight: Map<number, PhaseAttempt>,
+    work: (signal: AbortSignal) => Promise<PhaseWorkResult>,
+  ): StartedPhaseAttempt {
+    const startedAt = Date.now();
+    const attempt = createPhaseAttempt(startedAt);
+    const workPromise = work(attempt.controller.signal);
+    attempt.promise = this.trackPhaseAttempt(network, phase, inFlight, attempt, workPromise);
+    inFlight.set(network.networkId, attempt);
+    return { attempt, startedAt, workPromise };
+  }
+
+  private trackPhaseAttempt(
+    network: IndexedNetwork,
+    phase: PhaseName,
+    inFlight: Map<number, PhaseAttempt>,
+    attempt: PhaseAttempt,
+    workPromise: Promise<PhaseWorkResult>,
+  ): Promise<void> {
+    return workPromise
+      .then((result) => this.logLatePhaseSuccess(network, phase, attempt, result))
+      .catch((error) => this.logLatePhaseFailure(network, phase, attempt, error))
+      .finally(() => this.clearPhaseAttempt(network.networkId, inFlight, attempt.attemptId));
+  }
+
+  private async completePhaseAttempt(
+    network: IndexedNetwork,
+    phase: PhaseName,
+    backlog: BacklogState,
+    window: number | null,
+    timeoutMs: number,
+    started: StartedPhaseAttempt,
+  ): Promise<PhaseExecutionResult> {
+    const result = await withTimeout(
+      started.workPromise,
+      timeoutMs,
+      `${phase} timed out after ${timeoutMs}ms`,
+    );
+    const execution = {
+      ...result,
+      durationMs: Date.now() - started.startedAt,
+    };
+
+    if (result.didWork) {
+      this.logPhaseSuccess(network, phase, backlog, window, execution);
+    }
+    return execution;
+  }
+
+  private failPhaseAttempt(
+    network: IndexedNetwork,
+    phase: PhaseName,
+    backlog: BacklogState,
+    window: number | null,
+    inFlight: Map<number, PhaseAttempt>,
+    started: StartedPhaseAttempt,
+    error: unknown,
+  ): PhaseExecutionResult {
+    if (isTimeoutError(error)) {
+      this.abortTimedOutAttempt(network, phase, inFlight, started, error);
+    }
+    const execution = failedPhaseExecution(started.startedAt, error);
+    this.logPhaseFailure(network, phase, backlog, window, execution);
+    return execution;
+  }
+
+  private abortTimedOutAttempt(
+    network: IndexedNetwork,
+    phase: PhaseName,
+    inFlight: Map<number, PhaseAttempt>,
+    started: StartedPhaseAttempt,
+    error: unknown,
+  ): void {
+    started.attempt.timedOut = true;
+    started.attempt.controller.abort(error);
+    this.clearPhaseAttempt(network.networkId, inFlight, started.attempt.attemptId);
+    console.error(
+      `[onlydoge] phase=${phase} network=${network.id} aborting attemptId=${started.attempt.attemptId} durationMs=${Date.now() - started.startedAt} error=${formatError(error)}`,
+    );
+  }
+
+  private logLatePhaseSuccess(
+    network: IndexedNetwork,
+    phase: PhaseName,
+    attempt: PhaseAttempt,
+    result: PhaseWorkResult,
+  ): void {
+    if (attempt.timedOut) {
+      console.log(
+        `[onlydoge] phase=${phase} network=${network.id} completed-after-timeout ignored=true attemptId=${attempt.attemptId} durationMs=${Date.now() - attempt.startedAtMs} didWork=${result.didWork} workItems=${result.workItems}`,
+      );
+    }
+  }
+
+  private logLatePhaseFailure(
+    network: IndexedNetwork,
+    phase: PhaseName,
+    attempt: PhaseAttempt,
+    error: unknown,
+  ): void {
+    if (attempt.timedOut) {
+      console.error(
+        `[onlydoge] phase=${phase} network=${network.id} failed-after-timeout ignored=true attemptId=${attempt.attemptId} error=${formatError(error)}`,
+      );
+    }
+  }
+
+  private clearPhaseAttempt(
+    networkId: number,
+    inFlight: Map<number, PhaseAttempt>,
+    attemptId: string,
+  ): void {
+    if (inFlight.get(networkId)?.attemptId === attemptId) {
+      inFlight.delete(networkId);
     }
   }
 
@@ -830,58 +982,66 @@ export class IndexingPipelineService {
     window: number,
     _signal: AbortSignal,
   ): Promise<PhaseWorkResult> {
-    const currentSyncTail =
-      (await this.configs.getJsonValue<number>(configKeyIndexerSyncTail(network.networkId))) ?? -1;
+    const currentSyncTail = await this.readSyncTail(network.networkId);
     if (currentSyncTail >= latestBlockHeight) {
-      await this.configs.setJsonValue(
-        configKeyIndexerSyncProgress(network.networkId),
-        this.toProgress(currentSyncTail, latestBlockHeight),
-      );
-      return { didWork: false, workItems: 0 };
+      await this.recordSyncProgress(network.networkId, currentSyncTail, latestBlockHeight);
+      return noPhaseWork();
     }
 
     const windowEnd = Math.min(latestBlockHeight, currentSyncTail + window);
     const heights = range(currentSyncTail + 1, windowEnd);
-    const storedHeights = new Set<number>();
-
-    await mapWithConcurrency(heights, this.settings.syncConcurrency, async (blockHeight) => {
-      try {
-        const snapshot = await this.rpc.getBlockSnapshot(network, blockHeight);
-        await this.rawBlocks.putPart(network.networkId, blockHeight, 'block', snapshot);
-        storedHeights.add(blockHeight);
-      } catch (error) {
-        console.error(
-          `[onlydoge] sync failed network=${network.id} block=${blockHeight} error=${formatError(error)}`,
-        );
-      }
-    });
-
-    let contiguousTail = currentSyncTail;
-    for (const blockHeight of heights) {
-      if (!storedHeights.has(blockHeight)) {
-        break;
-      }
-
-      contiguousTail = blockHeight;
-    }
-
-    await this.configs.setJsonValue(
-      configKeyIndexerSyncProgress(network.networkId),
-      this.toProgress(contiguousTail, latestBlockHeight),
-    );
+    const storedHeights = await this.syncWindowHeights(network, heights);
+    const contiguousTail = contiguousStoredTail(currentSyncTail, heights, storedHeights);
+    await this.recordSyncProgress(network.networkId, contiguousTail, latestBlockHeight);
 
     if (contiguousTail <= currentSyncTail) {
-      return { didWork: false, workItems: 0 };
+      return noPhaseWork();
     }
 
     await this.configs.setJsonValue(configKeyIndexerSyncTail(network.networkId), contiguousTail);
+    return blockRangeWork(currentSyncTail, contiguousTail);
+  }
 
-    return {
-      didWork: true,
-      workItems: contiguousTail - currentSyncTail,
-      startBlock: currentSyncTail + 1,
-      endBlock: contiguousTail,
-    };
+  private async syncWindowHeights(
+    network: IndexedNetwork,
+    heights: number[],
+  ): Promise<Set<number>> {
+    const storedHeights = await mapWithConcurrency(
+      heights,
+      this.settings.syncConcurrency,
+      (blockHeight) => this.syncBlockHeight(network, blockHeight),
+    );
+
+    return new Set(
+      storedHeights.filter((blockHeight): blockHeight is number => blockHeight !== null),
+    );
+  }
+
+  private async syncBlockHeight(
+    network: IndexedNetwork,
+    blockHeight: number,
+  ): Promise<number | null> {
+    try {
+      const snapshot = await this.rpc.getBlockSnapshot(network, blockHeight);
+      await this.rawBlocks.putPart(network.networkId, blockHeight, 'block', snapshot);
+      return blockHeight;
+    } catch (error) {
+      console.error(
+        `[onlydoge] sync failed network=${network.id} block=${blockHeight} error=${formatError(error)}`,
+      );
+      return null;
+    }
+  }
+
+  private async recordSyncProgress(
+    networkId: PrimaryId,
+    syncTail: number,
+    latestBlockHeight: number,
+  ): Promise<void> {
+    await this.configs.setJsonValue(
+      configKeyIndexerSyncProgress(networkId),
+      this.toProgress(syncTail, latestBlockHeight),
+    );
   }
 
   private async projectNetworkWindow(
@@ -890,118 +1050,227 @@ export class IndexingPipelineService {
     window: number,
     _signal: AbortSignal,
   ): Promise<PhaseWorkResult> {
-    const currentSyncTail =
-      (await this.configs.getJsonValue<number>(configKeyIndexerSyncTail(network.networkId))) ?? -1;
+    const currentSyncTail = await this.readSyncTail(network.networkId);
     const currentProcessTail =
       (await this.configs.getJsonValue<number>(configKeyIndexerProcessTail(network.networkId))) ??
       -1;
     if (currentProcessTail >= currentSyncTail) {
-      await this.configs.setJsonValue(
-        configKeyIndexerProcessProgress(network.networkId),
-        this.toProgress(currentProcessTail, latestBlockHeight),
-      );
-      return { didWork: false, workItems: 0 };
+      await this.recordProjectProgress(network.networkId, currentProcessTail, latestBlockHeight);
+      return noPhaseWork();
     }
 
     const windowEnd = Math.min(currentSyncTail, currentProcessTail + window);
     const heights = range(currentProcessTail + 1, windowEnd);
-    const loadSnapshotsStartedAt = Date.now();
-    const orderedSnapshots = await this.loadSnapshots(network.networkId, heights);
-    const loadSnapshotsMs = Date.now() - loadSnapshotsStartedAt;
-    const appliedBlocks = await this.projectStateStore.listAppliedBlockSet(
-      network.networkId,
-      orderedSnapshots.map((snapshot, index) => ({
-        blockHeight: heights[index] ?? -1,
-        blockHash: this.readSnapshotBlockHash(snapshot, network.architecture),
-      })),
-    );
-
-    let recoveredProcessTail = currentProcessTail;
-    let recoveryIndex = 0;
-    for (const [index, snapshot] of orderedSnapshots.entries()) {
-      const blockHeight = heights[index] ?? currentProcessTail;
-      const blockHash = this.readSnapshotBlockHash(snapshot, network.architecture);
-      if (!appliedBlocks.has(blockIdentity(network.networkId, blockHeight, blockHash))) {
-        recoveryIndex = index;
-        break;
-      }
-
-      recoveredProcessTail = blockHeight;
-      recoveryIndex = index + 1;
-    }
-
-    if (recoveredProcessTail > currentProcessTail) {
-      await this.projectStateStore.finalizeProjectionBootstrap(
-        network.networkId,
-        recoveredProcessTail,
-      );
-      await this.configs.setJsonValue(
-        configKeyIndexerProcessTail(network.networkId),
-        recoveredProcessTail,
-      );
-      await this.configs.setJsonValue(
-        configKeyIndexerProcessProgress(network.networkId),
-        this.toProgress(recoveredProcessTail, latestBlockHeight),
-      );
-
-      if (recoveryIndex >= orderedSnapshots.length) {
-        return {
-          didWork: true,
-          workItems: recoveredProcessTail - currentProcessTail,
-          startBlock: currentProcessTail + 1,
-          endBlock: recoveredProcessTail,
-          metrics: {
-            load_snapshots_ms: loadSnapshotsMs,
-          },
-        };
-      }
-    }
-
-    const snapshotsToProject = orderedSnapshots.slice(recoveryIndex);
-    if (snapshotsToProject.length === 0) {
-      return recoveredProcessTail > currentProcessTail
-        ? {
-            didWork: true,
-            workItems: recoveredProcessTail - currentProcessTail,
-            startBlock: currentProcessTail + 1,
-            endBlock: recoveredProcessTail,
-            metrics: {
-              load_snapshots_ms: loadSnapshotsMs,
-            },
-          }
-        : { didWork: false, workItems: 0 };
-    }
-
-    const projectBlocksStartedAt = Date.now();
-    const projections = await this.projectWindow(
+    const snapshotWindow = await this.loadAppliedSnapshotWindow(
       network,
-      snapshotsToProject,
-      'state',
-      recoveredProcessTail,
+      heights,
+      windowEnd,
+      this.projectStateStore,
     );
-    const projectBlocksMs = Date.now() - projectBlocksStartedAt;
+    const recovery = await this.prepareProjectRecovery(
+      network,
+      snapshotWindow,
+      currentProcessTail,
+      latestBlockHeight,
+    );
+    if (recovery.result) {
+      return recovery.result;
+    }
 
-    const applyStateStartedAt = Date.now();
-    await this.projectStateStore.applyProjectionWindow(projections);
-    const applyStateMs = Date.now() - applyStateStartedAt;
-    await this.projectStateStore.finalizeProjectionBootstrap(network.networkId, windowEnd);
-    await this.configs.setJsonValue(configKeyIndexerProcessTail(network.networkId), windowEnd);
-    await this.configs.setJsonValue(
-      configKeyIndexerProcessProgress(network.networkId),
-      this.toProgress(windowEnd, latestBlockHeight),
+    const { durationMs: projectBlocksMs, value: projections } = await measureAsync(() =>
+      this.projectWindow(network, recovery.snapshotsToProject, 'state', recovery.recoveredTail),
+    );
+
+    const { durationMs: applyStateMs } = await measureAsync(() =>
+      this.projectStateStore.applyProjectionWindow(projections),
+    );
+    await this.commitProjectTail(network.networkId, windowEnd, latestBlockHeight);
+
+    return blockRangeWork(currentProcessTail, windowEnd, {
+      apply_state_ms: applyStateMs,
+      load_snapshots_ms: snapshotWindow.loadSnapshotsMs,
+      project_blocks_ms: projectBlocksMs,
+    });
+  }
+
+  private async loadAppliedSnapshotWindow(
+    network: IndexedNetwork,
+    heights: number[],
+    windowEnd: number,
+    appliedBlockReader: AppliedBlockSetReader,
+  ): Promise<AppliedSnapshotWindow> {
+    const { durationMs: loadSnapshotsMs, value: orderedSnapshots } = await measureAsync(() =>
+      this.loadSnapshots(network.networkId, heights),
+    );
+    const appliedBlocks = await appliedBlockReader.listAppliedBlockSet(
+      network.networkId,
+      this.snapshotBlockIdentities(network, heights, orderedSnapshots),
     );
 
     return {
-      didWork: true,
-      workItems: windowEnd - currentProcessTail,
-      startBlock: currentProcessTail + 1,
-      endBlock: windowEnd,
-      metrics: {
-        apply_state_ms: applyStateMs,
-        load_snapshots_ms: loadSnapshotsMs,
-        project_blocks_ms: projectBlocksMs,
-      },
+      appliedBlocks,
+      heights,
+      loadSnapshotsMs,
+      orderedSnapshots,
+      windowEnd,
     };
+  }
+
+  private snapshotBlockIdentities(
+    network: IndexedNetwork,
+    heights: number[],
+    orderedSnapshots: Record<string, unknown>[],
+  ): Array<{ blockHash: string; blockHeight: number }> {
+    return orderedSnapshots.map((snapshot, index) => ({
+      blockHeight: heights[index] ?? -1,
+      blockHash: this.readSnapshotBlockHash(snapshot, network.architecture),
+    }));
+  }
+
+  private async prepareProjectRecovery(
+    network: IndexedNetwork,
+    snapshotWindow: AppliedSnapshotWindow,
+    currentProcessTail: number,
+    latestBlockHeight: number,
+  ): Promise<ProjectRecoveryOutcome> {
+    const recovery = this.recoverAppliedSnapshotTail(
+      network,
+      snapshotWindow.heights,
+      snapshotWindow.orderedSnapshots,
+      snapshotWindow.appliedBlocks,
+      currentProcessTail,
+    );
+    await this.commitProjectRecoveryIfNeeded(
+      network,
+      recovery,
+      currentProcessTail,
+      latestBlockHeight,
+    );
+
+    return {
+      recoveredTail: recovery.recoveredTail,
+      result: recoveredSnapshotResult(
+        currentProcessTail,
+        recovery,
+        snapshotWindow.orderedSnapshots.length,
+        snapshotWindow.loadSnapshotsMs,
+      ),
+      snapshotsToProject: snapshotWindow.orderedSnapshots.slice(recovery.recoveryIndex),
+    };
+  }
+
+  private recoverAppliedSnapshotTail(
+    network: IndexedNetwork,
+    heights: number[],
+    orderedSnapshots: Record<string, unknown>[],
+    appliedBlocks: Set<string>,
+    currentTail: number,
+  ): AppliedSnapshotRecovery {
+    let recoveredTail = currentTail;
+    let recoveryIndex = 0;
+    for (const [index, snapshot] of orderedSnapshots.entries()) {
+      const blockHeight = heights[index] ?? currentTail;
+      const blockHash = this.readSnapshotBlockHash(snapshot, network.architecture);
+      if (!appliedBlocks.has(projectionBlockIdentity(network.networkId, blockHeight, blockHash))) {
+        return { recoveredTail, recoveryIndex: index };
+      }
+
+      recoveredTail = blockHeight;
+      recoveryIndex = index + 1;
+    }
+
+    return { recoveredTail, recoveryIndex };
+  }
+
+  private async commitProjectRecovery(
+    network: IndexedNetwork,
+    recoveredProcessTail: number,
+    latestBlockHeight: number,
+  ): Promise<void> {
+    await this.projectStateStore.finalizeProjectionBootstrap(
+      network.networkId,
+      recoveredProcessTail,
+    );
+    await this.configs.setJsonValue(
+      configKeyIndexerProcessTail(network.networkId),
+      recoveredProcessTail,
+    );
+    await this.configs.setJsonValue(
+      configKeyIndexerProcessProgress(network.networkId),
+      this.toProgress(recoveredProcessTail, latestBlockHeight),
+    );
+  }
+
+  private async commitProjectRecoveryIfNeeded(
+    network: IndexedNetwork,
+    recovery: AppliedSnapshotRecovery,
+    currentProcessTail: number,
+    latestBlockHeight: number,
+  ): Promise<void> {
+    if (recovery.recoveredTail > currentProcessTail) {
+      await this.commitProjectRecovery(network, recovery.recoveredTail, latestBlockHeight);
+    }
+  }
+
+  private async commitProjectTail(
+    networkId: PrimaryId,
+    processTail: number,
+    latestBlockHeight: number,
+  ): Promise<void> {
+    await this.projectStateStore.finalizeProjectionBootstrap(networkId, processTail);
+    await this.configs.setJsonValue(configKeyIndexerProcessTail(networkId), processTail);
+    await this.recordProjectProgress(networkId, processTail, latestBlockHeight);
+  }
+
+  private async recordProjectProgress(
+    networkId: PrimaryId,
+    processTail: number,
+    latestBlockHeight: number,
+  ): Promise<void> {
+    await this.configs.setJsonValue(
+      configKeyIndexerProcessProgress(networkId),
+      this.toProgress(processTail, latestBlockHeight),
+    );
+  }
+
+  private async commitFactRecovery(
+    network: IndexedNetwork,
+    recoveredFactTail: number,
+    latestBlockHeight: number,
+  ): Promise<void> {
+    await this.configs.setJsonValue(configKeyIndexerFactTail(network.networkId), recoveredFactTail);
+    await this.recordFactProgress(network.networkId, recoveredFactTail, latestBlockHeight);
+  }
+
+  private async commitFactRecoveryIfNeeded(
+    network: IndexedNetwork,
+    recovery: AppliedSnapshotRecovery,
+    currentFactTail: number,
+    latestBlockHeight: number,
+  ): Promise<void> {
+    if (recovery.recoveredTail > currentFactTail) {
+      await this.commitFactRecovery(network, recovery.recoveredTail, latestBlockHeight);
+    }
+  }
+
+  private async commitFactTail(
+    networkId: PrimaryId,
+    factTail: number,
+    latestBlockHeight: number,
+  ): Promise<void> {
+    await this.configs.setJsonValue(configKeyIndexerFactTail(networkId), factTail);
+    await this.recordFactProgress(networkId, factTail, latestBlockHeight);
+  }
+
+  private async recordFactProgress(
+    networkId: PrimaryId,
+    factTail: number,
+    latestBlockHeight: number,
+  ): Promise<void> {
+    await this.configs.setJsonValue(
+      configKeyIndexerFactProgress(networkId),
+      this.toProgress(factTail, latestBlockHeight),
+    );
   }
 
   private async factNetworkWindow(
@@ -1010,130 +1279,120 @@ export class IndexingPipelineService {
     window: number,
     _signal: AbortSignal,
   ): Promise<PhaseWorkResult> {
-    const currentProcessTail =
-      (await this.configs.getJsonValue<number>(configKeyIndexerProcessTail(network.networkId))) ??
-      -1;
+    const currentProcessTail = await this.readProcessTail(network.networkId);
     const currentFactTail = await this.getFactTail(network.networkId, currentProcessTail);
     if (currentFactTail >= currentProcessTail) {
-      await this.configs.setJsonValue(
-        configKeyIndexerFactProgress(network.networkId),
-        this.toProgress(currentFactTail, latestBlockHeight),
-      );
-      return { didWork: false, workItems: 0 };
+      await this.recordFactProgress(network.networkId, currentFactTail, latestBlockHeight);
+      return noPhaseWork();
     }
 
     const windowEnd = Math.min(currentProcessTail, currentFactTail + window);
     const heights = range(currentFactTail + 1, windowEnd);
-    const loadSnapshotsStartedAt = Date.now();
-    const orderedSnapshots = await this.loadSnapshots(network.networkId, heights);
-    const loadSnapshotsMs = Date.now() - loadSnapshotsStartedAt;
-    const appliedBlocks = await this.factWarehouse.listAppliedBlockSet(
-      network.networkId,
-      orderedSnapshots.map((snapshot, index) => ({
-        blockHeight: heights[index] ?? -1,
-        blockHash: this.readSnapshotBlockHash(snapshot, network.architecture),
-      })),
-    );
-
-    let recoveredFactTail = currentFactTail;
-    let recoveryIndex = 0;
-    for (const [index, snapshot] of orderedSnapshots.entries()) {
-      const blockHeight = heights[index] ?? currentFactTail;
-      const blockHash = this.readSnapshotBlockHash(snapshot, network.architecture);
-      if (!appliedBlocks.has(blockIdentity(network.networkId, blockHeight, blockHash))) {
-        recoveryIndex = index;
-        break;
-      }
-
-      recoveredFactTail = blockHeight;
-      recoveryIndex = index + 1;
-    }
-
-    if (recoveredFactTail > currentFactTail) {
-      await this.configs.setJsonValue(
-        configKeyIndexerFactTail(network.networkId),
-        recoveredFactTail,
-      );
-      await this.configs.setJsonValue(
-        configKeyIndexerFactProgress(network.networkId),
-        this.toProgress(recoveredFactTail, latestBlockHeight),
-      );
-
-      if (recoveryIndex >= orderedSnapshots.length) {
-        return {
-          didWork: true,
-          workItems: recoveredFactTail - currentFactTail,
-          startBlock: currentFactTail + 1,
-          endBlock: recoveredFactTail,
-          metrics: {
-            load_snapshots_ms: loadSnapshotsMs,
-          },
-        };
-      }
-    }
-
-    const recoveredSnapshots = orderedSnapshots.slice(0, recoveryIndex);
-    const snapshotsToPersist = orderedSnapshots.slice(recoveryIndex);
-    let recoveredProjectBlocksMs = 0;
-    let recoveredApplyLinksMs = 0;
-
-    if (recoveredSnapshots.length > 0) {
-      const recoveredProjectionsStartedAt = Date.now();
-      const recoveredProjections = await this.projectWindow(network, recoveredSnapshots, 'facts');
-      recoveredProjectBlocksMs = Date.now() - recoveredProjectionsStartedAt;
-      const recoveredApplyLinksStartedAt = Date.now();
-      await this.applyFactDirectLinks(network.networkId, recoveredProjections);
-      recoveredApplyLinksMs = Date.now() - recoveredApplyLinksStartedAt;
-    }
-
-    if (snapshotsToPersist.length === 0) {
-      const recoveryMetrics: Record<string, number> = {
-        apply_links_ms: recoveredApplyLinksMs,
-        load_snapshots_ms: loadSnapshotsMs,
-        project_blocks_ms: recoveredProjectBlocksMs,
-      };
-      return recoveredFactTail > currentFactTail
-        ? {
-            didWork: true,
-            workItems: recoveredFactTail - currentFactTail,
-            startBlock: currentFactTail + 1,
-            endBlock: recoveredFactTail,
-            metrics: recoveryMetrics,
-          }
-        : { didWork: false, workItems: 0 };
-    }
-
-    const projectBlocksStartedAt = Date.now();
-    const projections = await this.projectWindow(network, snapshotsToPersist, 'facts');
-    const projectBlocksMs = Date.now() - projectBlocksStartedAt;
-    const writeFactsStartedAt = Date.now();
-    const factWindow = await this.buildProjectionFactWindow(
-      network.networkId,
-      projections,
+    const snapshotWindow = await this.loadAppliedSnapshotWindow(
+      network,
+      heights,
+      windowEnd,
       this.factWarehouse,
     );
-    await this.factWarehouse.applyProjectionFacts(factWindow);
-    const writeFactsMs = Date.now() - writeFactsStartedAt;
-    const applyLinksStartedAt = Date.now();
-    await this.applyFactDirectLinks(network.networkId, projections);
-    const applyLinksMs = Date.now() - applyLinksStartedAt;
-    await this.configs.setJsonValue(configKeyIndexerFactTail(network.networkId), windowEnd);
-    await this.configs.setJsonValue(
-      configKeyIndexerFactProgress(network.networkId),
-      this.toProgress(windowEnd, latestBlockHeight),
+    const recovery = await this.prepareFactRecovery(
+      network,
+      snapshotWindow,
+      currentFactTail,
+      latestBlockHeight,
+    );
+    if (recovery.result) {
+      return recovery.result;
+    }
+
+    const { durationMs: projectBlocksMs, value: projections } = await measureAsync(() =>
+      this.projectWindow(network, recovery.snapshotsToPersist, 'facts'),
+    );
+    const persistMetrics = await this.persistFactWindow(network.networkId, projections);
+    await this.commitFactTail(network.networkId, windowEnd, latestBlockHeight);
+
+    return blockRangeWork(
+      currentFactTail,
+      windowEnd,
+      factPhaseMetrics(
+        snapshotWindow.loadSnapshotsMs,
+        recovery.metrics,
+        projectBlocksMs,
+        persistMetrics,
+      ),
+    );
+  }
+
+  private async prepareFactRecovery(
+    network: IndexedNetwork,
+    snapshotWindow: AppliedSnapshotWindow,
+    currentFactTail: number,
+    latestBlockHeight: number,
+  ): Promise<FactRecoveryOutcome> {
+    const recovery = this.recoverAppliedSnapshotTail(
+      network,
+      snapshotWindow.heights,
+      snapshotWindow.orderedSnapshots,
+      snapshotWindow.appliedBlocks,
+      currentFactTail,
+    );
+    await this.commitFactRecoveryIfNeeded(network, recovery, currentFactTail, latestBlockHeight);
+
+    const recoveredSnapshots = snapshotWindow.orderedSnapshots.slice(0, recovery.recoveryIndex);
+    const metrics = await this.replayRecoveredFactSnapshots(network, recoveredSnapshots);
+
+    return {
+      metrics,
+      recoveredTail: recovery.recoveredTail,
+      result: recoveredSnapshotResult(
+        currentFactTail,
+        recovery,
+        snapshotWindow.orderedSnapshots.length,
+        snapshotWindow.loadSnapshotsMs,
+        metrics,
+      ),
+      snapshotsToPersist: snapshotWindow.orderedSnapshots.slice(recovery.recoveryIndex),
+    };
+  }
+
+  private async replayRecoveredFactSnapshots(
+    network: IndexedNetwork,
+    recoveredSnapshots: Record<string, unknown>[],
+  ): Promise<Record<string, number>> {
+    if (recoveredSnapshots.length === 0) {
+      return { apply_links_ms: 0, project_blocks_ms: 0 };
+    }
+
+    const { durationMs: projectBlocksMs, value: recoveredProjections } = await measureAsync(() =>
+      this.projectWindow(network, recoveredSnapshots, 'facts'),
+    );
+    const applyLinksMs = await this.applyFactDirectLinksTimed(
+      network.networkId,
+      recoveredProjections,
     );
 
     return {
-      didWork: true,
-      workItems: windowEnd - currentFactTail,
-      startBlock: currentFactTail + 1,
-      endBlock: windowEnd,
-      metrics: {
-        apply_links_ms: applyLinksMs,
-        load_snapshots_ms: loadSnapshotsMs,
-        project_blocks_ms: projectBlocksMs,
-        write_facts_ms: writeFactsMs,
-      },
+      apply_links_ms: applyLinksMs,
+      project_blocks_ms: projectBlocksMs,
+    };
+  }
+
+  private async persistFactWindow(
+    networkId: PrimaryId,
+    projections: BlockProjectionBatch[],
+  ): Promise<Record<string, number>> {
+    const { durationMs: writeFactsMs } = await measureAsync(async () => {
+      const factWindow = await this.buildProjectionFactWindow(
+        networkId,
+        projections,
+        this.factWarehouse,
+      );
+      await this.factWarehouse.applyProjectionFacts(factWindow);
+    });
+    const applyLinksMs = await this.applyFactDirectLinksTimed(networkId, projections);
+
+    return {
+      apply_links_ms: applyLinksMs,
+      write_facts_ms: writeFactsMs,
     };
   }
 
@@ -1145,35 +1404,14 @@ export class IndexingPipelineService {
       'getBalanceSnapshots' | 'getDirectLinkSnapshots' | 'getUtxoOutputs'
     >,
   ): Promise<ProjectionFactWindow> {
-    const orderedProjections = [...projections].sort(
-      (left, right) => left.blockHeight - right.blockHeight,
+    const orderedProjections = orderProjectionBatches(projections);
+    const outputKeys = collectProjectionTouchedOutputKeys(orderedProjections);
+    const balanceKeys = collectProjectionBalanceSnapshotKeys(orderedProjections).map(
+      parseProjectionBalanceSnapshotKey,
     );
-    const outputKeys = [
-      ...new Set(
-        orderedProjections.flatMap((projection) => [
-          ...projection.utxoCreates.map((output) => output.outputKey),
-          ...projection.utxoSpends.map((spend) => spend.outputKey),
-        ]),
-      ),
-    ];
-    const balanceKeys = [
-      ...new Set(
-        projections.flatMap((projection) =>
-          projection.addressMovements.map((movement) =>
-            balanceKey(movement.address, movement.assetAddress),
-          ),
-        ),
-      ),
-    ].map(parseBalanceKey);
-    const directLinkKeys = [
-      ...new Set(
-        orderedProjections.flatMap((projection) =>
-          projection.directLinkDeltas.map((delta) =>
-            directLinkKey(delta.fromAddress, delta.toAddress, delta.assetAddress),
-          ),
-        ),
-      ),
-    ].map(parseDirectLinkKey);
+    const directLinkKeys = collectProjectionDirectLinkSnapshotKeys(orderedProjections).map(
+      parseProjectionDirectLinkSnapshotKey,
+    );
 
     const [currentOutputs, currentBalances, currentDirectLinks] = await Promise.all([
       snapshotStore.getUtxoOutputs(networkId, outputKeys),
@@ -1181,100 +1419,52 @@ export class IndexingPipelineService {
       snapshotStore.getDirectLinkSnapshots(networkId, directLinkKeys),
     ]);
 
-    const nextOutputs = new Map<string, ProjectionUtxoOutput>();
-    for (const projection of orderedProjections) {
-      for (const output of projection.utxoCreates) {
-        nextOutputs.set(output.outputKey, { ...output });
-      }
-
-      for (const spend of projection.utxoSpends) {
-        const current = nextOutputs.get(spend.outputKey) ?? currentOutputs.get(spend.outputKey);
-        if (!current) {
-          throw new Error(`missing utxo output: ${spend.outputKey}`);
-        }
-
-        nextOutputs.set(spend.outputKey, {
-          ...current,
-          spentByTxid: spend.spentByTxid,
-          spentInBlock: spend.spentInBlock,
-          spentInputIndex: spend.spentInputIndex,
-        });
-      }
-    }
+    const nextOutputs = buildNextProjectionUtxoOutputs(orderedProjections, currentOutputs);
 
     const nextBalances = new Map<string, ProjectionBalanceSnapshot>();
     for (const projection of orderedProjections) {
-      for (const movement of projection.addressMovements) {
-        const key = balanceKey(movement.address, movement.assetAddress);
-        const current = nextBalances.get(key) ?? currentBalances.get(key);
-        const currentAmount = parseAmountBase(current?.balance ?? '0');
-        const movementAmount = parseAmountBase(movement.amountBase);
-        const nextAmount =
-          movement.direction === 'credit'
-            ? currentAmount + movementAmount
-            : currentAmount - movementAmount;
-        if (nextAmount < 0n) {
-          throw new Error(
-            `negative balance for ${movement.networkId}:${movement.address}:${movement.assetAddress}`,
-          );
-        }
-
-        nextBalances.set(key, {
-          networkId: movement.networkId,
-          address: movement.address,
-          assetAddress: movement.assetAddress,
-          balance: formatAmountBase(nextAmount),
-          asOfBlockHeight: projection.blockHeight,
-        });
-      }
+      applyAddressMovementsToBalances({
+        asOfBlockHeight: projection.blockHeight,
+        currentBalances,
+        keyForMovement: (movement) =>
+          projectionBalanceSnapshotKey(movement.address, movement.assetAddress),
+        movements: projection.addressMovements,
+        nextBalances,
+      });
     }
 
     const nextDirectLinks = new Map<string, DirectLinkRecord>();
-    for (const projection of orderedProjections) {
-      for (const delta of projection.directLinkDeltas) {
-        const key = directLinkKey(delta.fromAddress, delta.toAddress, delta.assetAddress);
-        const current = nextDirectLinks.get(key) ?? currentDirectLinks.get(key);
-        if (current) {
-          nextDirectLinks.set(key, {
-            ...current,
-            transferCount: current.transferCount + delta.transferCount,
-            totalAmountBase: addAmountBase(current.totalAmountBase, delta.totalAmountBase),
-            firstSeenBlockHeight: Math.min(
-              current.firstSeenBlockHeight,
-              delta.firstSeenBlockHeight,
-            ),
-            lastSeenBlockHeight: Math.max(current.lastSeenBlockHeight, delta.lastSeenBlockHeight),
-          });
-          continue;
-        }
-
-        nextDirectLinks.set(key, { ...delta });
-      }
-    }
+    applyDirectLinkDeltasToSnapshots({
+      currentDirectLinks,
+      directLinkDeltas: orderedProjections.flatMap((projection) => projection.directLinkDeltas),
+      keyForDelta: (delta) =>
+        projectionDirectLinkSnapshotKey(delta.fromAddress, delta.toAddress, delta.assetAddress),
+      nextDirectLinks,
+    });
 
     return {
       networkId,
       addressMovements: orderedProjections.flatMap((projection) => projection.addressMovements),
       transfers: orderedProjections.flatMap((projection) => projection.transfers),
-      appliedBlocks: orderedProjections.map((projection) => ({
-        networkId: projection.networkId,
-        blockHeight: projection.blockHeight,
-        blockHash: projection.blockHash,
-      })),
+      appliedBlocks: toProjectionAppliedBlocks(orderedProjections),
       utxoOutputs: outputKeys.flatMap((outputKey) => {
         const output = nextOutputs.get(outputKey) ?? currentOutputs.get(outputKey);
         return output ? [output] : [];
       }),
       balances: balanceKeys.flatMap((key) => {
         const snapshot =
-          nextBalances.get(balanceKey(key.address, key.assetAddress)) ??
-          currentBalances.get(balanceKey(key.address, key.assetAddress));
+          nextBalances.get(projectionBalanceSnapshotKey(key.address, key.assetAddress)) ??
+          currentBalances.get(projectionBalanceSnapshotKey(key.address, key.assetAddress));
         return snapshot ? [snapshot] : [];
       }),
       directLinks: directLinkKeys.flatMap((key) => {
         const snapshot =
-          nextDirectLinks.get(directLinkKey(key.fromAddress, key.toAddress, key.assetAddress)) ??
-          currentDirectLinks.get(directLinkKey(key.fromAddress, key.toAddress, key.assetAddress));
+          nextDirectLinks.get(
+            projectionDirectLinkSnapshotKey(key.fromAddress, key.toAddress, key.assetAddress),
+          ) ??
+          currentDirectLinks.get(
+            projectionDirectLinkSnapshotKey(key.fromAddress, key.toAddress, key.assetAddress),
+          );
         return snapshot ? [snapshot] : [];
       }),
     };
@@ -1287,53 +1477,54 @@ export class IndexingPipelineService {
     expectedBootstrapTail = -1,
   ): Promise<BlockProjectionBatch[]> {
     if (network.architecture === 'evm') {
-      return snapshots.map((snapshot) =>
-        this.evmProjector.project(network.networkId, snapshot, {
-          includeDirectLinkDeltas: mode === 'facts',
-          includeTransfers: mode === 'facts',
-        }),
-      );
+      return this.projectEvmWindow(network, snapshots, mode);
     }
 
-    const knownOutputKeys = new Set<string>();
-    const externalOutputKeys = new Set<string>();
-    for (const snapshot of snapshots) {
-      for (const outputKey of this.dogecoinStateProjector.collectExternalOutputKeys(
-        snapshot,
-        knownOutputKeys,
-      )) {
-        externalOutputKeys.add(outputKey);
-      }
-    }
+    return this.projectDogecoinWindow(network, snapshots, mode, expectedBootstrapTail);
+  }
 
+  private async projectDogecoinWindow(
+    network: IndexedNetwork,
+    snapshots: Record<string, unknown>[],
+    mode: ProjectionMode,
+    expectedBootstrapTail: number,
+  ): Promise<BlockProjectionBatch[]> {
     const snapshotStore = mode === 'state' ? this.projectStateStore : this.stateStore;
     const projector = mode === 'state' ? this.dogecoinStateProjector : this.dogecoinFactProjector;
+    const externalOutputKeys = this.collectDogecoinExternalOutputKeys(snapshots);
     const persistedOutputs = await snapshotStore.getUtxoOutputs(network.networkId, [
       ...externalOutputKeys,
     ]);
-    if (mode === 'state' && persistedOutputs.size < externalOutputKeys.size) {
-      const bootstrapTail = await this.projectStateStore.getProjectionBootstrapTail(
-        network.networkId,
-      );
-      const missingPrevouts = externalOutputKeys.size - persistedOutputs.size;
-      if (bootstrapTail === null || bootstrapTail < expectedBootstrapTail) {
-        console.warn(
-          `[onlydoge] phase=project-state network=${network.id} reason=bootstrap-required missing_prevouts=${missingPrevouts} required_prevouts=${externalOutputKeys.size} bootstrap_tail=${bootstrapTail ?? -1} required_tail=${expectedBootstrapTail}`,
-        );
-        throw new BootstrapRequiredError(
-          `bootstrap required for project-state prevouts: ${missingPrevouts} missing`,
-        );
-      }
+    await this.assertDogecoinPrevoutsAvailable(
+      network,
+      mode,
+      externalOutputKeys.size,
+      persistedOutputs.size,
+      expectedBootstrapTail,
+    );
 
-      throw new Error(`strict metadata prevouts missing: ${missingPrevouts}`);
-    }
+    return this.projectDogecoinSnapshots(
+      network.networkId,
+      snapshots,
+      mode,
+      projector,
+      persistedOutputs,
+    );
+  }
 
+  private async projectDogecoinSnapshots(
+    networkId: PrimaryId,
+    snapshots: Record<string, unknown>[],
+    mode: ProjectionMode,
+    projector: DogecoinBlockProjector,
+    persistedOutputs: Map<string, ProjectionUtxoOutput>,
+  ): Promise<BlockProjectionBatch[]> {
     const localOutputs = new Map<string, ProjectionUtxoOutput>();
     const projections: BlockProjectionBatch[] = [];
     for (const snapshot of snapshots) {
       projections.push(
         await projector.project(
-          network.networkId,
+          networkId,
           snapshot,
           {
             localOutputs,
@@ -1350,6 +1541,67 @@ export class IndexingPipelineService {
     }
 
     return projections;
+  }
+
+  private projectEvmWindow(
+    network: IndexedNetwork,
+    snapshots: Record<string, unknown>[],
+    mode: ProjectionMode,
+  ): BlockProjectionBatch[] {
+    return snapshots.map((snapshot) =>
+      this.evmProjector.project(network.networkId, snapshot, {
+        includeDirectLinkDeltas: mode === 'facts',
+        includeTransfers: mode === 'facts',
+      }),
+    );
+  }
+
+  private collectDogecoinExternalOutputKeys(snapshots: Record<string, unknown>[]): Set<string> {
+    const knownOutputKeys = new Set<string>();
+    const externalOutputKeys = new Set<string>();
+    for (const snapshot of snapshots) {
+      for (const outputKey of this.dogecoinStateProjector.collectExternalOutputKeys(
+        snapshot,
+        knownOutputKeys,
+      )) {
+        externalOutputKeys.add(outputKey);
+      }
+    }
+
+    return externalOutputKeys;
+  }
+
+  private async assertDogecoinPrevoutsAvailable(
+    network: IndexedNetwork,
+    mode: ProjectionMode,
+    requiredPrevouts: number,
+    persistedPrevouts: number,
+    expectedBootstrapTail: number,
+  ): Promise<void> {
+    if (!requiresDogecoinPrevoutBootstrap(mode, requiredPrevouts, persistedPrevouts)) {
+      return;
+    }
+
+    const bootstrapTail = await this.projectStateStore.getProjectionBootstrapTail(
+      network.networkId,
+    );
+    const missingPrevouts = requiredPrevouts - persistedPrevouts;
+    if (hasRequiredBootstrapTail(bootstrapTail, expectedBootstrapTail)) {
+      throw new Error(`strict metadata prevouts missing: ${missingPrevouts}`);
+    }
+
+    console.warn(
+      bootstrapRequiredMessage(
+        network.id,
+        missingPrevouts,
+        requiredPrevouts,
+        bootstrapTail,
+        expectedBootstrapTail,
+      ),
+    );
+    throw new BootstrapRequiredError(
+      `bootstrap required for project-state prevouts: ${missingPrevouts} missing`,
+    );
   }
 
   private async applyFactDirectLinks(
@@ -1370,6 +1622,16 @@ export class IndexingPipelineService {
 
     await this.stateStore.applyDirectLinkDeltasWindow(batches);
     await this.markImpactedSeedsPendingRelink(networkId, projections);
+  }
+
+  private async applyFactDirectLinksTimed(
+    networkId: PrimaryId,
+    projections: BlockProjectionBatch[],
+  ): Promise<number> {
+    const { durationMs } = await measureAsync(() =>
+      this.applyFactDirectLinks(networkId, projections),
+    );
+    return durationMs;
   }
 
   private async markImpactedSeedsPendingRelink(
@@ -1520,21 +1782,49 @@ export class IndexingPipelineService {
       return { didWork: false, workItems: 0 };
     }
 
-    if (status.targetTail === null) {
-      throwIfAborted(signal);
-      await this.initializeBootstrapState(networkId, processTail);
-      status = await this.getBootstrapStatus(networkId, processTail);
+    status = await this.ensureBootstrapInitialized(networkId, processTail, signal, status);
+
+    return this.runBootstrapStatusPhase(networkId, status, processTail, signal);
+  }
+
+  private async ensureBootstrapInitialized(
+    networkId: number,
+    processTail: number,
+    signal: AbortSignal,
+    status: BootstrapStatus,
+  ): Promise<BootstrapStatus> {
+    if (status.targetTail !== null) {
+      return status;
     }
 
+    throwIfAborted(signal);
+    await this.initializeBootstrapState(networkId, processTail);
+    return this.getBootstrapStatus(networkId, processTail);
+  }
+
+  private runBootstrapStatusPhase(
+    networkId: number,
+    status: BootstrapStatus,
+    processTail: number,
+    signal: AbortSignal,
+  ): Promise<PhaseWorkResult> {
     const targetTail = status.targetTail ?? processTail;
-    switch (status.phase ?? 'utxos') {
-      case 'utxos':
-        return this.bootstrapUtxoState(networkId, targetTail, signal);
-      case 'balances':
-        return this.bootstrapBalanceState(networkId, targetTail, status.startedAtMs, signal);
-      case 'done':
-        return this.completeBootstrapState(networkId, targetTail, status.startedAtMs, 0, signal);
-    }
+    return this.bootstrapPhaseHandlers(networkId, status, targetTail, signal)[
+      bootstrapStatusPhase(status)
+    ]();
+  }
+
+  private bootstrapPhaseHandlers(
+    networkId: number,
+    status: BootstrapStatus,
+    targetTail: number,
+    signal: AbortSignal,
+  ): Record<BootstrapPhase, () => Promise<PhaseWorkResult>> {
+    return {
+      utxos: () => this.bootstrapUtxoState(networkId, targetTail, signal),
+      balances: () => this.bootstrapBalanceState(networkId, targetTail, status.startedAtMs, signal),
+      done: () => this.completeBootstrapState(networkId, targetTail, status.startedAtMs, 0, signal),
+    };
   }
 
   private async initializeBootstrapState(networkId: number, targetTail: number): Promise<void> {
@@ -1686,11 +1976,13 @@ export class IndexingPipelineService {
       this.configs.getJsonValue<number>(configKeyIndexerProcessTail(networkId)),
     ]);
 
+    const resolvedSyncTail = tailOrInitial(syncTail);
+    const resolvedProcessTail = tailOrInitial(processTail);
     return {
       latestBlockHeight,
-      syncTail: syncTail ?? -1,
-      processTail: processTail ?? -1,
-      backlog: Math.max(0, (syncTail ?? -1) - (processTail ?? -1)),
+      syncTail: resolvedSyncTail,
+      processTail: resolvedProcessTail,
+      backlog: Math.max(0, resolvedSyncTail - resolvedProcessTail),
     };
   }
 
@@ -1767,25 +2059,8 @@ export class IndexingPipelineService {
     phase: 'project-state' | 'sync',
     result: PhaseExecutionResult,
   ): void {
-    const tuning =
-      phase === 'sync'
-        ? this.getSyncTuning(network.networkId)
-        : this.getProjectTuning(network.networkId);
-    const minWindow =
-      phase === 'sync' ? this.settings.syncWindowMin : this.settings.projectWindowMin;
-    const maxWindow =
-      phase === 'sync' ? this.settings.syncWindowMax : this.settings.projectWindowMax;
-    const targetMs = phase === 'sync' ? this.settings.syncTargetMs : this.settings.projectTargetMs;
-
-    if (result.error && shouldBackoffWindow(result.error)) {
-      const nextWindow = Math.max(minWindow, Math.floor(tuning.window / 2) || minWindow);
-      if (nextWindow !== tuning.window) {
-        console.log(
-          `[onlydoge] adaptive backoff network=${network.id} phase=${phase} from=${tuning.window} to=${nextWindow} reason=${formatError(result.error)}`,
-        );
-        tuning.window = nextWindow;
-      }
-      tuning.successStreak = 0;
+    const context = this.adaptiveWindowContext(network.networkId, phase);
+    if (this.recordWindowBackoff(network, phase, result, context)) {
       return;
     }
 
@@ -1793,22 +2068,85 @@ export class IndexingPipelineService {
       return;
     }
 
-    if (result.durationMs <= targetMs) {
-      tuning.successStreak += 1;
-      if (tuning.successStreak >= 5 && tuning.window < maxWindow) {
-        const nextWindow = Math.min(maxWindow, tuning.window * 2);
-        if (nextWindow !== tuning.window) {
-          console.log(
-            `[onlydoge] adaptive growth network=${network.id} phase=${phase} from=${tuning.window} to=${nextWindow}`,
-          );
-          tuning.window = nextWindow;
-        }
-        tuning.successStreak = 0;
-      }
+    if (result.durationMs > context.targetMs) {
+      context.tuning.successStreak = 0;
       return;
     }
 
-    tuning.successStreak = 0;
+    this.recordWindowGrowth(network, phase, context);
+  }
+
+  private adaptiveWindowContext(
+    networkId: number,
+    phase: 'project-state' | 'sync',
+  ): AdaptiveWindowContext {
+    if (phase === 'sync') {
+      return {
+        tuning: this.getSyncTuning(networkId),
+        minWindow: this.settings.syncWindowMin,
+        maxWindow: this.settings.syncWindowMax,
+        targetMs: this.settings.syncTargetMs,
+      };
+    }
+
+    return {
+      tuning: this.getProjectTuning(networkId),
+      minWindow: this.settings.projectWindowMin,
+      maxWindow: this.settings.projectWindowMax,
+      targetMs: this.settings.projectTargetMs,
+    };
+  }
+
+  private recordWindowBackoff(
+    network: IndexedNetwork,
+    phase: 'project-state' | 'sync',
+    result: PhaseExecutionResult,
+    context: AdaptiveWindowContext,
+  ): boolean {
+    if (!result.error || !shouldBackoffWindow(result.error)) {
+      return false;
+    }
+
+    const nextWindow = Math.max(
+      context.minWindow,
+      Math.floor(context.tuning.window / 2) || context.minWindow,
+    );
+    this.updateAdaptiveWindow(network, phase, context, nextWindow, {
+      kind: 'backoff',
+      reason: formatError(result.error),
+    });
+    context.tuning.successStreak = 0;
+    return true;
+  }
+
+  private recordWindowGrowth(
+    network: IndexedNetwork,
+    phase: 'project-state' | 'sync',
+    context: AdaptiveWindowContext,
+  ): void {
+    context.tuning.successStreak += 1;
+    if (context.tuning.successStreak < 5 || context.tuning.window >= context.maxWindow) {
+      return;
+    }
+
+    const nextWindow = Math.min(context.maxWindow, context.tuning.window * 2);
+    this.updateAdaptiveWindow(network, phase, context, nextWindow, { kind: 'growth' });
+    context.tuning.successStreak = 0;
+  }
+
+  private updateAdaptiveWindow(
+    network: IndexedNetwork,
+    phase: 'project-state' | 'sync',
+    context: AdaptiveWindowContext,
+    nextWindow: number,
+    event: { kind: 'backoff'; reason: string } | { kind: 'growth' },
+  ): void {
+    if (nextWindow === context.tuning.window) {
+      return;
+    }
+
+    console.log(adaptiveWindowLogLine(network.id, phase, context.tuning.window, nextWindow, event));
+    context.tuning.window = nextWindow;
   }
 
   private logPhaseSkipOnce(
@@ -1840,18 +2178,8 @@ export class IndexingPipelineService {
     window: number | null,
     result: PhaseExecutionResult,
   ): void {
-    const rate =
-      result.durationMs > 0 ? (result.workItems * 1000) / Math.max(result.durationMs, 1) : 0;
-    const rangeText =
-      result.startBlock !== undefined && result.endBlock !== undefined
-        ? ` blocks=${result.startBlock}-${result.endBlock}`
-        : '';
-    const windowText = window === null ? '' : ` window=${window}`;
-    const pendingText = result.pendingCount === undefined ? '' : ` pending=${result.pendingCount}`;
-    const metricsText = formatMetrics(result.metrics);
-
     console.log(
-      `[onlydoge] phase=${phase} network=${network.id}${rangeText} latest=${backlog.latestBlockHeight} backlog=${backlog.backlog}${windowText}${pendingText} items=${result.workItems} durationMs=${result.durationMs} rate=${rate.toFixed(2)}/s${metricsText}`,
+      `[onlydoge] phase=${phase} network=${network.id}${phaseRangeText(result)} latest=${backlog.latestBlockHeight} backlog=${backlog.backlog}${phaseWindowText(window)}${phasePendingText(result)} items=${result.workItems} durationMs=${result.durationMs} rate=${phaseRate(result).toFixed(2)}/s${formatMetrics(result.metrics)}`,
     );
   }
 
@@ -1912,12 +2240,7 @@ export class IndexingPipelineService {
       return null;
     }
 
-    if (
-      typeof value === 'object' &&
-      value !== null &&
-      typeof value.instanceId === 'string' &&
-      typeof value.heartbeatAt === 'string'
-    ) {
+    if (isPrimaryLeaseRecord(value)) {
       return value;
     }
 
@@ -1928,17 +2251,8 @@ export class IndexingPipelineService {
     snapshot: Record<string, unknown>,
     architecture: 'dogecoin' | 'evm',
   ): string {
-    const block = snapshot.block;
-    if (!block || typeof block !== 'object' || Array.isArray(block)) {
-      throw new Error('invalid snapshot block payload');
-    }
-
-    const hash = 'hash' in block ? block.hash : undefined;
-    if (typeof hash !== 'string' || !hash.trim()) {
-      throw new Error('missing snapshot block hash');
-    }
-
-    return architecture === 'evm' ? hash.trim().toLowerCase() : hash.trim();
+    const hash = requireSnapshotHash(requireSnapshotBlock(snapshot));
+    return normalizeSnapshotHash(hash, architecture);
   }
 }
 
@@ -1973,76 +2287,58 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-function balanceKey(address: string, assetAddress: string): string {
-  return `${address}:${assetAddress}`;
-}
-
-function blockIdentity(networkId: number, blockHeight: number, blockHash: string): string {
-  return `${networkId}:${blockHeight}:${blockHash}`;
-}
-
-function parseBalanceKey(key: string): { address: string; assetAddress: string } {
-  const [address, ...assetAddressParts] = key.split(':');
-  return {
-    address: address ?? '',
-    assetAddress: assetAddressParts.join(':'),
-  };
-}
-
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function directLinkKey(fromAddress: string, toAddress: string, assetAddress: string): string {
-  return `${fromAddress}:${toAddress}:${assetAddress}`;
+function shouldContinue(signal: AbortSignal | undefined): boolean {
+  return !signal?.aborted;
 }
 
-function parseDirectLinkKey(key: string): {
-  assetAddress: string;
-  fromAddress: string;
-  toAddress: string;
-} {
-  const [fromAddress, toAddress, ...assetAddressParts] = key.split(':');
-  return {
-    fromAddress: fromAddress ?? '',
-    toAddress: toAddress ?? '',
-    assetAddress: assetAddressParts.join(':'),
-  };
+function isOwnLease(lease: PrimaryLease | null, instanceId: string): boolean {
+  return lease?.instanceId === instanceId;
 }
 
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function formatMetrics(metrics: Record<string, number | string> | undefined): string {
-  if (!metrics || Object.keys(metrics).length === 0) {
-    return '';
+function primaryLeaseClaimMessage(instanceId: string, reason: 'fresh' | 'stale'): string {
+  if (reason === 'stale') {
+    return `[onlydoge] indexer primary instance=${instanceId} replaced-stale-primary`;
   }
 
-  return ` ${Object.entries(metrics)
-    .map(([key, value]) => `${key}=${value}`)
-    .join(' ')}`;
+  return `[onlydoge] indexer primary instance=${instanceId}`;
 }
 
-function shouldBackoffWindow(error: unknown): boolean {
-  const message = formatError(error);
-  return [
-    'timed out',
-    'MEMORY_LIMIT_EXCEEDED',
-    'warehouse query exceeded memory limit',
-    'warehouse unavailable',
-    'ECONNRESET',
-    'ECONNREFUSED',
-    'socket hang up',
-  ].some((needle) => message.includes(needle));
+function isPrimaryLeaseRecord(value: unknown): value is PrimaryLease {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  return hasStringProperty(value, 'instanceId') && hasStringProperty(value, 'heartbeatAt');
 }
 
-function isTimeoutError(error: unknown): boolean {
-  return formatError(error).includes('timed out');
+function hasStringProperty(value: object, property: string): boolean {
+  return property in value && typeof Reflect.get(value, property) === 'string';
 }
 
-function isBootstrapPhase(value: string | null): value is BootstrapPhase {
-  return value === 'balances' || value === 'done' || value === 'utxos';
+function requireSnapshotBlock(snapshot: Record<string, unknown>): Record<string, unknown> {
+  const block = snapshot.block;
+  if (!block || typeof block !== 'object' || Array.isArray(block)) {
+    throw new Error('invalid snapshot block payload');
+  }
+
+  return block as Record<string, unknown>;
+}
+
+function requireSnapshotHash(block: Record<string, unknown>): string {
+  const hash = block.hash;
+  if (typeof hash !== 'string' || !hash.trim()) {
+    throw new Error('missing snapshot block hash');
+  }
+
+  return hash;
+}
+
+function normalizeSnapshotHash(hash: string, architecture: 'dogecoin' | 'evm'): string {
+  return architecture === 'evm' ? hash.trim().toLowerCase() : hash.trim();
 }
 
 class BootstrapRequiredError extends Error {}
@@ -2054,6 +2350,15 @@ function throwIfAborted(signal: AbortSignal): void {
 
   const reason = signal.reason;
   throw reason instanceof Error ? reason : new Error(String(reason ?? 'operation aborted'));
+}
+
+async function measureAsync<T>(work: () => Promise<T>): Promise<TimedValue<T>> {
+  const startedAt = Date.now();
+  const value = await work();
+  return {
+    durationMs: Date.now() - startedAt,
+    value,
+  };
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

@@ -13,7 +13,17 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { dogecoinFixture } from '../fixtures/dogecoin';
-import { createTestApp, installRpcMock } from '../helpers';
+import {
+  createDogecoinAddressBook,
+  createDogecoinTestNetwork,
+  createTestApp,
+  expectDogecoinBalances,
+  installRpcMock,
+  readObjectArray,
+  requireNumber,
+  requireObject,
+  requireString,
+} from '../helpers';
 
 describe('indexer integration', () => {
   let restoreFetch: ReturnType<typeof installRpcMock>;
@@ -29,43 +39,9 @@ describe('indexer integration', () => {
   it('derives dogecoin balances and source paths from raw snapshots', async () => {
     const ctx = await createTestApp('indexer');
 
-    const network = await ctx.runtime.networkCatalog.createNetwork({
-      name: 'Dogecoin Mainnet',
-      architecture: 'dogecoin',
-      chainId: 0,
-      blockTime: 60,
-      rpcEndpoint: 'https://doge.example/rpc',
-    });
+    const network = await createDogecoinTestNetwork(ctx.runtime);
 
-    const sourceEntity = await ctx.runtime.entityLabeling.createEntity({
-      name: 'Source Entity',
-      description: 'Known source',
-    });
-    const targetEntity = await ctx.runtime.entityLabeling.createEntity({
-      name: 'Target Entity',
-      description: 'Known target',
-    });
-
-    await ctx.runtime.entityLabeling.createAddresses({
-      entity: sourceEntity.entity.id,
-      network: network.id,
-      addresses: [
-        {
-          address: dogecoinFixture.sourceAddress,
-          description: 'Source wallet',
-        },
-      ],
-    });
-    await ctx.runtime.entityLabeling.createAddresses({
-      entity: targetEntity.entity.id,
-      network: network.id,
-      addresses: [
-        {
-          address: dogecoinFixture.targetAddress,
-          description: 'Target wallet',
-        },
-      ],
-    });
+    const { sourceEntity } = await createDogecoinAddressBook(ctx.runtime, network.id);
 
     await ctx.runtime.indexingPipeline.runOnce();
 
@@ -98,22 +74,7 @@ describe('indexer integration', () => {
     const warehouse = parseWarehouseState(
       await readFile(join(ctx.tempRoot, 'warehouse.json'), 'utf8'),
     );
-    expect(warehouse.balances).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          address: dogecoinFixture.sourceAddress,
-          balance: '5900000000',
-        }),
-        expect.objectContaining({
-          address: dogecoinFixture.intermediaryAddress,
-          balance: '1400000000',
-        }),
-        expect.objectContaining({
-          address: dogecoinFixture.targetAddress,
-          balance: '2500000000',
-        }),
-      ]),
-    );
+    expectDogecoinBalances(warehouse.balances);
     expect(warehouse.directLinks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -172,13 +133,7 @@ describe('indexer integration', () => {
   it('reclaims a stale primary lease and resumes syncing', async () => {
     const ctx = await createTestApp('indexer');
 
-    await ctx.runtime.networkCatalog.createNetwork({
-      name: 'Dogecoin Mainnet',
-      architecture: 'dogecoin',
-      chainId: 0,
-      blockTime: 60,
-      rpcEndpoint: 'https://doge.example/rpc',
-    });
+    await createDogecoinTestNetwork(ctx.runtime);
 
     await ctx.runtime.metadata.setJsonValue('primary', 'stale-instance-id');
 
@@ -197,13 +152,7 @@ describe('indexer integration', () => {
   it('replays an already-applied dogecoin block when the process tail lags', async () => {
     const ctx = await createTestApp('indexer');
 
-    await ctx.runtime.networkCatalog.createNetwork({
-      name: 'Dogecoin Mainnet',
-      architecture: 'dogecoin',
-      chainId: 0,
-      blockTime: 60,
-      rpcEndpoint: 'https://doge.example/rpc',
-    });
+    await createDogecoinTestNetwork(ctx.runtime);
 
     await ctx.runtime.indexingPipeline.runOnce();
     await ctx.runtime.indexingPipeline.runOnce();
@@ -221,18 +170,7 @@ describe('indexer integration', () => {
     const warehouse = parseWarehouseState(
       await readFile(join(ctx.tempRoot, 'warehouse.json'), 'utf8'),
     );
-    expect(warehouse.balances).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          address: dogecoinFixture.sourceAddress,
-          balance: '5900000000',
-        }),
-        expect.objectContaining({
-          address: dogecoinFixture.intermediaryAddress,
-          balance: '1400000000',
-        }),
-      ]),
-    );
+    expectDogecoinBalances(warehouse.balances, ['source', 'intermediary']);
 
     await ctx.cleanup();
   });
@@ -240,13 +178,7 @@ describe('indexer integration', () => {
   it('times out a hung projection phase instead of stalling the indexer loop', async () => {
     const ctx = await createTestApp('indexer');
 
-    await ctx.runtime.networkCatalog.createNetwork({
-      name: 'Dogecoin Mainnet',
-      architecture: 'dogecoin',
-      chainId: 0,
-      blockTime: 60,
-      rpcEndpoint: 'https://doge.example/rpc',
-    });
+    await createDogecoinTestNetwork(ctx.runtime);
 
     const pipeline = ctx.runtime.indexingPipeline as unknown as {
       settings: {
@@ -293,13 +225,7 @@ describe('indexer integration', () => {
   it('advances processed state even when fact persistence times out', async () => {
     const ctx = await createTestApp('indexer');
 
-    const network = await ctx.runtime.networkCatalog.createNetwork({
-      name: 'Dogecoin Mainnet',
-      architecture: 'dogecoin',
-      chainId: 0,
-      blockTime: 60,
-      rpcEndpoint: 'https://doge.example/rpc',
-    });
+    const network = await createDogecoinTestNetwork(ctx.runtime);
 
     const pipeline = ctx.runtime.indexingPipeline as unknown as {
       factWarehouse: {
@@ -316,10 +242,7 @@ describe('indexer integration', () => {
     );
     pipeline.factWarehouse.applyProjectionFacts = () => new Promise<void>(() => {});
 
-    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
-
-    const internalNetwork = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
-    expect(internalNetwork?.networkId).toBeDefined();
+    const internalNetwork = await runIndexerOnceAndGetDogecoinNetwork(ctx);
     await expect(
       ctx.runtime.metadata.getJsonValue<number>(
         `indexer_process_tail_n${internalNetwork?.networkId}`,
@@ -356,18 +279,9 @@ describe('indexer integration', () => {
   it('bootstraps the fact tail from existing warehouse state', async () => {
     const ctx = await createTestApp('indexer');
 
-    await ctx.runtime.networkCatalog.createNetwork({
-      name: 'Dogecoin Mainnet',
-      architecture: 'dogecoin',
-      chainId: 0,
-      blockTime: 60,
-      rpcEndpoint: 'https://doge.example/rpc',
-    });
+    await createDogecoinTestNetwork(ctx.runtime);
 
-    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
-
-    const internalNetwork = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
-    expect(internalNetwork?.networkId).toBeDefined();
+    const internalNetwork = await runIndexerOnceAndGetDogecoinNetwork(ctx);
 
     await ctx.runtime.metadata.deleteByPrefix(`indexer_fact_tail_n${internalNetwork?.networkId}`);
     await ctx.runtime.metadata.deleteByPrefix(
@@ -385,30 +299,7 @@ describe('indexer integration', () => {
   it('bootstraps metadata state before resuming strict project-state', async () => {
     const ctx = await createTestApp('indexer');
 
-    await ctx.runtime.networkCatalog.createNetwork({
-      name: 'Dogecoin Mainnet',
-      architecture: 'dogecoin',
-      chainId: 0,
-      blockTime: 60,
-      rpcEndpoint: 'https://doge.example/rpc',
-    });
-
-    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
-
-    const network = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
-    expect(network?.networkId).toBeDefined();
-    const networkId = network?.networkId ?? 0;
-
-    await ctx.runtime.metadata.clearProjectionBootstrapState(networkId);
-    await Promise.all([
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapTail(networkId)),
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapTargetTail(networkId)),
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapPhase(networkId)),
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapCursorUtxo(networkId)),
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapCursorBalance(networkId)),
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapStartedAt(networkId)),
-    ]);
-    await ctx.runtime.metadata.setJsonValue(configKeyIndexerProcessTail(networkId), 1);
+    const networkId = await prepareBootstrapRetryScenario(ctx);
 
     const pipeline = ctx.runtime.indexingPipeline as unknown as {
       factWarehouse: {
@@ -461,30 +352,7 @@ describe('indexer integration', () => {
   it('retries timed-out bootstrap exports and ignores late completions from stale attempts', async () => {
     const ctx = await createTestApp('indexer');
 
-    await ctx.runtime.networkCatalog.createNetwork({
-      name: 'Dogecoin Mainnet',
-      architecture: 'dogecoin',
-      chainId: 0,
-      blockTime: 60,
-      rpcEndpoint: 'https://doge.example/rpc',
-    });
-
-    await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
-
-    const network = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
-    expect(network?.networkId).toBeDefined();
-    const networkId = network?.networkId ?? 0;
-
-    await ctx.runtime.metadata.clearProjectionBootstrapState(networkId);
-    await Promise.all([
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapTail(networkId)),
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapTargetTail(networkId)),
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapPhase(networkId)),
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapCursorUtxo(networkId)),
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapCursorBalance(networkId)),
-      ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapStartedAt(networkId)),
-    ]);
-    await ctx.runtime.metadata.setJsonValue(configKeyIndexerProcessTail(networkId), 1);
+    const networkId = await prepareBootstrapRetryScenario(ctx);
 
     const pipeline = ctx.runtime.indexingPipeline as unknown as {
       factWarehouse: {
@@ -627,42 +495,40 @@ function parseWarehouseState(value: string): {
   };
 }
 
-function readObjectArray(
-  record: Record<string, unknown>,
-  field: string,
-): Array<Record<string, unknown>> {
-  const value = record[field];
-  if (!Array.isArray(value)) {
-    throw new TypeError(`expected array for ${field}`);
-  }
-
-  return value.map((item, index) => requireObject(item, `${field}[${index}]`));
+async function clearProjectionBootstrapKeys(
+  ctx: Awaited<ReturnType<typeof createTestApp>>,
+  networkId: number,
+): Promise<void> {
+  await Promise.all([
+    ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapTail(networkId)),
+    ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapTargetTail(networkId)),
+    ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapPhase(networkId)),
+    ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapCursorUtxo(networkId)),
+    ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapCursorBalance(networkId)),
+    ctx.runtime.metadata.deleteByPrefix(configKeyProjectionBootstrapStartedAt(networkId)),
+  ]);
 }
 
-function requireObject(value: unknown, field: string): Record<string, unknown> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new TypeError(`expected object for ${field}`);
+async function prepareBootstrapRetryScenario(
+  ctx: Awaited<ReturnType<typeof createTestApp>>,
+): Promise<number> {
+  await createDogecoinTestNetwork(ctx.runtime);
+  await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
+
+  const network = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
+  if (network === null) {
+    throw new TypeError('missing Dogecoin Mainnet network');
   }
 
-  return Object.fromEntries(Object.entries(value));
+  await ctx.runtime.metadata.clearProjectionBootstrapState(network.networkId);
+  await clearProjectionBootstrapKeys(ctx, network.networkId);
+  await ctx.runtime.metadata.setJsonValue(configKeyIndexerProcessTail(network.networkId), 1);
+  return network.networkId;
 }
 
-function requireString(record: Record<string, unknown>, field: string): string {
-  const key = field.split('.').at(-1) ?? field;
-  const value = record[key];
-  if (typeof value !== 'string') {
-    throw new TypeError(`expected string for ${field}`);
-  }
-
-  return value;
-}
-
-function requireNumber(record: Record<string, unknown>, field: string): number {
-  const key = field.split('.').at(-1) ?? field;
-  const value = record[key];
-  if (typeof value !== 'number') {
-    throw new TypeError(`expected number for ${field}`);
-  }
-
-  return value;
+async function runIndexerOnceAndGetDogecoinNetwork(ctx: Awaited<ReturnType<typeof createTestApp>>) {
+  await expect(ctx.runtime.indexingPipeline.runOnce()).resolves.toBe(true);
+  const network = await ctx.runtime.metadata.getNetworkByName('Dogecoin Mainnet');
+  expect(network?.networkId).toBeDefined();
+  return network;
 }

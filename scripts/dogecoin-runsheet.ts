@@ -27,6 +27,21 @@ interface StatsResponse {
   }>;
 }
 
+interface RunsheetInput {
+  apiToken?: string;
+  baseUrl: string;
+  blockTime: number;
+  chainId: number;
+  name: string;
+  rpcEndpoint: string;
+  rps: number;
+}
+
+interface RunsheetCredential {
+  apiToken: string;
+  createdKey: CreatedApiKey | null;
+}
+
 function normalizeBaseUrl(value: string): string {
   return value.endsWith('/') ? value : `${value}/`;
 }
@@ -43,13 +58,28 @@ function buildHeaders(apiToken?: string, includeJson = false): Record<string, st
 }
 
 async function readErrorMessage(response: Response): Promise<string> {
+  const jsonError = await readJsonError(response);
+  if (jsonError) {
+    return jsonError;
+  }
+
+  return readTextError(response);
+}
+
+async function readJsonError(response: Response): Promise<string | null> {
   try {
     const payload = (await response.json()) as { error?: string };
     if (typeof payload.error === 'string' && payload.error) {
       return payload.error;
     }
-  } catch {}
+  } catch {
+    return null;
+  }
 
+  return null;
+}
+
+async function readTextError(response: Response): Promise<string> {
   const text = await response.text().catch(() => '');
   return text || `${response.status} ${response.statusText}`;
 }
@@ -154,8 +184,38 @@ function printCurlRunsheet(input: {
 }
 
 async function main(): Promise<void> {
-  const program = new Command();
+  const input = readRunsheetInput();
+  await assertHealthy(input.baseUrl);
+  const credential = await resolveRunsheetCredential(input.baseUrl, input.apiToken);
+  const network = await createDogecoinNetwork(input.baseUrl, credential.apiToken, input);
+  const stats = await getStats(input.baseUrl, credential.apiToken);
+  printRunsheetResult(input, credential, network, stats);
+}
 
+function readRunsheetInput(): RunsheetInput {
+  const options = parseRunsheetOptions();
+
+  return {
+    apiToken: options.apiToken,
+    baseUrl: options.baseUrl,
+    blockTime: parsePositiveInteger(options.blockTime, '--block-time'),
+    chainId: parseNonNegativeInteger(options.chainId, '--chain-id'),
+    name: options.name,
+    rpcEndpoint: options.rpcEndpoint,
+    rps: parsePositiveInteger(options.rps, '--rps'),
+  };
+}
+
+function parseRunsheetOptions(): {
+  apiToken?: string;
+  baseUrl: string;
+  blockTime: string;
+  chainId: string;
+  name: string;
+  rpcEndpoint: string;
+  rps: string;
+} {
+  const program = new Command();
   program
     .name('dogecoin-runsheet')
     .description(
@@ -170,56 +230,49 @@ async function main(): Promise<void> {
     .option('--rps <number>', 'Per-network requests per second cap', '25');
 
   program.parse();
-  const options = program.opts<{
-    apiToken?: string;
-    baseUrl: string;
-    blockTime: string;
-    chainId: string;
-    name: string;
-    rpcEndpoint: string;
-    rps: string;
-  }>();
+  return program.opts();
+}
 
-  const chainId = Number.parseInt(options.chainId, 10);
-  const blockTime = Number.parseInt(options.blockTime, 10);
-  const rps = Number.parseInt(options.rps, 10);
-
-  if (!Number.isInteger(chainId) || chainId < 0) {
-    throw new Error(`invalid --chain-id: ${options.chainId}`);
-  }
-  if (!Number.isInteger(blockTime) || blockTime <= 0) {
-    throw new Error(`invalid --block-time: ${options.blockTime}`);
-  }
-  if (!Number.isInteger(rps) || rps <= 0) {
-    throw new Error(`invalid --rps: ${options.rps}`);
+function parseNonNegativeInteger(value: string, label: string): number {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`invalid ${label}: ${value}`);
   }
 
-  await assertHealthy(options.baseUrl);
+  return parsed;
+}
 
-  let apiToken = options.apiToken?.trim();
-  let createdKey: CreatedApiKey | null = null;
-  if (!apiToken) {
-    createdKey = await createBootstrapKey(options.baseUrl);
-    apiToken = createdKey.key;
+function parsePositiveInteger(value: string, label: string): number {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`invalid ${label}: ${value}`);
   }
 
-  const network = await createDogecoinNetwork(options.baseUrl, apiToken, {
-    name: options.name,
-    chainId,
-    blockTime,
-    rpcEndpoint: options.rpcEndpoint,
-    rps,
-  });
-  const stats = await getStats(options.baseUrl, apiToken);
+  return parsed;
+}
 
+async function resolveRunsheetCredential(
+  baseUrl: string,
+  requestedToken: string | undefined,
+): Promise<RunsheetCredential> {
+  const apiToken = requestedToken?.trim();
+  if (apiToken) {
+    return { apiToken, createdKey: null };
+  }
+
+  const createdKey = await createBootstrapKey(baseUrl);
+  return { apiToken: createdKey.key, createdKey };
+}
+
+function printRunsheetResult(
+  input: RunsheetInput,
+  credential: RunsheetCredential,
+  network: NetworkResponse,
+  stats: StatsResponse,
+): void {
   console.log('Dogecoin indexing runsheet completed.');
-  console.log(`Base URL: ${normalizeBaseUrl(options.baseUrl)}`);
-  if (createdKey) {
-    console.log(`Created API key: ${createdKey.id}`);
-    console.log(`x-api-token: ${createdKey.key}`);
-  } else {
-    console.log('Used existing API token from --api-token.');
-  }
+  console.log(`Base URL: ${normalizeBaseUrl(input.baseUrl)}`);
+  printCredentialSummary(credential);
   console.log(`Registered network: ${network.id} (${network.name})`);
   console.log(`Masked RPC endpoint: ${network.rpcEndpoint}`);
   console.log(
@@ -228,16 +281,17 @@ async function main(): Promise<void> {
   console.log('');
   console.log('Current stats:');
   console.log(JSON.stringify(stats, null, 2));
+  printCurlRunsheet({ ...input, apiToken: credential.apiToken });
+}
 
-  printCurlRunsheet({
-    apiToken,
-    baseUrl: options.baseUrl,
-    name: options.name,
-    chainId,
-    blockTime,
-    rpcEndpoint: options.rpcEndpoint,
-    rps,
-  });
+function printCredentialSummary(credential: RunsheetCredential): void {
+  if (!credential.createdKey) {
+    console.log('Used existing API token from --api-token.');
+    return;
+  }
+
+  console.log(`Created API key: ${credential.createdKey.id}`);
+  console.log(`x-api-token: ${credential.createdKey.key}`);
 }
 
 void main().catch((error) => {

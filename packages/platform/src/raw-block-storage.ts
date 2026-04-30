@@ -20,8 +20,7 @@ export class FileRawBlockStorageAdapter implements RawBlockStoragePort {
     const filePath = join(this.basePath, String(networkId), String(blockHeight), `${part}.json.gz`);
     try {
       const payload = await readFile(filePath);
-      const parsed: T = JSON.parse(gunzipSync(payload).toString('utf8'));
-      return parsed;
+      return decodeJsonGzip<T>(payload);
     } catch {
       return null;
     }
@@ -45,22 +44,10 @@ export class S3RawBlockStorageAdapter implements RawBlockStoragePort {
   private readonly prefix: string;
 
   public constructor(settings: StorageSettings) {
-    const url = new URL(settings.location);
-    this.bucket = url.pathname.replace(/^\/+/u, '').split('/')[0] ?? 'onlydoge';
-    this.prefix = url.pathname.replace(/^\/+/u, '').split('/').slice(1).join('/');
-    const credentials =
-      settings.accessKeyId && settings.secretAccessKey
-        ? {
-            accessKeyId: settings.accessKeyId,
-            secretAccessKey: settings.secretAccessKey,
-          }
-        : undefined;
-    this.client = new S3Client({
-      endpoint: `${url.protocol}//${url.host}`,
-      region: 'auto',
-      ...(credentials ? { credentials } : {}),
-      forcePathStyle: true,
-    });
+    const location = parseS3Location(settings.location);
+    this.bucket = location.bucket;
+    this.prefix = location.prefix;
+    this.client = createS3Client(settings, location.url);
   }
 
   public async getPart<T extends Record<string, unknown>>(
@@ -77,8 +64,7 @@ export class S3RawBlockStorageAdapter implements RawBlockStoragePort {
         }),
       );
       const body = await toBuffer(response.Body);
-      const parsed: T = JSON.parse(gunzipSync(body).toString('utf8'));
-      return parsed;
+      return decodeJsonGzip<T>(body);
     } catch {
       return null;
     }
@@ -113,29 +99,102 @@ async function toBuffer(body: unknown): Promise<Buffer> {
   if (!body) {
     return Buffer.alloc(0);
   }
-  if (body instanceof Uint8Array) {
+
+  const buffer = await knownBodyToBuffer(body);
+  if (buffer) {
+    return buffer;
+  }
+
+  throw new Error('Unsupported S3 response body');
+}
+
+async function knownBodyToBuffer(body: unknown): Promise<Buffer | null> {
+  const direct = bufferFromDirectBody(body);
+  if (direct) {
+    return direct;
+  }
+
+  if (hasTransformToByteArray(body)) {
+    return Buffer.from(await body.transformToByteArray());
+  }
+
+  if (isAsyncIterable(body)) {
+    return bufferFromAsyncIterable(body);
+  }
+
+  return null;
+}
+
+function parseS3Location(location: string): {
+  bucket: string;
+  prefix: string;
+  url: URL;
+} {
+  const url = new URL(location);
+  const pathParts = url.pathname.replace(/^\/+/u, '').split('/');
+  return {
+    bucket: pathParts[0] ?? 'onlydoge',
+    prefix: pathParts.slice(1).join('/'),
+    url,
+  };
+}
+
+function createS3Client(settings: StorageSettings, url: URL): S3Client {
+  const credentials = s3Credentials(settings);
+  return new S3Client({
+    endpoint: `${url.protocol}//${url.host}`,
+    region: 'auto',
+    ...(credentials ? { credentials } : {}),
+    forcePathStyle: true,
+  });
+}
+
+function s3Credentials(settings: StorageSettings):
+  | {
+      accessKeyId: string;
+      secretAccessKey: string;
+    }
+  | undefined {
+  if (!settings.accessKeyId || !settings.secretAccessKey) {
+    return undefined;
+  }
+
+  return {
+    accessKeyId: settings.accessKeyId,
+    secretAccessKey: settings.secretAccessKey,
+  };
+}
+
+function decodeJsonGzip<T extends Record<string, unknown>>(payload: Uint8Array): T {
+  return JSON.parse(gunzipSync(payload).toString('utf8'));
+}
+
+function bufferFromDirectBody(body: unknown): Buffer | null {
+  if (body instanceof Uint8Array || typeof body === 'string') {
     return Buffer.from(body);
   }
-  if (typeof body === 'string') {
-    return Buffer.from(body);
-  }
-  if (
+
+  return null;
+}
+
+function hasTransformToByteArray(
+  body: unknown,
+): body is { transformToByteArray(): Promise<Uint8Array> } {
+  return (
     typeof body === 'object' &&
     body !== null &&
     'transformToByteArray' in body &&
     typeof body.transformToByteArray === 'function'
-  ) {
-    return Buffer.from(await body.transformToByteArray());
-  }
-  if (isAsyncIterable(body)) {
-    const chunks: Buffer[] = [];
-    for await (const chunk of body) {
-      chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk));
-    }
-    return Buffer.concat(chunks);
+  );
+}
+
+async function bufferFromAsyncIterable(body: AsyncIterable<unknown>): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of body) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : Buffer.from(chunk as Uint8Array));
   }
 
-  throw new Error('Unsupported S3 response body');
+  return Buffer.concat(chunks);
 }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<Buffer | Uint8Array | string> {

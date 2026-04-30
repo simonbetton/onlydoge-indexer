@@ -17,6 +17,12 @@ interface BindSettings {
   port: number;
 }
 
+interface CliRuntimeContext {
+  abortController: AbortController;
+  bind: BindSettings;
+  options: CliOptions;
+}
+
 function waitForAbort(signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     signal.addEventListener(
@@ -57,9 +63,17 @@ function applyEnvironmentOverrides(options: CliOptions): void {
 
 function resolveBindSettings(options: CliOptions): BindSettings {
   return {
-    ip: options.ip ?? process.env.ONLYDOGE_IP ?? '127.0.0.1',
-    port: options.port ? Number(options.port) : Number(process.env.ONLYDOGE_PORT ?? 2277),
+    ip: resolveBindIp(options),
+    port: resolveBindPort(options),
   };
+}
+
+function resolveBindIp(options: CliOptions): string {
+  return options.ip ?? process.env.ONLYDOGE_IP ?? '127.0.0.1';
+}
+
+function resolveBindPort(options: CliOptions): number {
+  return options.port ? Number(options.port) : Number(process.env.ONLYDOGE_PORT ?? 2277);
 }
 
 function logRuntimeStartup(runtime: Awaited<ReturnType<typeof createRuntime>>): void {
@@ -70,6 +84,23 @@ function logRuntimeStartup(runtime: Awaited<ReturnType<typeof createRuntime>>): 
 
 function shouldStartDegradedHealthServer(_error: unknown): boolean {
   return process.env.NODE_ENV === 'production';
+}
+
+function createCliRuntimeContext(): CliRuntimeContext {
+  const program = createProgram();
+  program.parse();
+  const options = program.opts<CliOptions>();
+  applyEnvironmentOverrides(options);
+  const bind = resolveBindSettings(options);
+  const abortController = new AbortController();
+
+  for (const event of ['SIGINT', 'SIGTERM']) {
+    process.on(event, () => {
+      abortController.abort();
+    });
+  }
+
+  return { abortController, bind, options };
 }
 
 async function startDegradedHealthServer(
@@ -106,61 +137,69 @@ async function startDegradedHealthServer(
 }
 
 async function main(): Promise<void> {
-  const program = createProgram();
-  program.parse();
-  const options = program.opts<CliOptions>();
-  applyEnvironmentOverrides(options);
-  const bind = resolveBindSettings(options);
-  const abortController = new AbortController();
-
-  for (const event of ['SIGINT', 'SIGTERM']) {
-    process.on(event, () => {
-      abortController.abort();
-    });
-  }
-
+  const { abortController, bind, options } = createCliRuntimeContext();
   const runtime = await createRuntime({
     ...(options.mode ? { mode: options.mode } : {}),
     ...(bind.ip ? { ip: bind.ip } : {}),
     ...(Number.isFinite(bind.port) ? { port: bind.port } : {}),
   });
   logRuntimeStartup(runtime);
+  await runRuntime(runtime, abortController.signal);
+}
 
-  const server = runtime.settings.isHttp ? await startApiServer(runtime) : null;
-  if (runtime.settings.isHttp) {
-    console.log(
-      `[onlydoge] api listening on http://${runtime.settings.ip}:${runtime.settings.port}`,
-    );
-  }
+async function runRuntime(
+  runtime: Awaited<ReturnType<typeof createRuntime>>,
+  signal: AbortSignal,
+): Promise<void> {
+  const server = await startHttpRuntime(runtime);
 
   if (runtime.settings.isIndexer) {
-    console.log('[onlydoge] indexer loop started');
-    const indexerPromise = startIndexer(runtime, abortController.signal);
-    if (runtime.settings.isHttp) {
-      await waitForAbort(abortController.signal);
-      await server?.stop();
-    } else {
-      await indexerPromise;
-    }
-  } else if (runtime.settings.isHttp) {
-    await waitForAbort(abortController.signal);
-    await server?.stop();
+    await runIndexerRuntime(runtime, signal, server);
+    return;
   }
+
+  await stopHttpRuntimeOnAbort(server, signal);
+}
+
+async function startHttpRuntime(runtime: Awaited<ReturnType<typeof createRuntime>>) {
+  if (!runtime.settings.isHttp) {
+    return null;
+  }
+
+  const server = await startApiServer(runtime);
+  console.log(`[onlydoge] api listening on http://${runtime.settings.ip}:${runtime.settings.port}`);
+  return server;
+}
+
+async function runIndexerRuntime(
+  runtime: Awaited<ReturnType<typeof createRuntime>>,
+  signal: AbortSignal,
+  server: Awaited<ReturnType<typeof startApiServer>> | null,
+): Promise<void> {
+  console.log('[onlydoge] indexer loop started');
+  const indexerPromise = startIndexer(runtime, signal);
+  if (!runtime.settings.isHttp) {
+    await indexerPromise;
+    return;
+  }
+
+  await stopHttpRuntimeOnAbort(server, signal);
+}
+
+async function stopHttpRuntimeOnAbort(
+  server: Awaited<ReturnType<typeof startApiServer>> | null,
+  signal: AbortSignal,
+): Promise<void> {
+  if (!server) {
+    return;
+  }
+
+  await waitForAbort(signal);
+  await server.stop();
 }
 
 void main().catch((error) => {
-  const program = createProgram();
-  program.parse();
-  const options = program.opts<CliOptions>();
-  applyEnvironmentOverrides(options);
-  const bind = resolveBindSettings(options);
-  const abortController = new AbortController();
-
-  for (const event of ['SIGINT', 'SIGTERM']) {
-    process.on(event, () => {
-      abortController.abort();
-    });
-  }
+  const { abortController, bind } = createCliRuntimeContext();
 
   if (!shouldStartDegradedHealthServer(error)) {
     console.error(

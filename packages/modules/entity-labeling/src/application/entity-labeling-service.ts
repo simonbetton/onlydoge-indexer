@@ -21,11 +21,19 @@ import {
   type EntityRecord,
   Tag,
   type TagRecord,
+  updateEntityRecord,
+  updateTagRecord,
 } from '../domain/entity';
 
 function unique(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
+
+export type CreateAddressRequest = {
+  address: string;
+  data?: Record<string, unknown>;
+  description: string;
+};
 
 export class EntityLabelingService {
   public constructor(
@@ -48,16 +56,7 @@ export class EntityLabelingService {
       throw new ValidationError(`invalid parameter for \`id\`: ${input.id}`);
     }
 
-    if (input.name) {
-      const deleted = await this.entities.getEntityByName(input.name, true);
-      if (deleted?.isDeleted) {
-        throw new TooEarlyError(`too early: entity hasn't been deleted yet: ${input.name}`);
-      }
-      const duplicate = await this.entities.getEntityByName(input.name);
-      if (duplicate) {
-        throw new ConflictError(`duplicate found at \`name\`: ${input.name}`);
-      }
-    }
+    await this.assertEntityNameAvailable(input.name);
 
     const tagRecords = await this.resolveTags(input.tags ?? []);
     const created = await this.entities.createEntity(Entity.create(input).record);
@@ -83,18 +82,9 @@ export class EntityLabelingService {
       throw new NotFoundError();
     }
 
-    if (input.name) {
-      const deleted = await this.entities.getEntityByName(input.name, true);
-      if (deleted?.isDeleted) {
-        throw new TooEarlyError(`too early: entity hasn't been deleted yet: ${input.name}`);
-      }
-      const duplicate = await this.entities.getEntityByName(input.name);
-      if (duplicate && duplicate.id !== entity.id) {
-        throw new ConflictError(`duplicate found at \`name\`: ${input.name}`);
-      }
-    }
+    await this.assertEntityNameAvailable(input.name, entity.id);
 
-    const updated = Entity.rehydrate(entity).update(input);
+    const updated = updateEntityRecord(entity, input);
     await this.entities.updateEntityRecord(updated);
 
     if (input.tags) {
@@ -129,16 +119,9 @@ export class EntityLabelingService {
     );
 
     return {
+      ...this.serializeAddressContext(addressRecords, networkRecords),
       entities: entities.map((entity) => this.serializeEntity(entity, tagMap, addressRecords)),
       tags: tagRecords.map((tag) => this.serializeTag(tag)),
-      addresses: addressRecords
-        .filter((address) => !address.isDeleted)
-        .map((address) => this.serializeAddress(address)),
-      networks: networkRecords.map((network) => ({
-        id: network.id,
-        name: network.name,
-        chainId: network.chainId,
-      })),
     };
   }
 
@@ -160,89 +143,32 @@ export class EntityLabelingService {
     );
 
     return {
+      ...this.serializeAddressContext(addressRecords, networkRecords),
       entity: this.serializeEntity(entity, tagMap, addressRecords),
       tags: tagRecords.map((tag) => this.serializeTag(tag)),
-      addresses: addressRecords
-        .filter((address) => !address.isDeleted)
-        .map((address) => this.serializeAddress(address)),
-      networks: networkRecords.map((network) => ({
-        id: network.id,
-        name: network.name,
-        chainId: network.chainId,
-      })),
     };
   }
 
   public async createAddresses(input: {
-    addresses: Array<{
-      address: string;
-      data?: Record<string, unknown>;
-      description: string;
-    }>;
+    addresses: CreateAddressRequest[];
     entity: string;
     network: string;
   }) {
-    const entity = await this.entities.getEntityById(input.entity);
-    if (!entity || entity.isDeleted) {
-      throw new ValidationError(`invalid parameter for \`entity\`: ${input.entity}`);
-    }
-
-    const network = await this.networks.getActiveNetworkById(input.network);
-    if (!network) {
-      throw new ValidationError(`invalid parameter for \`network\`: ${input.network}`);
-    }
-
-    const uniqueAddresses = unique(input.addresses.map((address) => address.address));
-    if (uniqueAddresses.length !== input.addresses.length) {
-      throw new ValidationError('bad request: request contains duplicate addresses');
-    }
-
-    const softDeleted = await this.addresses.findAddressesByEntityNetworkAndAddresses(
+    const entity = await this.requireActiveEntity(input.entity);
+    const network = await this.requireActiveNetwork(input.network);
+    const uniqueAddresses = this.requireUniqueAddresses(input.addresses);
+    await this.assertAddressesNotPendingDeletion(
       entity.entityId,
       network.networkId,
       uniqueAddresses,
-      true,
     );
-    if (softDeleted.some((address) => address.isDeleted)) {
-      throw new TooEarlyError(
-        `too early: addresses haven't been deleted yet: ${softDeleted
-          .filter((address) => address.isDeleted)
-          .map((address) => address.address)
-          .join(', ')}`,
-      );
-    }
-
-    const duplicates = await this.addresses.findAddressesByEntityNetworkAndAddresses(
-      entity.entityId,
-      network.networkId,
-      uniqueAddresses,
-      false,
-    );
-    if (duplicates.length > 0) {
-      throw new ConflictError(
-        `duplicates found at \`addresses\`: ${duplicates.map((address) => address.address).join(', ')}`,
-      );
-    }
+    await this.assertAddressesAvailable(entity.entityId, network.networkId, uniqueAddresses);
 
     const created = await this.addresses.createAddresses(
-      input.addresses.map(
-        (address) =>
-          Address.create({
-            address: address.address,
-            ...(address.data ? { data: address.data } : {}),
-            description: address.description,
-            entityId: entity.entityId,
-            network: network.id,
-            networkId: network.networkId,
-          }).record,
-      ),
+      input.addresses.map((address) => createAddressRecord(address, entity, network)),
     );
 
-    await Promise.all(
-      created.map((address) =>
-        this.configs.markNewlyAddedAddress(address.networkId, address.addressId),
-      ),
-    );
+    await this.markNewlyAddedAddresses(created);
 
     return created.map((address) => this.serializeAddress(address));
   }
@@ -257,11 +183,7 @@ export class EntityLabelingService {
 
     return {
       addresses: addresses.map((address) => this.serializeAddress(address)),
-      networks: networks.map((network) => ({
-        id: network.id,
-        name: network.name,
-        chainId: network.chainId,
-      })),
+      networks: networks.map(toNetworkSummary),
     };
   }
 
@@ -274,15 +196,7 @@ export class EntityLabelingService {
     const network = await this.networks.getActiveNetworkById(address.network);
     return {
       address: this.serializeAddress(address),
-      networks: network
-        ? [
-            {
-              id: network.id,
-              name: network.name,
-              chainId: network.chainId,
-            },
-          ]
-        : [],
+      networks: network ? [toNetworkSummary(network)] : [],
     };
   }
 
@@ -315,26 +229,14 @@ export class EntityLabelingService {
       throw new NotFoundError();
     }
 
-    if (input.name) {
-      const duplicate = await this.tags.getTagByName(input.name);
-      if (duplicate && duplicate.id !== tag.id) {
-        throw new ConflictError(`duplicate found at \`name\`: ${input.name}`);
-      }
-    }
+    await this.assertTagNameAvailable(input.name, tag.id);
 
-    await this.tags.updateTagRecord(Tag.rehydrate(tag).update(input));
+    await this.tags.updateTagRecord(updateTagRecord(tag, input));
   }
 
   public async listTags(offset?: number, limit?: number) {
     const tags = await this.tags.listTags(offset, limit);
-    const joinedEntities = await this.entities.listEntitiesByTagIds(tags.map((tag) => tag.tagId));
-    const entities = joinedEntities.map((joined) => joined.entity);
-    const addresses = await this.addresses.listAddressesByEntityIds(
-      entities.map((entity) => entity.entityId),
-    );
-    const networks = await this.networks.getActiveNetworksByInternalIds(
-      addresses.map((address) => address.networkId),
-    );
+    const { addresses, entities, joinedEntities, networks } = await this.loadTagRelations(tags);
 
     const entitiesByTag = new Map<PrimaryId, string[]>();
     for (const joined of joinedEntities) {
@@ -345,19 +247,9 @@ export class EntityLabelingService {
 
     return {
       tags: tags.map((tag) => this.serializeTag(tag, entitiesByTag.get(tag.tagId) ?? [])),
-      entities: entities.map((entity) =>
-        this.serializeEntity(
-          entity,
-          new Map(),
-          addresses.filter((address) => address.entityId === entity.entityId),
-        ),
-      ),
+      entities: this.serializeRelatedEntities(entities, addresses),
       addresses: addresses.map((address) => this.serializeAddress(address)),
-      networks: networks.map((network) => ({
-        id: network.id,
-        name: network.name,
-        chainId: network.chainId,
-      })),
+      networks: networks.map(toNetworkSummary),
     };
   }
 
@@ -367,33 +259,16 @@ export class EntityLabelingService {
       throw new NotFoundError();
     }
 
-    const joinedEntities = await this.entities.listEntitiesByTagIds([tag.tagId]);
-    const entities = joinedEntities.map((joined) => joined.entity);
-    const addresses = await this.addresses.listAddressesByEntityIds(
-      entities.map((entity) => entity.entityId),
-    );
-    const networks = await this.networks.getActiveNetworksByInternalIds(
-      addresses.map((address) => address.networkId),
-    );
+    const { addresses, entities, networks } = await this.loadTagRelations([tag]);
 
     return {
       tag: this.serializeTag(
         tag,
         entities.map((entity) => entity.id),
       ),
-      entities: entities.map((entity) =>
-        this.serializeEntity(
-          entity,
-          new Map(),
-          addresses.filter((address) => address.entityId === entity.entityId),
-        ),
-      ),
+      entities: this.serializeRelatedEntities(entities, addresses),
       addresses: addresses.map((address) => this.serializeAddress(address)),
-      networks: networks.map((network) => ({
-        id: network.id,
-        name: network.name,
-        chainId: network.chainId,
-      })),
+      networks: networks.map(toNetworkSummary),
     };
   }
 
@@ -418,6 +293,158 @@ export class EntityLabelingService {
     const tagMap = await this.entityTags.listEntityTagMap(entityIds);
     const tagIds = [...new Set([...tagMap.values()].flat())];
     return this.tags.listTagsByIds(tagIds);
+  }
+
+  private async assertEntityNameAvailable(
+    name: string | null | undefined,
+    currentEntityId?: string,
+  ): Promise<void> {
+    if (!name) {
+      return;
+    }
+
+    await this.assertDeletedEntityNameNotPending(name);
+    await this.assertDuplicateEntityNameAvailable(name, currentEntityId);
+  }
+
+  private async requireActiveEntity(id: string): Promise<EntityRecord> {
+    const entity = await this.entities.getEntityById(id);
+    if (!entity || entity.isDeleted) {
+      throw new ValidationError(`invalid parameter for \`entity\`: ${id}`);
+    }
+
+    return entity;
+  }
+
+  private async requireActiveNetwork(id: string) {
+    const network = await this.networks.getActiveNetworkById(id);
+    if (!network) {
+      throw new ValidationError(`invalid parameter for \`network\`: ${id}`);
+    }
+
+    return network;
+  }
+
+  private requireUniqueAddresses(addresses: CreateAddressRequest[]): string[] {
+    const uniqueAddresses = unique(addresses.map((address) => address.address));
+    if (uniqueAddresses.length !== addresses.length) {
+      throw new ValidationError('bad request: request contains duplicate addresses');
+    }
+
+    return uniqueAddresses;
+  }
+
+  private async assertAddressesNotPendingDeletion(
+    entityId: PrimaryId,
+    networkId: PrimaryId,
+    addresses: string[],
+  ): Promise<void> {
+    const softDeleted = await this.addresses.findAddressesByEntityNetworkAndAddresses(
+      entityId,
+      networkId,
+      addresses,
+      true,
+    );
+    const pending = softDeleted.filter((address) => address.isDeleted);
+    if (pending.length > 0) {
+      throw new TooEarlyError(
+        `too early: addresses haven't been deleted yet: ${pending
+          .map((address) => address.address)
+          .join(', ')}`,
+      );
+    }
+  }
+
+  private async assertAddressesAvailable(
+    entityId: PrimaryId,
+    networkId: PrimaryId,
+    addresses: string[],
+  ): Promise<void> {
+    const duplicates = await this.addresses.findAddressesByEntityNetworkAndAddresses(
+      entityId,
+      networkId,
+      addresses,
+      false,
+    );
+    if (duplicates.length > 0) {
+      throw new ConflictError(
+        `duplicates found at \`addresses\`: ${duplicates.map((address) => address.address).join(', ')}`,
+      );
+    }
+  }
+
+  private async markNewlyAddedAddresses(addresses: AddressRecord[]): Promise<void> {
+    await Promise.all(
+      addresses.map((address) =>
+        this.configs.markNewlyAddedAddress(address.networkId, address.addressId),
+      ),
+    );
+  }
+
+  private async assertTagNameAvailable(
+    name: string | undefined,
+    currentTagId: string,
+  ): Promise<void> {
+    if (!name) {
+      return;
+    }
+
+    const duplicate = await this.tags.getTagByName(name);
+    if (duplicate && duplicate.id !== currentTagId) {
+      throw new ConflictError(`duplicate found at \`name\`: ${name}`);
+    }
+  }
+
+  private async assertDeletedEntityNameNotPending(name: string): Promise<void> {
+    const deleted = await this.entities.getEntityByName(name, true);
+    if (deleted?.isDeleted) {
+      throw new TooEarlyError(`too early: entity hasn't been deleted yet: ${name}`);
+    }
+  }
+
+  private async assertDuplicateEntityNameAvailable(
+    name: string,
+    currentEntityId?: string,
+  ): Promise<void> {
+    const duplicate = await this.entities.getEntityByName(name);
+    if (duplicate && duplicate.id !== currentEntityId) {
+      throw new ConflictError(`duplicate found at \`name\`: ${name}`);
+    }
+  }
+
+  private async loadTagRelations(tags: TagRecord[]) {
+    const joinedEntities = await this.entities.listEntitiesByTagIds(tags.map((tag) => tag.tagId));
+    const entities = joinedEntities.map((joined) => joined.entity);
+    const addresses = await this.addresses.listAddressesByEntityIds(
+      entities.map((entity) => entity.entityId),
+    );
+    const networks = await this.networks.getActiveNetworksByInternalIds(
+      addresses.map((address) => address.networkId),
+    );
+
+    return { addresses, entities, joinedEntities, networks };
+  }
+
+  private serializeAddressContext(
+    addresses: AddressRecord[],
+    networks: Array<{ chainId: number; id: string; name: string }>,
+  ) {
+    return {
+      addresses: addresses
+        .filter((address) => !address.isDeleted)
+        .map((address) => this.serializeAddress(address)),
+      networks: networks.map(toNetworkSummary),
+    };
+  }
+
+  private serializeRelatedEntities(entities: EntityRecord[], addresses: AddressRecord[]) {
+    return entities.map((entity) =>
+      this.serializeEntity(
+        entity,
+        new Map(),
+        addresses.filter((address) => address.entityId === entity.entityId),
+      ),
+    );
   }
 
   private serializeEntity(
@@ -458,6 +485,29 @@ export class EntityLabelingService {
       entities,
     };
   }
+}
+
+function toNetworkSummary(network: { chainId: number; id: string; name: string }) {
+  return {
+    id: network.id,
+    name: network.name,
+    chainId: network.chainId,
+  };
+}
+
+function createAddressRecord(
+  address: CreateAddressRequest,
+  entity: EntityRecord,
+  network: NonNullable<Awaited<ReturnType<NetworkReader['getActiveNetworkById']>>>,
+): AddressRecord {
+  return Address.create({
+    address: address.address,
+    ...(address.data ? { data: address.data } : {}),
+    description: address.description,
+    entityId: entity.entityId,
+    network: network.id,
+    networkId: network.networkId,
+  }).record;
 }
 
 function buildEntityTagMap(

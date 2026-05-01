@@ -367,6 +367,7 @@ export class CoreDogecoinIndexerService {
     state: CoreIndexerState,
   ): Promise<void> {
     await Promise.all([
+      this.configs.setJsonValue(configKeyPrimary(), createLease(this.instanceId)),
       this.configs.setJsonValue(configKeyIndexerStage(networkId), state.stage),
       this.configs.setJsonValue(configKeyIndexerSyncTail(networkId), state.syncTail),
       this.configs.setJsonValue(configKeyIndexerProcessTail(networkId), state.processTail),

@@ -15,6 +15,7 @@
     "dev:http": "bun run apps/onlydoge/src/index.ts --mode=http",
     "dev:indexer": "bun run apps/onlydoge/src/index.ts --mode=indexer",
     "runsheet:dogecoin": "bun run scripts/dogecoin-runsheet.ts",
+    "health:indexer": "bun run scripts/indexer-health.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "biome check .",
@@ -30,6 +31,7 @@
     "docker:prod:logs": "docker compose --env-file .env.production -f docker-compose.prod.yml logs -f",
     "image:builder:init": "sh ./scripts/push-image.sh --init-only",
     "image:push": "sh ./scripts/push-image.sh",
+    "deploy:docker": "bun run scripts/deploy-docker.ts",
     "deploy:once": "bun run scripts/deploy-once.ts"
   },
   "dependencies": {

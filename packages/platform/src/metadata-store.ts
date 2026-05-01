@@ -19,6 +19,7 @@ import {
   buildProjectionStateChanges,
   type CoordinatorConfigPort,
   type CoreBlockRecord,
+  type CoreDogecoinApplyContext,
   type CoreDogecoinApplyResult,
   type CoreDogecoinBlockApplication,
   type CoreDogecoinStateStorePort,
@@ -1788,84 +1789,93 @@ export class RelationalMetadataStore
 
   public async applyCoreDogecoinBlock(
     input: CoreDogecoinBlockApplication,
+    context?: CoreDogecoinApplyContext,
   ): Promise<CoreDogecoinApplyResult> {
-    return this.withTransaction(async (executor) => {
-      const existing = await this.oneWithExecutor<DatabaseRow>(
-        executor,
-        'SELECT block_hash FROM core_processed_blocks WHERE network_id = ? AND block_height = ? LIMIT 1',
-        [input.networkId, input.blockHeight],
-      );
-      if (existing) {
-        const existingHash = String(existing.block_hash);
-        if (existingHash !== input.blockHash) {
-          throw new Error(
-            `core block hash mismatch network=${input.networkId} height=${input.blockHeight} existing=${existingHash} next=${input.blockHash}`,
+    return this.withTransaction(
+      async (executor) => {
+        await this.acquireCoreNetworkLock(executor, input.networkId);
+        try {
+          const existing = await this.oneWithExecutor<DatabaseRow>(
+            executor,
+            'SELECT block_hash FROM core_processed_blocks WHERE network_id = ? AND block_height = ? LIMIT 1',
+            [input.networkId, input.blockHeight],
           );
-        }
-        return { applied: false, processTail: input.blockHeight };
-      }
-
-      await this.upsertCoreBlockWithExecutor(input, executor);
-      const currentOutputs = await this.getCoreUtxoOutputsWithExecutor(
-        executor,
-        input.networkId,
-        input.utxoSpends.map((spend) => spend.outputKey),
-      );
-      const nextOutputs = new Map<string, ProjectionUtxoOutput>();
-      const affectedAddresses = new Set<string>();
-
-      for (const output of input.utxoCreates) {
-        nextOutputs.set(output.outputKey, { ...output });
-        if (output.isSpendable && output.address) {
-          affectedAddresses.add(output.address);
-        }
-      }
-
-      for (const spend of input.utxoSpends) {
-        const current = nextOutputs.get(spend.outputKey) ?? currentOutputs.get(spend.outputKey);
-        if (!current) {
-          throw new Error(`missing core utxo output: ${spend.outputKey}`);
-        }
-        if (current.spentByTxid) {
-          const sameSpend =
-            current.spentByTxid === spend.spentByTxid &&
-            current.spentInBlock === spend.spentInBlock &&
-            current.spentInputIndex === spend.spentInputIndex;
-          if (!sameSpend) {
-            throw new Error(
-              `core utxo output already spent: ${spend.outputKey} by ${current.spentByTxid}`,
-            );
+          if (existing) {
+            const existingHash = String(existing.block_hash);
+            if (existingHash !== input.blockHash) {
+              throw new Error(
+                `core block hash mismatch network=${input.networkId} height=${input.blockHeight} existing=${existingHash} next=${input.blockHash}`,
+              );
+            }
+            return { applied: false, processTail: input.blockHeight };
           }
-        }
-        nextOutputs.set(spend.outputKey, {
-          ...current,
-          spentByTxid: spend.spentByTxid,
-          spentInBlock: spend.spentInBlock,
-          spentInputIndex: spend.spentInputIndex,
-        });
-        if (current.isSpendable && current.address) {
-          affectedAddresses.add(current.address);
-        }
-      }
 
-      const timestamp = nowIsoString();
-      await this.upsertCoreUtxoOutputs([...nextOutputs.values()], timestamp, executor);
-      await this.recomputeCoreBalances(
-        input.networkId,
-        [...affectedAddresses],
-        input.blockHeight,
-        timestamp,
-        executor,
-      );
-      await this.insertCoreBlockUndo(input, timestamp, executor);
-      await this.insertCoreProcessedBlock(input, timestamp, executor);
-      await this.executeWithExecutor(
-        executor,
-        'UPDATE core_blocks SET processed_at = ?, updated_at = ? WHERE network_id = ? AND block_height = ?',
-        [timestamp, timestamp, input.networkId, input.blockHeight],
-      );
-      return { applied: true, processTail: input.blockHeight };
-    });
+          await this.upsertCoreBlockWithExecutor(input, executor);
+          const currentOutputs = await this.getCoreUtxoOutputsWithExecutor(
+            executor,
+            input.networkId,
+            input.utxoSpends.map((spend) => spend.outputKey),
+          );
+          const nextOutputs = new Map<string, ProjectionUtxoOutput>();
+          const affectedAddresses = new Set<string>();
+
+          for (const output of input.utxoCreates) {
+            nextOutputs.set(output.outputKey, { ...output });
+            if (output.isSpendable && output.address) {
+              affectedAddresses.add(output.address);
+            }
+          }
+
+          for (const spend of input.utxoSpends) {
+            const current = nextOutputs.get(spend.outputKey) ?? currentOutputs.get(spend.outputKey);
+            if (!current) {
+              throw new Error(`missing core utxo output: ${spend.outputKey}`);
+            }
+            if (current.spentByTxid) {
+              const sameSpend =
+                current.spentByTxid === spend.spentByTxid &&
+                current.spentInBlock === spend.spentInBlock &&
+                current.spentInputIndex === spend.spentInputIndex;
+              if (!sameSpend) {
+                throw new Error(
+                  `core utxo output already spent: ${spend.outputKey} by ${current.spentByTxid}`,
+                );
+              }
+            }
+            nextOutputs.set(spend.outputKey, {
+              ...current,
+              spentByTxid: spend.spentByTxid,
+              spentInBlock: spend.spentInBlock,
+              spentInputIndex: spend.spentInputIndex,
+            });
+            if (current.isSpendable && current.address) {
+              affectedAddresses.add(current.address);
+            }
+          }
+
+          const timestamp = nowIsoString();
+          await this.upsertCoreUtxoOutputs([...nextOutputs.values()], timestamp, executor);
+          await this.recomputeCoreBalances(
+            input.networkId,
+            [...affectedAddresses],
+            input.blockHeight,
+            timestamp,
+            executor,
+          );
+          await this.insertCoreBlockUndo(input, timestamp, executor);
+          await this.insertCoreProcessedBlock(input, timestamp, executor);
+          await this.executeWithExecutor(
+            executor,
+            'UPDATE core_blocks SET processed_at = ?, updated_at = ? WHERE network_id = ? AND block_height = ?',
+            [timestamp, timestamp, input.networkId, input.blockHeight],
+          );
+          return { applied: true, processTail: input.blockHeight };
+        } finally {
+          await this.releaseCoreNetworkLock(executor, input.networkId);
+        }
+      },
+      context?.statementTimeoutMs ? { statementTimeoutMs: context.statementTimeoutMs } : {},
+    );
   }
 
   private mapProjectionUtxoOutput(row: DatabaseRow): ProjectionUtxoOutput {
@@ -2449,15 +2459,37 @@ export class RelationalMetadataStore
     timestamp: string,
     executor: SupportedExecutor,
   ): Promise<void> {
-    await this.executeWithExecutor(
+    if (executor.kind === 'mysql') {
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT IGNORE INTO core_processed_blocks (
+            network_id, block_height, block_hash, processed_at, created_at
+          )
+          VALUES (?, ?, ?, ?, ?)
+        `,
+        [input.networkId, input.blockHeight, input.blockHash, timestamp, timestamp],
+      );
+    } else {
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO core_processed_blocks (
+            network_id, block_height, block_hash, processed_at, created_at
+          )
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT (network_id, block_height) DO NOTHING
+        `,
+        [input.networkId, input.blockHeight, input.blockHash, timestamp, timestamp],
+      );
+    }
+
+    await this.assertCoreIdentityHash(
       executor,
-      `
-        INSERT INTO core_processed_blocks (
-          network_id, block_height, block_hash, processed_at, created_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-      `,
-      [input.networkId, input.blockHeight, input.blockHash, timestamp, timestamp],
+      'core_processed_blocks',
+      input.networkId,
+      input.blockHeight,
+      input.blockHash,
     );
   }
 
@@ -2475,16 +2507,94 @@ export class RelationalMetadataStore
         spentInputIndex: spend.spentInputIndex,
       })),
     });
-    await this.executeWithExecutor(
+
+    if (executor.kind === 'mysql') {
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT IGNORE INTO core_block_undo (
+            network_id, block_height, block_hash, undo_json, created_at
+          )
+          VALUES (?, ?, ?, ?, ?)
+        `,
+        [input.networkId, input.blockHeight, input.blockHash, payload, timestamp],
+      );
+    } else {
+      await this.executeWithExecutor(
+        executor,
+        `
+          INSERT INTO core_block_undo (
+            network_id, block_height, block_hash, undo_json, created_at
+          )
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT (network_id, block_height) DO NOTHING
+        `,
+        [input.networkId, input.blockHeight, input.blockHash, payload, timestamp],
+      );
+    }
+
+    await this.assertCoreIdentityHash(
       executor,
-      `
-        INSERT INTO core_block_undo (
-          network_id, block_height, block_hash, undo_json, created_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-      `,
-      [input.networkId, input.blockHeight, input.blockHash, payload, timestamp],
+      'core_block_undo',
+      input.networkId,
+      input.blockHeight,
+      input.blockHash,
     );
+  }
+
+  private async assertCoreIdentityHash(
+    executor: SupportedExecutor,
+    table: 'core_block_undo' | 'core_processed_blocks',
+    networkId: PrimaryId,
+    blockHeight: number,
+    blockHash: string,
+  ): Promise<void> {
+    const row = await this.oneWithExecutor<DatabaseRow>(
+      executor,
+      `SELECT block_hash FROM ${table} WHERE network_id = ? AND block_height = ? LIMIT 1`,
+      [networkId, blockHeight],
+    );
+
+    const storedHash = row ? String(row.block_hash) : null;
+    if (storedHash !== blockHash) {
+      throw new Error(
+        `core block hash mismatch table=${table} network=${networkId} height=${blockHeight} existing=${storedHash ?? 'missing'} next=${blockHash}`,
+      );
+    }
+  }
+
+  private async acquireCoreNetworkLock(
+    executor: SupportedExecutor,
+    networkId: PrimaryId,
+  ): Promise<void> {
+    if (executor.kind === 'postgres') {
+      await this.executeWithExecutor(executor, 'SELECT pg_advisory_xact_lock(1868853095, ?)', [
+        networkId,
+      ]);
+      return;
+    }
+
+    if (executor.kind === 'mysql') {
+      const [row] = await this.queryWithExecutor<DatabaseRow>(
+        executor,
+        'SELECT GET_LOCK(?, 30) AS locked',
+        [`onlydoge-core-network-${networkId}`],
+      );
+      if (Number(row?.locked ?? 0) !== 1) {
+        throw new Error(`timed out acquiring core network lock network=${networkId}`);
+      }
+    }
+  }
+
+  private async releaseCoreNetworkLock(
+    executor: SupportedExecutor,
+    networkId: PrimaryId,
+  ): Promise<void> {
+    if (executor.kind === 'mysql') {
+      await this.executeWithExecutor(executor, 'SELECT RELEASE_LOCK(?)', [
+        `onlydoge-core-network-${networkId}`,
+      ]);
+    }
   }
 
   private async getCoreUtxoOutputsWithExecutor(
@@ -2671,13 +2781,16 @@ export class RelationalMetadataStore
     await this.executeWithExecutor(this.client, statement, params);
   }
 
-  private async withTransaction<T>(work: (executor: SupportedExecutor) => Promise<T>): Promise<T> {
+  private async withTransaction<T>(
+    work: (executor: SupportedExecutor) => Promise<T>,
+    options: { statementTimeoutMs?: number } = {},
+  ): Promise<T> {
     if (this.client.kind === 'sqlite') {
       return this.withSqliteTransaction(work);
     }
 
     if (this.client.kind === 'postgres') {
-      return this.withPostgresTransaction(this.client, work);
+      return this.withPostgresTransaction(this.client, work, options);
     }
 
     return this.withMysqlTransaction(this.client, work);
@@ -2700,11 +2813,18 @@ export class RelationalMetadataStore
   private async withPostgresTransaction<T>(
     clientPool: Extract<SupportedClient, { kind: 'postgres' }>,
     work: (executor: SupportedExecutor) => Promise<T>,
+    options: { statementTimeoutMs?: number } = {},
   ): Promise<T> {
     const client = await clientPool.raw.connect();
     const executor: SupportedExecutor = { kind: 'postgres', raw: client };
     try {
       await this.executeWithExecutor(executor, 'BEGIN');
+      if (options.statementTimeoutMs) {
+        await this.executeWithExecutor(
+          executor,
+          `SET LOCAL statement_timeout = ${Math.trunc(options.statementTimeoutMs)}`,
+        );
+      }
       const result = await work(executor);
       await this.executeWithExecutor(executor, 'COMMIT');
       return result;

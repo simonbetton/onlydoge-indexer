@@ -35,8 +35,11 @@ export interface WarehouseSettings {
 
 export interface IndexerSettings {
   bootstrapTimeoutMs: number;
+  coreBlockTimeoutMs: number;
+  coreDbStatementTimeoutMs: number;
   coreOnlineTipDistance: number;
   coreProcessWindow: number;
+  coreProgressWatchdogMs: number;
   coreRawStorageTimeoutMs: number;
   coreSyncCompleteDistance: number;
   dogecoinTransferMaxEdges: number;
@@ -368,8 +371,14 @@ function applyClickHouseCredentials(settings: WarehouseSettings, env: NodeJS.Pro
 function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
   return {
     bootstrapTimeoutMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS, 60_000),
+    coreBlockTimeoutMs: parsePositiveInteger(env.ONLYDOGE_CORE_BLOCK_TIMEOUT_MS, 120_000),
+    coreDbStatementTimeoutMs: parsePositiveInteger(
+      env.ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS,
+      30_000,
+    ),
     coreOnlineTipDistance: parsePositiveInteger(env.ONLYDOGE_CORE_ONLINE_TIP_DISTANCE, 6),
     coreProcessWindow: parsePositiveInteger(env.ONLYDOGE_CORE_PROCESS_WINDOW, 128),
+    coreProgressWatchdogMs: parsePositiveInteger(env.ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS, 180_000),
     coreRawStorageTimeoutMs: parsePositiveInteger(env.ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS, 30_000),
     coreSyncCompleteDistance: parsePositiveInteger(env.ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE, 6),
     dogecoinTransferMaxInputAddresses: parsePositiveInteger(

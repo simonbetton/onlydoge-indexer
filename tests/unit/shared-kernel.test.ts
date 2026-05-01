@@ -31,8 +31,11 @@ describe('shared kernel', () => {
     expect(settings.database.driver).toBe('sqlite');
     expect(settings.indexer).toMatchObject({
       bootstrapTimeoutMs: 60000,
+      coreBlockTimeoutMs: 120000,
+      coreDbStatementTimeoutMs: 30000,
       coreOnlineTipDistance: 6,
       coreProcessWindow: 128,
+      coreProgressWatchdogMs: 180000,
       coreRawStorageTimeoutMs: 30000,
       coreSyncCompleteDistance: 6,
       dogecoinTransferMaxEdges: 1024,
@@ -64,8 +67,11 @@ describe('shared kernel', () => {
         ONLYDOGE_WAREHOUSE: '/tmp/warehouse.json',
         ONLYDOGE_INDEXER_LEASE_HEARTBEAT_INTERVAL_MS: '2500',
         ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS: '35000',
+        ONLYDOGE_CORE_BLOCK_TIMEOUT_MS: '55000',
+        ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS: '7000',
         ONLYDOGE_CORE_ONLINE_TIP_DISTANCE: '3',
         ONLYDOGE_CORE_PROCESS_WINDOW: '24',
+        ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS: '65000',
         ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS: '15000',
         ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE: '2',
         ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES: '12',
@@ -89,8 +95,11 @@ describe('shared kernel', () => {
 
     expect(settings.indexer).toMatchObject({
       bootstrapTimeoutMs: 35000,
+      coreBlockTimeoutMs: 55000,
+      coreDbStatementTimeoutMs: 7000,
       coreOnlineTipDistance: 3,
       coreProcessWindow: 24,
+      coreProgressWatchdogMs: 65000,
       coreRawStorageTimeoutMs: 15000,
       coreSyncCompleteDistance: 2,
       dogecoinTransferMaxInputAddresses: 12,

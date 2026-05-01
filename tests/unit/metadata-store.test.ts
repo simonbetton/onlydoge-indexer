@@ -338,4 +338,125 @@ describe('relational metadata store', () => {
 
     await ctx.cleanup();
   });
+
+  it('applies core dogecoin block when undo already exists from a partial replay', async () => {
+    const ctx = await createTestApp('indexer');
+    const store = ctx.runtime.metadata as unknown as CoreDogecoinStateStorePort;
+    const metadata = ctx.runtime.metadata as unknown as {
+      execute(statement: string, params?: unknown[]): Promise<void>;
+    };
+
+    const coinbase = {
+      networkId: 7,
+      blockHeight: 0,
+      blockHash: 'block-0',
+      previousBlockHash: null,
+      blockTime: 1_700_000_000,
+      txCount: 1,
+      rawStorageKey: 'block',
+      utxoSpends: [],
+      utxoCreates: [
+        {
+          networkId: 7,
+          blockHeight: 0,
+          blockHash: 'block-0',
+          blockTime: 1_700_000_000,
+          txid: 'tx-0',
+          txIndex: 0,
+          vout: 0,
+          outputKey: 'tx-0:0',
+          address: 'DSource',
+          scriptType: 'pubkeyhash',
+          valueBase: '10000000000',
+          isCoinbase: true,
+          isSpendable: true,
+          spentByTxid: null,
+          spentInBlock: null,
+          spentInputIndex: null,
+        },
+      ],
+    };
+    const spend = {
+      networkId: 7,
+      blockHeight: 1,
+      blockHash: 'block-1',
+      previousBlockHash: 'block-0',
+      blockTime: 1_700_000_060,
+      txCount: 1,
+      rawStorageKey: 'block',
+      utxoSpends: [
+        {
+          outputKey: 'tx-0:0',
+          spentByTxid: 'tx-1',
+          spentInBlock: 1,
+          spentInputIndex: 0,
+          address: 'DSource',
+          valueBase: '10000000000',
+        },
+      ],
+      utxoCreates: [
+        {
+          networkId: 7,
+          blockHeight: 1,
+          blockHash: 'block-1',
+          blockTime: 1_700_000_060,
+          txid: 'tx-1',
+          txIndex: 0,
+          vout: 0,
+          outputKey: 'tx-1:0',
+          address: 'DTarget',
+          scriptType: 'pubkeyhash',
+          valueBase: '9900000000',
+          isCoinbase: false,
+          isSpendable: true,
+          spentByTxid: null,
+          spentInBlock: null,
+          spentInputIndex: null,
+        },
+      ],
+    };
+
+    await store.applyCoreDogecoinBlock(coinbase);
+    await metadata.execute(
+      'INSERT INTO core_block_undo (network_id, block_height, block_hash, undo_json, created_at) VALUES (?, ?, ?, ?, ?)',
+      [7, 1, 'block-1', '{}', '2026-01-01T00:00:00.000Z'],
+    );
+
+    await expect(store.applyCoreDogecoinBlock(spend)).resolves.toEqual({
+      applied: true,
+      processTail: 1,
+    });
+    await expect(store.applyCoreDogecoinBlock(spend)).resolves.toEqual({
+      applied: false,
+      processTail: 1,
+    });
+
+    await ctx.cleanup();
+  });
+
+  it('rejects core dogecoin replay with a different block hash', async () => {
+    const ctx = await createTestApp('indexer');
+    const store = ctx.runtime.metadata as unknown as CoreDogecoinStateStorePort;
+    const coinbase = {
+      networkId: 7,
+      blockHeight: 0,
+      blockHash: 'block-0',
+      previousBlockHash: null,
+      blockTime: 1_700_000_000,
+      txCount: 1,
+      rawStorageKey: 'block',
+      utxoSpends: [],
+      utxoCreates: [],
+    };
+
+    await store.applyCoreDogecoinBlock(coinbase);
+    await expect(
+      store.applyCoreDogecoinBlock({
+        ...coinbase,
+        blockHash: 'block-0-reorg',
+      }),
+    ).rejects.toThrow('core block hash mismatch');
+
+    await ctx.cleanup();
+  });
 });

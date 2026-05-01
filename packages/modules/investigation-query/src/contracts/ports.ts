@@ -61,6 +61,15 @@ export interface InvestigationMetadataPort {
       networkId: PrimaryId;
     }>
   >;
+  getCoreIndexerState?(networkId: PrimaryId): Promise<{
+    lastError: string | null;
+    networkId: PrimaryId;
+    onlineTip: number;
+    processTail: number;
+    stage: string;
+    syncTail: number;
+    updatedAt: string;
+  } | null>;
 }
 
 export interface InvestigationWarehousePort {

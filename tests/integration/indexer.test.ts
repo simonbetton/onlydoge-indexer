@@ -2,9 +2,11 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
+  CoreDogecoinIndexerService,
   configKeyIndexerProcessTail,
   configKeyIndexerStage,
   configKeyIndexerSyncTail,
+  type IndexingPipelineSettings,
 } from '@onlydoge/indexing-pipeline';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -137,6 +139,105 @@ describe('core dogecoin indexer integration', () => {
 
     await ctx.cleanup();
   });
+
+  it('fails fast when a core block step exceeds the deadline', async () => {
+    const values = new Map<string, unknown>();
+    const errors: string[] = [];
+    const service = new CoreDogecoinIndexerService(
+      {
+        async compareAndSwapJsonValue(key, expectedValue, nextValue) {
+          if ((values.get(key) ?? null) !== expectedValue) {
+            return false;
+          }
+          values.set(key, nextValue);
+          return true;
+        },
+        async deleteByPrefix() {},
+        async getJsonValue(key) {
+          return (values.get(key) as never) ?? null;
+        },
+        async setJsonValue(key, value) {
+          values.set(key, value);
+        },
+      },
+      {
+        async listActiveNetworks() {
+          return [
+            {
+              architecture: 'dogecoin',
+              blockTime: 60,
+              id: 'net_doge',
+              networkId: 7,
+              rpcEndpoint: 'https://doge.example/rpc',
+              rps: 10,
+            },
+          ];
+        },
+      },
+      {
+        async getPart() {
+          return new Promise<null>(() => {});
+        },
+        async putPart() {},
+      },
+      {
+        async getBlockHeight() {
+          return 0;
+        },
+        async getBlockSnapshot() {
+          return {};
+        },
+      },
+      {
+        async applyCoreDogecoinBlock() {
+          return { applied: true, processTail: 0 };
+        },
+        async getCoreIndexerState() {
+          return {
+            lastError: null,
+            networkId: 7,
+            onlineTip: 0,
+            processTail: -1,
+            stage: 'process_backfill',
+            syncTail: 0,
+            updatedAt: new Date().toISOString(),
+          };
+        },
+        async getCoreUtxoOutputs() {
+          return new Map();
+        },
+        async setCoreIndexerError(_networkId, error) {
+          errors.push(error ?? '');
+        },
+        async setCoreIndexerStage() {},
+        async upsertCoreBlock() {},
+        async upsertCoreIndexerState(input) {
+          return {
+            lastError: input.lastError ?? null,
+            networkId: input.networkId,
+            onlineTip: input.onlineTip ?? 0,
+            processTail: input.processTail ?? -1,
+            stage: input.stage ?? 'process_backfill',
+            syncTail: input.syncTail ?? 0,
+            updatedAt: new Date().toISOString(),
+          };
+        },
+      },
+      {
+        ...testIndexerSettings(),
+        coreBlockTimeoutMs: 1,
+      },
+      {
+        exitProcess(code): never {
+          throw new Error(`exit ${code}`);
+        },
+      },
+    );
+
+    await expect(service.runOnce()).rejects.toThrow('exit 1');
+    expect(errors.at(-1)).toContain('height=0');
+    expect(errors.at(-1)).toContain('active_step=load_raw');
+  });
 });
 
 async function runUntilProcessed(
@@ -155,4 +256,42 @@ async function runUntilProcessed(
   }
 
   throw new Error(`core process tail did not reach ${targetTail}`);
+}
+
+function testIndexerSettings(): IndexingPipelineSettings {
+  return {
+    bootstrapTimeoutMs: 60_000,
+    coreBlockTimeoutMs: 120_000,
+    coreDbStatementTimeoutMs: 30_000,
+    coreOnlineTipDistance: 6,
+    coreProcessWindow: 128,
+    coreProgressWatchdogMs: 180_000,
+    coreRawStorageTimeoutMs: 30_000,
+    coreSyncCompleteDistance: 6,
+    dogecoinTransferMaxEdges: 1024,
+    dogecoinTransferMaxInputAddresses: 64,
+    factTimeoutMs: 300_000,
+    factWindow: 64,
+    leaseHeartbeatIntervalMs: 5_000,
+    networkConcurrency: 2,
+    projectTargetMs: 30_000,
+    projectTimeoutMs: 120_000,
+    projectWindow: 4,
+    projectWindowMax: 16,
+    projectWindowMin: 2,
+    relinkBacklogThreshold: 256,
+    relinkBatchSize: 16,
+    relinkConcurrency: 2,
+    relinkFrontierBatch: 32,
+    relinkTipDistance: 512,
+    relinkTimeoutMs: 120_000,
+    syncBacklogHighWatermark: 2048,
+    syncBacklogLowWatermark: 512,
+    syncConcurrency: 4,
+    syncTargetMs: 15_000,
+    syncTimeoutMs: 120_000,
+    syncWindow: 32,
+    syncWindowMax: 256,
+    syncWindowMin: 32,
+  };
 }

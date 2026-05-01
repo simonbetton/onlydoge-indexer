@@ -64,7 +64,10 @@ export interface RawBlockStorageRequestContext {
 }
 
 export interface CoreDogecoinStateStorePort {
-  applyCoreDogecoinBlock(input: CoreDogecoinBlockApplication): Promise<CoreDogecoinApplyResult>;
+  applyCoreDogecoinBlock(
+    input: CoreDogecoinBlockApplication,
+    context?: CoreDogecoinApplyContext,
+  ): Promise<CoreDogecoinApplyResult>;
   getCoreIndexerState(networkId: PrimaryId): Promise<CoreIndexerState | null>;
   getCoreUtxoOutputs(
     networkId: PrimaryId,
@@ -81,6 +84,10 @@ export interface CoreDogecoinStateStorePort {
     stage?: CoreIndexerStage;
     syncTail?: number;
   }): Promise<CoreIndexerState>;
+}
+
+export interface CoreDogecoinApplyContext {
+  statementTimeoutMs?: number;
 }
 
 export interface BlockchainRpcPort {

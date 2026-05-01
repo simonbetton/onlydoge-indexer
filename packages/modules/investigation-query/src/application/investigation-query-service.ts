@@ -19,7 +19,10 @@ export class InvestigationQueryService {
     networks: Array<{
       blockHeight: number;
       factTail: number | null;
+      lastError: string | null;
+      lastUpdatedAt: string | null;
       name: string;
+      onlineTip: number | null;
       processTail: number;
       processed: number;
       stage: string | null;
@@ -29,30 +32,44 @@ export class InvestigationQueryService {
   }> {
     const networks = await this.metadata.listActiveNetworks();
     const response = await Promise.all(
-      networks.map(async (network) => ({
-        name: network.name,
-        blockHeight:
-          (await this.configs.getJsonValue<number>(`block_height_n${network.networkId}`)) ?? 0,
-        stage:
-          (await this.configs.getJsonValue<string>(`indexer_stage_n${network.networkId}`)) ?? null,
-        syncTail:
-          (await this.configs.getJsonValue<number>(`indexer_sync_tail_n${network.networkId}`)) ??
-          -1,
-        processTail:
-          (await this.configs.getJsonValue<number>(`indexer_process_tail_n${network.networkId}`)) ??
-          -1,
-        factTail:
-          (await this.configs.getJsonValue<number>(`indexer_fact_tail_n${network.networkId}`)) ??
-          null,
-        synced:
-          (await this.configs.getJsonValue<number>(
-            `indexer_sync_progress_n${network.networkId}`,
-          )) ?? 0,
-        processed:
-          (await this.configs.getJsonValue<number>(
-            `indexer_process_progress_n${network.networkId}`,
-          )) ?? 0,
-      })),
+      networks.map(async (network) => {
+        const coreState = this.metadata.getCoreIndexerState
+          ? await this.metadata.getCoreIndexerState(network.networkId)
+          : null;
+        return {
+          name: network.name,
+          blockHeight:
+            (await this.configs.getJsonValue<number>(`block_height_n${network.networkId}`)) ?? 0,
+          stage:
+            coreState?.stage ??
+            (await this.configs.getJsonValue<string>(`indexer_stage_n${network.networkId}`)) ??
+            null,
+          syncTail:
+            coreState?.syncTail ??
+            (await this.configs.getJsonValue<number>(`indexer_sync_tail_n${network.networkId}`)) ??
+            -1,
+          processTail:
+            coreState?.processTail ??
+            (await this.configs.getJsonValue<number>(
+              `indexer_process_tail_n${network.networkId}`,
+            )) ??
+            -1,
+          onlineTip: coreState?.onlineTip ?? null,
+          lastError: coreState?.lastError ?? null,
+          lastUpdatedAt: coreState?.updatedAt ?? null,
+          factTail:
+            (await this.configs.getJsonValue<number>(`indexer_fact_tail_n${network.networkId}`)) ??
+            null,
+          synced:
+            (await this.configs.getJsonValue<number>(
+              `indexer_sync_progress_n${network.networkId}`,
+            )) ?? 0,
+          processed:
+            (await this.configs.getJsonValue<number>(
+              `indexer_process_progress_n${network.networkId}`,
+            )) ?? 0,
+        };
+      }),
     );
 
     return { networks: response };

@@ -206,8 +206,11 @@ The app reads the following configuration surface:
 - `ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS`
 - `ONLYDOGE_INDEXER_FACT_WINDOW`
 - `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS`
+- `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS`
+- `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS`
 - `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE`
 - `ONLYDOGE_CORE_PROCESS_WINDOW`
+- `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS`
 - `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS`
 - `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE`
 - `ONLYDOGE_INDEXER_PROJECT_WINDOW`
@@ -357,7 +360,7 @@ npm run image:builder:init
 
 You still need to be authenticated to `ghcr.io` before pushing.
 
-The production image defaults to `--mode=both`, listens on port `80`, and exposes `/up` as an unauthenticated health endpoint so it can be installed by ONCE-compatible runtimes.
+The production image defaults to `--mode=both` for compatibility, but production should run split API and indexer containers. The API container owns public HTTP health; the indexer container owns indexing progress and can restart independently.
 
 ## Deploying This Project
 
@@ -378,9 +381,35 @@ Deploy this project as containers on a platform that supports long-running proce
 - ClickHouse
 - Dogecoin and EVM RPC providers
 
-### ONCE First-Time Deployment
+### Docker + Caddy Deployment
 
-ONCE is a good fit if you want to run OnlyDoge as a single production image in `both` mode while pointing it at external PostgreSQL, S3-compatible storage, ClickHouse, and RPC providers.
+Docker Compose with Caddy is the preferred production shape for the managed DigitalOcean deployment.
+
+1. Prepare an env file from `.env.managed.example` with external PostgreSQL, DigitalOcean Spaces, ClickHouse, and application secrets.
+
+2. Push or select the image to deploy:
+
+```bash
+bun run image:push
+```
+
+3. Deploy the pinned image to the production droplet:
+
+```bash
+bun run deploy:docker -- --envFile .env.managed
+```
+
+The deploy script uploads `docker-compose.managed.yml`, `docker/caddy/Caddyfile`, and the resolved env file to `/opt/onlydoge`, stops the legacy ONCE containers by default, starts Caddy/API/indexer with Docker Compose, then verifies public API health and indexer health.
+
+The managed Compose stack runs:
+
+- `caddy` on ports `80` and `443`, terminating TLS for `platform.onlydoge.io`.
+- `onlydoge-api` with `--mode=http --ip=0.0.0.0 --port=2277`.
+- `onlydoge-indexer` with `--mode=indexer` and an indexer-specific health check.
+
+### ONCE First-Time Deployment (Legacy)
+
+ONCE is now a legacy deployment option. It runs the image as a single `both` process, which means API health and indexer liveness share one container. Prefer Docker + Caddy for sustained production indexing.
 
 1. Install ONCE on the target machine.
 
@@ -415,8 +444,11 @@ ghcr.io/simonbetton/onlydoge-indexer:latest
 - `ONLYDOGE_INDEXER_SYNC_CONCURRENCY=4`
 - `ONLYDOGE_INDEXER_FACT_WINDOW=64`
 - `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`
+- `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`
+- `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`
 - `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`
 - `ONLYDOGE_CORE_PROCESS_WINDOW=128`
+- `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`
 - `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`
 - `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`
 - `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`
@@ -496,7 +528,7 @@ cp .env.once.example .env.once
 3. Deploy with the checked-in script.
 
 ```bash
-npm run deploy:once
+bun run deploy:once
 ```
 
 The script:
@@ -512,9 +544,9 @@ The script:
 Useful overrides:
 
 ```bash
-npm run deploy:once -- --envFile .env.once --image ghcr.io/simonbetton/onlydoge-indexer:latest
-npm run deploy:once -- --dryRun
-npm run deploy:once -- --host platform.onlydoge.io --sshJump root@164.90.159.127 --sshTarget root@10.124.0.3
+bun run deploy:once -- --envFile .env.once --image ghcr.io/simonbetton/onlydoge-indexer:latest
+bun run deploy:once -- --dryRun
+bun run deploy:once -- --host platform.onlydoge.io --sshJump root@164.90.159.127 --sshTarget root@10.124.0.3
 ```
 
 By default the script expects:
@@ -551,8 +583,11 @@ For the bundled Compose production stack, ClickHouse and the indexer tuning are 
 - `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`
 - `ONLYDOGE_INDEXER_FACT_WINDOW=64`
 - `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`
+- `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`
+- `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`
 - `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`
 - `ONLYDOGE_CORE_PROCESS_WINDOW=128`
+- `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`
 - `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`
 - `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`
 - `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`
@@ -644,4 +679,4 @@ Vitest covers:
 - The local and production Compose stacks assume the warehouse database name is `onlydoge`.
 - Raw block storage is written to S3-compatible object storage in Dockerized environments.
 - The current checked-in ClickHouse memory profile assumes a warehouse node in roughly the `16 GB RAM` class. If you run a materially smaller box, lower the profile values before deployment.
-- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_WINDOW=128`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS=60000`, `ONLYDOGE_INDEXER_FACT_WINDOW=64`, `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`, `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK=2048`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK=512`, `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`, and relink deferral near the values in `.env.production.example`.
+- The current checked-in indexer defaults are intentionally conservative for production backfill: `ONLYDOGE_CORE_BLOCK_TIMEOUT_MS=120000`, `ONLYDOGE_CORE_DB_STATEMENT_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE=6`, `ONLYDOGE_CORE_PROCESS_WINDOW=128`, `ONLYDOGE_CORE_PROGRESS_WATCHDOG_MS=180000`, `ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS=30000`, `ONLYDOGE_CORE_ONLINE_TIP_DISTANCE=6`, `ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS=60000`, `ONLYDOGE_INDEXER_FACT_WINDOW=64`, `ONLYDOGE_INDEXER_FACT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_PROJECT_WINDOW=4`, `ONLYDOGE_INDEXER_PROJECT_TIMEOUT_MS=300000`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES=64`, `ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_EDGES=1024`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_HIGH_WATERMARK=2048`, `ONLYDOGE_INDEXER_SYNC_BACKLOG_LOW_WATERMARK=512`, `ONLYDOGE_WAREHOUSE_REQUEST_TIMEOUT_MS=30000`, and relink deferral near the values in `.env.production.example`.

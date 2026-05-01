@@ -4,7 +4,10 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 
-import type { RawBlockStoragePort } from '@onlydoge/indexing-pipeline';
+import type {
+  RawBlockStoragePort,
+  RawBlockStorageRequestContext,
+} from '@onlydoge/indexing-pipeline';
 import type { PrimaryId } from '@onlydoge/shared-kernel';
 
 import type { StorageSettings } from './settings';
@@ -16,12 +19,16 @@ export class FileRawBlockStorageAdapter implements RawBlockStoragePort {
     networkId: PrimaryId,
     blockHeight: number,
     part: string,
+    context?: RawBlockStorageRequestContext,
   ): Promise<T | null> {
+    assertNotAborted(context);
     const filePath = join(this.basePath, String(networkId), String(blockHeight), `${part}.json.gz`);
     try {
       const payload = await readFile(filePath);
+      assertNotAborted(context);
       return decodeJsonGzip<T>(payload);
     } catch {
+      assertNotAborted(context);
       return null;
     }
   }
@@ -31,10 +38,13 @@ export class FileRawBlockStorageAdapter implements RawBlockStoragePort {
     blockHeight: number,
     part: string,
     payload: Record<string, unknown>,
+    context?: RawBlockStorageRequestContext,
   ): Promise<void> {
+    assertNotAborted(context);
     const filePath = join(this.basePath, String(networkId), String(blockHeight), `${part}.json.gz`);
     await mkdir(dirname(filePath), { recursive: true });
     await writeFile(filePath, gzipSync(Buffer.from(JSON.stringify(payload))));
+    assertNotAborted(context);
   }
 }
 
@@ -54,19 +64,28 @@ export class S3RawBlockStorageAdapter implements RawBlockStoragePort {
     networkId: PrimaryId,
     blockHeight: number,
     part: string,
+    context?: RawBlockStorageRequestContext,
   ): Promise<T | null> {
     const key = [this.prefix, networkId, blockHeight, `${part}.json.gz`].filter(Boolean).join('/');
+    const request = createRequestAbortSignal(context);
     try {
       const response = await this.client.send(
         new GetObjectCommand({
           Bucket: this.bucket,
           Key: key,
         }),
+        request.signal ? { abortSignal: request.signal } : undefined,
       );
       const body = await toBuffer(response.Body);
+      assertNotAborted(context);
       return decodeJsonGzip<T>(body);
     } catch {
+      if (request.signal?.aborted) {
+        throw new Error(`raw block storage get timed out key=${key}`);
+      }
       return null;
+    } finally {
+      request.cleanup();
     }
   }
 
@@ -75,17 +94,29 @@ export class S3RawBlockStorageAdapter implements RawBlockStoragePort {
     blockHeight: number,
     part: string,
     payload: Record<string, unknown>,
+    context?: RawBlockStorageRequestContext,
   ): Promise<void> {
     const key = [this.prefix, networkId, blockHeight, `${part}.json.gz`].filter(Boolean).join('/');
-    await this.client.send(
-      new PutObjectCommand({
-        Bucket: this.bucket,
-        Key: key,
-        Body: gzipSync(Buffer.from(JSON.stringify(payload))),
-        ContentType: 'application/json',
-        ContentEncoding: 'gzip',
-      }),
-    );
+    const request = createRequestAbortSignal(context);
+    try {
+      await this.client.send(
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: key,
+          Body: gzipSync(Buffer.from(JSON.stringify(payload))),
+          ContentType: 'application/json',
+          ContentEncoding: 'gzip',
+        }),
+        request.signal ? { abortSignal: request.signal } : undefined,
+      );
+    } catch (error) {
+      if (request.signal?.aborted) {
+        throw new Error(`raw block storage put timed out key=${key}`);
+      }
+      throw error;
+    } finally {
+      request.cleanup();
+    }
   }
 }
 
@@ -167,6 +198,46 @@ function s3Credentials(settings: StorageSettings):
 
 function decodeJsonGzip<T extends Record<string, unknown>>(payload: Uint8Array): T {
   return JSON.parse(gunzipSync(payload).toString('utf8'));
+}
+
+function createRequestAbortSignal(context?: RawBlockStorageRequestContext): {
+  cleanup(): void;
+  signal?: AbortSignal;
+} {
+  if (!context?.abortSignal && !context?.timeoutMs) {
+    return { cleanup() {} };
+  }
+
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort(context.abortSignal?.reason);
+  const timeout = context.timeoutMs
+    ? setTimeout(
+        () => controller.abort(new Error('raw block storage request timed out')),
+        context.timeoutMs,
+      )
+    : null;
+
+  if (context.abortSignal?.aborted) {
+    controller.abort(context.abortSignal.reason);
+  } else {
+    context.abortSignal?.addEventListener('abort', abortFromParent, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      context.abortSignal?.removeEventListener('abort', abortFromParent);
+    },
+  };
+}
+
+function assertNotAborted(context?: RawBlockStorageRequestContext): void {
+  if (context?.abortSignal?.aborted) {
+    throw new Error('raw block storage request aborted');
+  }
 }
 
 function bufferFromDirectBody(body: unknown): Buffer | null {

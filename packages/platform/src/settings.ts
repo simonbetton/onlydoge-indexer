@@ -37,6 +37,7 @@ export interface IndexerSettings {
   bootstrapTimeoutMs: number;
   coreOnlineTipDistance: number;
   coreProcessWindow: number;
+  coreRawStorageTimeoutMs: number;
   coreSyncCompleteDistance: number;
   dogecoinTransferMaxEdges: number;
   dogecoinTransferMaxInputAddresses: number;
@@ -369,6 +370,7 @@ function parseIndexerSettings(env: NodeJS.ProcessEnv): IndexerSettings {
     bootstrapTimeoutMs: parsePositiveInteger(env.ONLYDOGE_INDEXER_BOOTSTRAP_TIMEOUT_MS, 60_000),
     coreOnlineTipDistance: parsePositiveInteger(env.ONLYDOGE_CORE_ONLINE_TIP_DISTANCE, 6),
     coreProcessWindow: parsePositiveInteger(env.ONLYDOGE_CORE_PROCESS_WINDOW, 128),
+    coreRawStorageTimeoutMs: parsePositiveInteger(env.ONLYDOGE_CORE_RAW_STORAGE_TIMEOUT_MS, 30_000),
     coreSyncCompleteDistance: parsePositiveInteger(env.ONLYDOGE_CORE_SYNC_COMPLETE_DISTANCE, 6),
     dogecoinTransferMaxInputAddresses: parsePositiveInteger(
       env.ONLYDOGE_INDEXER_DOGECOIN_TRANSFER_MAX_INPUT_ADDRESSES,

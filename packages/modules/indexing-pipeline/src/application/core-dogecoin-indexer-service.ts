@@ -68,13 +68,13 @@ export class CoreDogecoinIndexerService {
   public async start(signal?: AbortSignal): Promise<void> {
     console.info('[onlydoge] core dogecoin indexer loop started');
     while (!signal?.aborted) {
-      const isPrimary = await this.leaseLeadership();
-      if (!isPrimary) {
-        await sleep(1_000);
-        continue;
-      }
-
       try {
+        const isPrimary = await this.leaseLeadership();
+        if (!isPrimary) {
+          await sleep(1_000);
+          continue;
+        }
+
         const didWork = await this.runOnce();
         if (!didWork) {
           await sleep(workerIdleMs);
@@ -176,7 +176,9 @@ export class CoreDogecoinIndexerService {
     const heights = range(state.syncTail + 1, end);
     await mapWithConcurrency(heights, this.settings.syncConcurrency, async (height) => {
       const snapshot = await this.rpc.getBlockSnapshot(network, height);
-      await this.rawBlocks.putPart(network.networkId, height, rawBlockPart, snapshot);
+      await this.rawBlocks.putPart(network.networkId, height, rawBlockPart, snapshot, {
+        timeoutMs: this.settings.coreRawStorageTimeoutMs,
+      });
       const block = parseDogecoinBlockSnapshot(snapshot);
       await this.stateStore.upsertCoreBlock({
         networkId: network.networkId,
@@ -278,6 +280,7 @@ export class CoreDogecoinIndexerService {
       network.networkId,
       height,
       rawBlockPart,
+      { timeoutMs: this.settings.coreRawStorageTimeoutMs },
     );
     if (!snapshot) {
       throw new Error(`missing raw dogecoin block snapshot network=${network.id} height=${height}`);

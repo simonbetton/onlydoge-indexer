@@ -47,13 +47,20 @@ export interface RawBlockStoragePort {
     networkId: PrimaryId,
     blockHeight: number,
     part: string,
+    context?: RawBlockStorageRequestContext,
   ): Promise<T | null>;
   putPart(
     networkId: PrimaryId,
     blockHeight: number,
     part: string,
     payload: Record<string, unknown>,
+    context?: RawBlockStorageRequestContext,
   ): Promise<void>;
+}
+
+export interface RawBlockStorageRequestContext {
+  abortSignal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 export interface CoreDogecoinStateStorePort {

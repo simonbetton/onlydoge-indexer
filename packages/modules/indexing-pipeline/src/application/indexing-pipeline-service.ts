@@ -94,6 +94,7 @@ export interface IndexingPipelineSettings {
   bootstrapTimeoutMs: number;
   coreOnlineTipDistance: number;
   coreProcessWindow: number;
+  coreRawStorageTimeoutMs: number;
   coreSyncCompleteDistance: number;
   dogecoinTransferMaxEdges: number;
   dogecoinTransferMaxInputAddresses: number;
@@ -194,6 +195,7 @@ const defaultSettings: IndexingPipelineSettings = {
   bootstrapTimeoutMs: 60_000,
   coreOnlineTipDistance: 6,
   coreProcessWindow: 128,
+  coreRawStorageTimeoutMs: 30_000,
   coreSyncCompleteDistance: 6,
   dogecoinTransferMaxInputAddresses: 64,
   dogecoinTransferMaxEdges: 1024,

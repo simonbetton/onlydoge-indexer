@@ -183,7 +183,31 @@ async function runIndexerRuntime(
     return;
   }
 
+  superviseBackgroundIndexer(indexerPromise, signal);
   await stopHttpRuntimeOnAbort(server, signal);
+}
+
+function superviseBackgroundIndexer(indexerPromise: Promise<void>, signal: AbortSignal): void {
+  void indexerPromise.then(
+    () => {
+      if (signal.aborted) {
+        return;
+      }
+
+      console.error('[onlydoge] indexer loop stopped unexpectedly');
+      process.exit(1);
+    },
+    (error) => {
+      if (signal.aborted) {
+        return;
+      }
+
+      console.error(
+        `[onlydoge] indexer loop stopped unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exit(1);
+    },
+  );
 }
 
 async function stopHttpRuntimeOnAbort(
